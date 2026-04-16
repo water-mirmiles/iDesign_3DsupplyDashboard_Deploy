@@ -13,11 +13,16 @@ import LastSoleRelationView from '@/views/LastSoleRelation';
 import Login from '@/views/Login';
 
 export default function App() {
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
-  const [currentView, setCurrentView] = useState('dashboard');
+  const [isAuthenticated, setIsAuthenticated] = useState(() => localStorage.getItem('isLoggedIn') === 'true');
+  const [currentView, setCurrentView] = useState(() => localStorage.getItem('currentView') || 'dashboard');
 
   if (!isAuthenticated) {
-    return <Login onLogin={() => setIsAuthenticated(true)} />;
+    return <Login onLogin={({ username, rememberMe }) => {
+      setIsAuthenticated(true);
+      localStorage.setItem('username', username);
+      if (rememberMe) localStorage.setItem('isLoggedIn', 'true');
+      else localStorage.removeItem('isLoggedIn');
+    }} />;
   }
 
   const renderView = () => {
@@ -38,7 +43,17 @@ export default function App() {
   };
 
   return (
-    <Layout currentView={currentView} onNavigate={setCurrentView} onLogout={() => setIsAuthenticated(false)}>
+    <Layout
+      currentView={currentView}
+      onNavigate={(view) => {
+        setCurrentView(view);
+        localStorage.setItem('currentView', view);
+      }}
+      onLogout={() => {
+        setIsAuthenticated(false);
+        localStorage.removeItem('isLoggedIn');
+      }}
+    >
       {renderView()}
     </Layout>
   );

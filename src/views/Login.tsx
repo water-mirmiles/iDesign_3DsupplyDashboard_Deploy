@@ -2,19 +2,62 @@ import React, { useState } from 'react';
 import { Box, Lock, User, ArrowRight } from 'lucide-react';
 
 interface LoginProps {
-  onLogin: () => void;
+  onLogin: (info: { username: string; rememberMe: boolean }) => void;
+}
+
+type StoredUser = { username: string; password: string };
+
+function loadUsers(): StoredUser[] {
+  try {
+    const raw = localStorage.getItem('users');
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed)
+      ? parsed.filter((u) => typeof u?.username === 'string' && typeof u?.password === 'string')
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveUsers(users: StoredUser[]) {
+  localStorage.setItem('users', JSON.stringify(users));
 }
 
 export default function Login({ onLogin }: LoginProps) {
   const [isLogin, setIsLogin] = useState(true);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [rememberMe, setRememberMe] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (username && password) {
-      onLogin();
+    setError(null);
+
+    const u = username.trim();
+    const p = password;
+    if (!u || !p) return;
+
+    const users = loadUsers();
+
+    if (isLogin) {
+      const found = users.find((x) => x.username === u && x.password === p);
+      if (!found) {
+        setError('用户名或密码错误，或该账号尚未注册。');
+        return;
+      }
+      onLogin({ username: u, rememberMe });
+      return;
     }
+
+    if (users.some((x) => x.username === u)) {
+      setError('该用户名已存在，请直接登录。');
+      return;
+    }
+
+    saveUsers([...users, { username: u, password: p }]);
+    onLogin({ username: u, rememberMe });
   };
 
   return (
@@ -36,6 +79,11 @@ export default function Login({ onLogin }: LoginProps) {
         </div>
 
         <form onSubmit={handleSubmit} className="space-y-5">
+          {error && (
+            <div className="text-sm text-red-200 bg-red-500/10 border border-red-500/20 rounded-lg px-4 py-3">
+              {error}
+            </div>
+          )}
           <div>
             <label className="block text-sm font-medium text-slate-300 mb-1.5">用户名</label>
             <div className="relative">
@@ -67,6 +115,21 @@ export default function Login({ onLogin }: LoginProps) {
                 placeholder="请输入密码"
                 required
               />
+            </div>
+          </div>
+
+          <div className="flex items-center justify-between">
+            <label className="flex items-center gap-2 text-sm text-slate-300 select-none">
+              <input
+                type="checkbox"
+                checked={rememberMe}
+                onChange={(e) => setRememberMe(e.target.checked)}
+                className="h-4 w-4 rounded border-slate-600 bg-slate-900/50 text-blue-600 focus:ring-2 focus:ring-blue-500"
+              />
+              记住我
+            </label>
+            <div className="text-xs text-slate-500">
+              {isLogin ? '登录校验本地用户列表' : '注册将写入本地存储'}
             </div>
           </div>
 

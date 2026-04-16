@@ -3,99 +3,67 @@ import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, Legend, ResponsiveContainer,
   AreaChart, Area
 } from 'recharts';
-import { Box, Layers, Hash, Factory, Loader2, Activity, TrendingUp } from 'lucide-react';
+import { Box, Layers, Hash, Factory, Loader2, Activity, TrendingUp, AlertCircle } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { DashboardKPIs, AssetTrendStats, BrandCoverageStats } from '@/types';
+import { AssetTrendStats } from '@/types';
 
-// --- Mock Data ---
-const mockKPIs: DashboardKPIs = {
-  totalBrands: 24,
-  newBrandsLastMonth: 2,
-  totalStyles: 4200,
-  activeStyles: 3450,
-  newActiveStylesLastMonth: 150,
-  matched3DLasts: 2100,
-  newMatched3DLastsLastMonth: 45,
-  totalLastIDs: 2890,
-  matched3DSoles: 1850,
-  newMatched3DSolesLastMonth: 32,
-  totalSoleIDs: 2100,
-  overallCoverage: 78,
-  coverageIncreaseLastMonth: 2.5,
-};
-
-const mockBrandCoverage: BrandCoverageStats[] = [
-  { brand: 'Nike', linked: 850, unlinked: 150 },
-  { brand: 'Adidas', linked: 620, unlinked: 280 },
-  { brand: 'Puma', linked: 450, unlinked: 300 },
-  { brand: 'New Balance', linked: 380, unlinked: 420 },
-  { brand: 'Under Armour', linked: 290, unlinked: 510 },
-  { brand: 'Reebok', linked: 210, unlinked: 390 },
-  { brand: 'Asics', linked: 180, unlinked: 220 },
-  { brand: 'Vans', linked: 150, unlinked: 150 },
-];
-
-const trendDataMap: Record<string, AssetTrendStats[]> = {
-  day: [
-    { date: '08:00', newLasts: 5, newSoles: 2 },
-    { date: '10:00', newLasts: 12, newSoles: 8 },
-    { date: '12:00', newLasts: 8, newSoles: 5 },
-    { date: '14:00', newLasts: 15, newSoles: 10 },
-    { date: '16:00', newLasts: 20, newSoles: 18 },
-    { date: '18:00', newLasts: 10, newSoles: 7 },
-  ],
-  week: [
-    { date: 'Mon', newLasts: 45, newSoles: 30 },
-    { date: 'Tue', newLasts: 52, newSoles: 38 },
-    { date: 'Wed', newLasts: 38, newSoles: 45 },
-    { date: 'Thu', newLasts: 65, newSoles: 50 },
-    { date: 'Fri', newLasts: 48, newSoles: 42 },
-    { date: 'Sat', newLasts: 15, newSoles: 10 },
-    { date: 'Sun', newLasts: 20, newSoles: 15 },
-  ],
-  month: [
-    { date: 'Week 1', newLasts: 150, newSoles: 120 },
-    { date: 'Week 2', newLasts: 180, newSoles: 160 },
-    { date: 'Week 3', newLasts: 210, newSoles: 190 },
-    { date: 'Week 4', newLasts: 170, newSoles: 140 },
-  ],
-  quarter: [
-    { date: 'Jan', newLasts: 600, newSoles: 500 },
-    { date: 'Feb', newLasts: 750, newSoles: 680 },
-    { date: 'Mar', newLasts: 820, newSoles: 710 },
-  ],
-  year: [
-    { date: 'Jan', newLasts: 600, newSoles: 500 },
-    { date: 'Feb', newLasts: 750, newSoles: 680 },
-    { date: 'Mar', newLasts: 820, newSoles: 710 },
-    { date: 'Apr', newLasts: 900, newSoles: 850 },
-    { date: 'May', newLasts: 850, newSoles: 800 },
-    { date: 'Jun', newLasts: 950, newSoles: 900 },
-    { date: 'Jul', newLasts: 1100, newSoles: 1050 },
-    { date: 'Aug', newLasts: 1050, newSoles: 980 },
-    { date: 'Sep', newLasts: 1200, newSoles: 1150 },
-    { date: 'Oct', newLasts: 1300, newSoles: 1250 },
-    { date: 'Nov', newLasts: 1400, newSoles: 1350 },
-    { date: 'Dec', newLasts: 1500, newSoles: 1450 },
-  ],
+type DashboardStatsResponse = {
+  ok: boolean;
+  dates: { latest: string; prev: string };
+  mapping: { hasConfig: boolean; configPath: string };
+  meta: { mainTable: string | null; requiredCols?: string[]; reason?: string };
+  kpis: {
+    activeStyles: number;
+    matched3DLasts: number;
+    matched3DSoles: number;
+    lastCoverage: number;
+    soleCoverage: number;
+    deltaActiveStyles: number;
+    deltaMatched3DLasts: number;
+    deltaMatched3DSoles: number;
+  };
+  brandCoverage: Array<{ brand: string; linked: number; unlinked: number }>;
+  error?: string;
 };
 
 type TimePeriod = 'day' | 'week' | 'month' | 'quarter' | 'year';
 
 export default function Dashboard() {
+  const [stats, setStats] = useState<DashboardStatsResponse | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
   const [trendPeriod, setTrendPeriod] = useState<TimePeriod>('week');
-  const [isChartLoading, setIsChartLoading] = useState(false);
-  const [chartData, setChartData] = useState<AssetTrendStats[]>(trendDataMap['week']);
+  const [chartData, setChartData] = useState<AssetTrendStats[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const run = async () => {
+      setIsLoading(true);
+      setError(null);
+      try {
+        const resp = await fetch('/api/dashboard-stats');
+        const json = (await resp.json()) as DashboardStatsResponse;
+        if (!resp.ok || !json.ok) throw new Error(json.error || `加载失败（HTTP ${resp.status}）`);
+        if (cancelled) return;
+        setStats(json);
+      } catch (e) {
+        if (cancelled) return;
+        setError(e instanceof Error ? e.message : '加载失败');
+      } finally {
+        if (!cancelled) setIsLoading(false);
+      }
+    };
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const handlePeriodChange = (period: TimePeriod) => {
+    // 真实趋势后续由数据引擎生成；当前先保留切换控件但不做假异步
     if (period === trendPeriod) return;
     setTrendPeriod(period);
-    setIsChartLoading(true);
-    // Simulate network request
-    setTimeout(() => {
-      setChartData(trendDataMap[period]);
-      setIsChartLoading(false);
-    }, 600);
   };
 
   const getProgressColor = (percent: number) => {
@@ -137,6 +105,24 @@ export default function Dashboard() {
         <p className="text-sm text-slate-500 mt-1">全局 3D 资产覆盖率与新增趋势</p>
       </div>
 
+      {!isLoading && stats && (!stats.mapping?.hasConfig || !stats.meta?.mainTable) && (
+        <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 text-sm text-amber-800 flex items-start gap-3">
+          <AlertCircle className="w-5 h-5 mt-0.5" />
+          <div className="min-w-0">
+            <div className="font-medium">数据引擎尚未找到“款号主表”或映射未完成</div>
+            <div className="text-xs mt-1 text-amber-700">
+              {stats.mapping?.hasConfig ? `主表识别失败：${stats.meta?.reason || '请检查映射字段是否覆盖 款号/品牌/状态'}` : '未检测到 mapping_config.json（请在“字段映射管理”保存映射）'}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {error && (
+        <div className="bg-red-50 border border-red-200 rounded-xl p-4 text-sm text-red-700">
+          {error}
+        </div>
+      )}
+
       {/* KPI Cards - 5 Cards Layout */}
       <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-5 gap-4">
         {/* Card 1: Total Brands */}
@@ -148,7 +134,7 @@ export default function Dashboard() {
             </div>
           </div>
           <div className="mt-4">
-            <span className="text-3xl font-bold text-slate-900">{mockKPIs.totalBrands.toLocaleString()}</span>
+            <span className="text-3xl font-bold text-slate-900">{(stats?.brandCoverage?.length || 0).toLocaleString()}</span>
           </div>
         </div>
 
@@ -162,12 +148,10 @@ export default function Dashboard() {
           </div>
           <div className="mt-4">
             <div className="flex items-end gap-2">
-              <span className="text-3xl font-bold text-slate-900">{mockKPIs.activeStyles.toLocaleString()}</span>
-              {getTrendBadge(mockKPIs.newActiveStylesLastMonth)}
+              <span className="text-3xl font-bold text-slate-900">{(stats?.kpis?.activeStyles || 0).toLocaleString()}</span>
+              {getTrendBadge(stats?.kpis?.deltaActiveStyles || 0)}
             </div>
-            <div className="mt-1 text-xs text-slate-500">
-              总款号参考: <span className="font-medium text-slate-700">{mockKPIs.totalStyles.toLocaleString()}</span>
-            </div>
+            <div className="mt-1 text-xs text-slate-500">生效款号（按状态过滤）</div>
           </div>
         </div>
 
@@ -181,11 +165,11 @@ export default function Dashboard() {
           </div>
           <div className="mt-4">
             <div className="flex items-end gap-2">
-              <span className="text-3xl font-bold text-slate-900">{mockKPIs.matched3DLasts.toLocaleString()}</span>
-              {getTrendBadge(mockKPIs.newMatched3DLastsLastMonth)}
+              <span className="text-3xl font-bold text-slate-900">{(stats?.kpis?.matched3DLasts || 0).toLocaleString()}</span>
+              {getTrendBadge(stats?.kpis?.deltaMatched3DLasts || 0)}
             </div>
             <div className="mt-1 text-xs text-slate-500">
-              / {mockKPIs.totalLastIDs.toLocaleString()} ({Math.round((mockKPIs.matched3DLasts / mockKPIs.totalLastIDs) * 100)}%)
+              覆盖率: <span className="font-medium text-slate-700">{stats?.kpis?.lastCoverage ?? 0}%</span>
             </div>
           </div>
         </div>
@@ -200,11 +184,11 @@ export default function Dashboard() {
           </div>
           <div className="mt-4">
             <div className="flex items-end gap-2">
-              <span className="text-3xl font-bold text-slate-900">{mockKPIs.matched3DSoles.toLocaleString()}</span>
-              {getTrendBadge(mockKPIs.newMatched3DSolesLastMonth)}
+              <span className="text-3xl font-bold text-slate-900">{(stats?.kpis?.matched3DSoles || 0).toLocaleString()}</span>
+              {getTrendBadge(stats?.kpis?.deltaMatched3DSoles || 0)}
             </div>
             <div className="mt-1 text-xs text-slate-500">
-              / {mockKPIs.totalSoleIDs.toLocaleString()} ({Math.round((mockKPIs.matched3DSoles / mockKPIs.totalSoleIDs) * 100)}%)
+              覆盖率: <span className="font-medium text-slate-700">{stats?.kpis?.soleCoverage ?? 0}%</span>
             </div>
           </div>
         </div>
@@ -219,13 +203,15 @@ export default function Dashboard() {
           </div>
           <div className="mt-4">
             <div className="flex items-end gap-2">
-              <span className="text-3xl font-bold text-slate-900">{mockKPIs.overallCoverage}%</span>
-              {getTrendBadge(mockKPIs.coverageIncreaseLastMonth, true)}
+              <span className="text-3xl font-bold text-slate-900">
+                {Math.round((((stats?.kpis?.lastCoverage ?? 0) + (stats?.kpis?.soleCoverage ?? 0)) / 2))}%
+              </span>
+              {getTrendBadge(0, true)}
             </div>
             <div className="mt-2 h-1.5 w-full bg-slate-100 rounded-full overflow-hidden">
               <div 
-                className={cn("h-full rounded-full transition-all duration-1000", getProgressColor(mockKPIs.overallCoverage))} 
-                style={{ width: `${mockKPIs.overallCoverage}%` }}
+                className={cn("h-full rounded-full transition-all duration-1000", getProgressColor(Math.round((((stats?.kpis?.lastCoverage ?? 0) + (stats?.kpis?.soleCoverage ?? 0)) / 2))))} 
+                style={{ width: `${Math.round((((stats?.kpis?.lastCoverage ?? 0) + (stats?.kpis?.soleCoverage ?? 0)) / 2))}%` }}
               />
             </div>
           </div>
@@ -244,7 +230,7 @@ export default function Dashboard() {
           <div className="flex-1 min-h-[350px] w-full">
             <ResponsiveContainer width="100%" height="100%">
               <BarChart 
-                data={mockBrandCoverage} 
+                data={stats?.brandCoverage || []} 
                 margin={{ top: 10, right: 10, left: -20, bottom: 0 }}
               >
                 <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
@@ -282,7 +268,7 @@ export default function Dashboard() {
             </div>
           </div>
           <div className="flex-1 min-h-[350px] w-full relative">
-            {isChartLoading && (
+            {isLoading && (
               <div className="absolute inset-0 z-10 flex items-center justify-center bg-white/50 backdrop-blur-sm rounded-lg">
                 <Loader2 className="w-8 h-8 text-blue-500 animate-spin" />
               </div>

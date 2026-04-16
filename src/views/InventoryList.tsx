@@ -1,21 +1,15 @@
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Search, Filter, Download, MoreHorizontal, CheckCircle2, XCircle, Database, Box, Layers, X, DownloadCloud, ChevronDown } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { InventoryItem } from '@/types';
 
-const mockInventory: InventoryItem[] = [
-  { id: '1', style_wms: 'NK-RUN-2024-001', brand: 'Nike', colorCode: 'C01-BLK', colorHex: '#000000', materialCode: 'M-MESH-01', materialThumb: 'https://picsum.photos/seed/m1/24/16', lastCode: 'LST-NK-2024-A1', lastStatus: 'matched', soleCode: 'SOL-NK-A1-01', soleStatus: 'matched', data_status: 'active', sourceTable: 'ods_pdm_style', lastUpdated: '2024-05-20', updatedBy: 'Admin' },
-  { id: '2', style_wms: 'NK-RUN-2024-002', brand: 'Nike', colorCode: 'C02-WHT', colorHex: '#FFFFFF', materialCode: 'M-MESH-01', materialThumb: 'https://picsum.photos/seed/m1/24/16', lastCode: 'LST-NK-2024-A1', lastStatus: 'matched', soleCode: 'SOL-NK-A1-02', soleStatus: 'matched', data_status: 'active', sourceTable: 'ods_pdm_style', lastUpdated: '2024-05-20', updatedBy: 'Admin' },
-  { id: '3', style_wms: 'AD-CAS-2024-X1', brand: 'Adidas', colorCode: 'C15-RED', colorHex: '#EF4444', materialCode: 'M-LTHR-05', materialThumb: 'https://picsum.photos/seed/m2/24/16', lastCode: 'LST-AD-CAS-X', lastStatus: 'missing', soleCode: 'SOL-AD-CX-1', soleStatus: 'matched', data_status: 'draft', sourceTable: 'erp_inventory', lastUpdated: '2024-05-19', updatedBy: 'System' },
-  { id: '4', style_wms: 'PM-SNEAK-V2', brand: 'Puma', colorCode: 'C08-BLU', colorHex: '#3B82F6', materialCode: 'M-SUED-02', materialThumb: 'https://picsum.photos/seed/m3/24/16', lastCode: 'LST-PM-SNK-V2', lastStatus: 'matched', soleCode: 'SOL-PM-SV2', soleStatus: 'missing', data_status: 'active', sourceTable: 'ods_pdm_style', lastUpdated: '2024-05-18', updatedBy: 'User_A' },
-  { id: '5', style_wms: 'NB-WALK-500', brand: 'New Balance', colorCode: 'C04-GRY', colorHex: '#9CA3AF', materialCode: 'M-MESH-03', materialThumb: 'https://picsum.photos/seed/m4/24/16', lastCode: 'LST-NB-W500', lastStatus: 'matched', soleCode: 'SOL-NB-W500', soleStatus: 'matched', data_status: 'obsolete', sourceTable: 'legacy_db', lastUpdated: '2024-05-15', updatedBy: 'Admin' },
-  { id: '6', style_wms: 'UA-TRAIN-X', brand: 'Under Armour', colorCode: 'C11-GRN', colorHex: '#10B981', materialCode: 'M-KNIT-01', materialThumb: 'https://picsum.photos/seed/m5/24/16', lastCode: 'LST-UA-TRX', lastStatus: 'missing', soleCode: 'SOL-UA-TRX', soleStatus: 'missing', data_status: 'draft', sourceTable: 'erp_inventory', lastUpdated: '2024-05-21', updatedBy: 'User_B' },
-  { id: '7', style_wms: 'RBK-CLASSIC-1', brand: 'Reebok', colorCode: 'C02-WHT', colorHex: '#FFFFFF', materialCode: 'M-LTHR-01', materialThumb: 'https://picsum.photos/seed/m6/24/16', lastCode: 'LST-RBK-CL1', lastStatus: 'matched', soleCode: 'SOL-RBK-CL1', soleStatus: 'matched', data_status: 'active', sourceTable: 'ods_pdm_style', lastUpdated: '2024-05-21', updatedBy: 'Admin' },
-  { id: '8', style_wms: 'AS-GEL-90', brand: 'Asics', colorCode: 'C22-NVY', colorHex: '#1E3A8A', materialCode: 'M-MESH-05', materialThumb: 'https://picsum.photos/seed/m7/24/16', lastCode: 'LST-AS-G90', lastStatus: 'matched', soleCode: 'SOL-AS-G90', soleStatus: 'missing', data_status: 'active', sourceTable: 'ods_pdm_style', lastUpdated: '2024-05-20', updatedBy: 'System' },
-  { id: '9', style_wms: 'VN-SK8-HI', brand: 'Vans', colorCode: 'C01-BLK', colorHex: '#000000', materialCode: 'M-CNVS-01', materialThumb: 'https://picsum.photos/seed/m8/24/16', lastCode: 'LST-VN-SK8', lastStatus: 'missing', soleCode: 'SOL-VN-SK8', soleStatus: 'matched', data_status: 'active', sourceTable: 'erp_inventory', lastUpdated: '2024-05-19', updatedBy: 'User_A' },
-  { id: '10', style_wms: 'NK-BBALL-Z', brand: 'Nike', colorCode: 'C33-PUR', colorHex: '#9333EA', materialCode: 'M-SYNT-02', materialThumb: 'https://picsum.photos/seed/m9/24/16', lastCode: 'LST-NK-BBZ', lastStatus: 'matched', soleCode: 'SOL-NK-BBZ', soleStatus: 'matched', data_status: 'draft', sourceTable: 'ods_pdm_style', lastUpdated: '2024-05-22', updatedBy: 'Admin' },
-  { id: '11', style_wms: 'AD-TERREX-1', brand: 'Adidas', colorCode: 'C44-BRN', colorHex: '#78350F', materialCode: 'M-GTEX-01', materialThumb: 'https://picsum.photos/seed/m10/24/16', lastCode: 'LST-AD-TX1', lastStatus: 'matched', soleCode: 'SOL-AD-TX1', soleStatus: 'matched', data_status: 'active', sourceTable: 'ods_pdm_style', lastUpdated: '2024-05-22', updatedBy: 'System' },
-];
+type InventoryRealResponse = {
+  ok: boolean;
+  items: InventoryItem[];
+  meta?: { mainTable: string | null; reason?: string };
+  mapping?: { hasConfig: boolean };
+  error?: string;
+};
 
 const DataStatusBadge = ({ status }: { status: InventoryItem['data_status'] }) => {
   switch (status) {
@@ -166,12 +160,43 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType }: PreviewModalPro
 export default function InventoryList() {
   const [previewModal, setPreviewModal] = useState<{isOpen: boolean, assetCode: string, type: 'last'|'sole'}>({ isOpen: false, assetCode: '', type: 'last' });
   const [has3DFilter, setHas3DFilter] = useState<string>('all');
+  const [items, setItems] = useState<InventoryItem[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   const openPreview = (assetCode: string | undefined, type: 'last' | 'sole') => {
     if (assetCode) {
       setPreviewModal({ isOpen: true, assetCode, type });
     }
   };
+
+  useEffect(() => {
+    let cancelled = false;
+    const run = async () => {
+      setIsLoading(true);
+      setError(null);
+      try {
+        const resp = await fetch('/api/inventory-real');
+        const json = (await resp.json()) as InventoryRealResponse;
+        if (!resp.ok || !json.ok) throw new Error(json.error || `加载失败（HTTP ${resp.status}）`);
+        if (!cancelled) setItems(json.items || []);
+      } catch (e) {
+        if (!cancelled) setError(e instanceof Error ? e.message : '加载失败');
+      } finally {
+        if (!cancelled) setIsLoading(false);
+      }
+    };
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const filteredItems = useMemo(() => {
+    if (has3DFilter === 'all') return items;
+    if (has3DFilter === 'yes') return items.filter((x) => x.lastStatus === 'matched' || x.soleStatus === 'matched');
+    return items.filter((x) => x.lastStatus !== 'matched' && x.soleStatus !== 'matched');
+  }, [has3DFilter, items]);
 
   return (
     <div className="space-y-6 animate-in fade-in duration-500 pb-10">
@@ -230,12 +255,22 @@ export default function InventoryList() {
             </div>
           </div>
           <div className="text-sm text-slate-500">
-            共 <span className="font-medium text-slate-900">{mockInventory.length}</span> 条记录
+            共 <span className="font-medium text-slate-900">{filteredItems.length}</span> 条记录
           </div>
         </div>
 
         {/* Table */}
         <div className="overflow-x-auto">
+          {error && (
+            <div className="p-4 text-sm text-red-700 bg-red-50 border-b border-red-200">
+              {error}
+            </div>
+          )}
+          {isLoading && (
+            <div className="p-4 text-sm text-slate-600 bg-slate-50 border-b border-slate-200">
+              正在加载真实清单数据...
+            </div>
+          )}
           <table className="w-full text-sm text-left whitespace-nowrap">
             <thead className="text-xs text-slate-500 bg-slate-50 uppercase border-b border-slate-200">
               <tr>
@@ -253,7 +288,7 @@ export default function InventoryList() {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {mockInventory.map((item) => (
+              {filteredItems.map((item) => (
                 <tr key={item.id} className="hover:bg-slate-50/50 transition-colors group">
                   <td className="px-5 py-4 font-medium text-slate-900">{item.style_wms}</td>
                   <td className="px-5 py-4 text-slate-600">

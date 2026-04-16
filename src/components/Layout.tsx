@@ -74,13 +74,11 @@ export function Sidebar({ currentView, onNavigate, onLogout }: SidebarProps) {
 }
 
 export function Layout({ children, currentView, onNavigate, onLogout }: { children: React.ReactNode, currentView: string, onNavigate: (view: string) => void, onLogout: () => void }) {
-  const isFullWidth = currentView === 'inventory' || currentView === 'relation';
-
   return (
     <div className="flex h-screen bg-slate-50 overflow-hidden font-sans">
       <Sidebar currentView={currentView} onNavigate={onNavigate} onLogout={onLogout} />
       <main className="flex-1 overflow-y-auto">
-        <div className={cn("mx-auto p-8", isFullWidth ? "w-full" : "max-w-7xl")}>
+        <div className="w-full px-4 py-4">
           {children}
         </div>
       </main>

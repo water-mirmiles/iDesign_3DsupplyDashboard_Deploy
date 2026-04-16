@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { UploadCloud, FileSpreadsheet, Box, CheckCircle2, Clock, FileWarning, Search, Info, Calendar } from 'lucide-react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { UploadCloud, FileSpreadsheet, Box, CheckCircle2, Clock, FileWarning, Search, Info, Calendar, Play, Trash2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { ImportHistory } from '@/types';
 
@@ -10,17 +10,197 @@ const mockHistory: ImportHistory[] = [
   { id: '4', fileName: 'Invalid_Data.xlsx', type: 'xlsx', status: 'failed', uploadTime: '2024-05-19 16:45', operator: 'Admin', targetTable: '未知' },
 ];
 
+type UploadStatus = 'queued' | 'uploading' | 'success' | 'failed';
+type UploadQueueItem = {
+  id: string;
+  file: File;
+  status: UploadStatus;
+  progress: number; // 0-100
+  error?: string;
+};
+
+function formatBytes(bytes: number) {
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let v = bytes;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return `${v.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
 export default function DataCenter() {
   const [activeTab, setActiveTab] = useState<'xlsx' | '3d'>('xlsx');
+  const [queue, setQueue] = useState<UploadQueueItem[]>([]);
+  const [isUploading, setIsUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [history, setHistory] = useState<ImportHistory[]>(mockHistory);
+
+  const xlsxInputRef = useRef<HTMLInputElement | null>(null);
+  const assetInputRef = useRef<HTMLInputElement | null>(null);
+
+  const accept = useMemo(() => {
+    return activeTab === 'xlsx' ? '.xlsx,.xls' : '.obj,.stl,.3dm';
+  }, [activeTab]);
+
+  const loadHistory = async () => {
+    try {
+      const resp = await fetch('/api/history');
+      if (!resp.ok) return;
+      const json = (await resp.json()) as {
+        ok: boolean;
+        items: Array<{
+          id: string;
+          fileName: string;
+          size: number;
+          uploadTime: string;
+          snapshotDate?: string;
+          category: 'xlsx' | '3d_lasts' | '3d_soles' | 'unknown';
+        }>;
+      };
+      if (!json?.ok) return;
+
+      const mapped: ImportHistory[] = json.items.map((it) => ({
+        id: it.id,
+        fileName: it.fileName,
+        type: it.category === 'xlsx' ? 'xlsx' : '3d_model',
+        status: 'success',
+        uploadTime: it.uploadTime,
+        snapshotDate: it.snapshotDate,
+        operator: 'Storage',
+        targetTable: it.category === 'xlsx' ? '数据表文件' : it.category === '3d_soles' ? '3D 大底库' : '3D 楦头库',
+      }));
+      setHistory(mapped);
+    } catch {
+      // ignore for PoC
+    }
+  };
+
+  useEffect(() => {
+    void loadHistory();
+  }, []);
+
+  const handlePickFile = () => {
+    setUploadError(null);
+    if (isUploading) return;
+    if (activeTab === 'xlsx') xlsxInputRef.current?.click();
+    else assetInputRef.current?.click();
+  };
+
+  const addFilesToQueue = (files: File[]) => {
+    const allowedExts = activeTab === 'xlsx'
+      ? new Set(['xlsx', 'xls'])
+      : new Set(['obj', 'stl', '3dm']);
+
+    const picked = files.filter((f) => {
+      const ext = f.name.split('.').pop()?.toLowerCase();
+      return ext ? allowedExts.has(ext) : false;
+    });
+    if (picked.length === 0) return;
+
+    setQueue((prev) => {
+      const existing = new Set(prev.map((p) => `${p.file.name}::${p.file.size}`));
+      const next = [...prev];
+      for (const f of picked) {
+        const key = `${f.name}::${f.size}`;
+        if (existing.has(key)) continue;
+        next.push({
+          id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+          file: f,
+          status: 'queued',
+          progress: 0,
+        });
+      }
+      return next;
+    });
+  };
+
+  const handleFileSelected = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []) as File[];
+    e.target.value = '';
+    addFilesToQueue(files);
+  };
+
+  const onDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+  };
+
+  const onDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (isUploading) return;
+    const files = Array.from(e.dataTransfer.files || []) as File[];
+    addFilesToQueue(files);
+  };
+
+  const uploadOneWithProgress = (itemId: string, file: File) => {
+    return new Promise<void>((resolve, reject) => {
+      const form = new FormData();
+      form.append('files', file);
+
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/api/upload', true);
+
+      xhr.upload.onprogress = (evt) => {
+        if (!evt.lengthComputable) return;
+        const p = Math.round((evt.loaded / evt.total) * 100);
+        setQueue((prev) => prev.map((it) => (it.id === itemId ? { ...it, progress: p } : it)));
+      };
+
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) resolve();
+        else reject(new Error(xhr.responseText || `上传失败（HTTP ${xhr.status}）`));
+      };
+      xhr.onerror = () => reject(new Error('网络错误'));
+      xhr.onabort = () => reject(new Error('已取消'));
+
+      xhr.send(form);
+    });
+  };
+
+  const startUpload = async () => {
+    if (isUploading) return;
+    const toUpload = queue.filter((q) => q.status === 'queued' || q.status === 'failed');
+    if (toUpload.length === 0) return;
+
+    setIsUploading(true);
+    setUploadError(null);
+
+    try {
+      for (const q of toUpload) {
+        setQueue((prev) => prev.map((it) => (it.id === q.id ? { ...it, status: 'uploading', progress: 0, error: undefined } : it)));
+        try {
+          await uploadOneWithProgress(q.id, q.file);
+          setQueue((prev) => prev.map((it) => (it.id === q.id ? { ...it, status: 'success', progress: 100 } : it)));
+        } catch (e) {
+          const message = e instanceof Error ? e.message : '上传失败';
+          setQueue((prev) => prev.map((it) => (it.id === q.id ? { ...it, status: 'failed', error: message } : it)));
+        }
+      }
+      await loadHistory();
+    } catch (e) {
+      const message = e instanceof Error ? e.message : '上传失败';
+      setUploadError(message);
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
+  const clearQueue = () => {
+    if (isUploading) return;
+    setQueue([]);
+  };
 
   return (
-    <div className="space-y-6 animate-in fade-in duration-500">
+    <div className="space-y-6 animate-in fade-in duration-500 w-full">
       <div>
         <h1 className="text-2xl font-semibold text-slate-900">数据导入中心</h1>
         <p className="text-sm text-slate-500 mt-1">上传业务表格与 3D 资产文件，系统将自动进行匹配</p>
       </div>
 
-      <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+      <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden w-full">
         {/* Tabs */}
         <div className="flex border-b border-slate-200">
           <button
@@ -49,33 +229,145 @@ export default function DataCenter() {
 
         {/* Upload Area */}
         <div className="p-8">
-          <div className="border-2 border-dashed border-slate-300 rounded-xl bg-slate-50 hover:bg-slate-100 transition-colors cursor-pointer flex flex-col items-center justify-center py-16 px-4 text-center">
+          <input
+            ref={xlsxInputRef}
+            type="file"
+            accept=".xlsx,.xls"
+            multiple
+            className="hidden"
+            onChange={handleFileSelected}
+          />
+          <input
+            ref={assetInputRef}
+            type="file"
+            accept=".obj,.stl,.3dm"
+            multiple
+            className="hidden"
+            onChange={handleFileSelected}
+          />
+
+          <div
+            onClick={handlePickFile}
+            onDragOver={onDragOver}
+            onDrop={onDrop}
+            className={cn(
+              "border-2 border-dashed border-slate-300 rounded-xl bg-slate-50 transition-colors cursor-pointer flex flex-col items-center justify-center py-14 px-6 text-center w-full",
+              isUploading ? "opacity-70 cursor-not-allowed" : "hover:bg-slate-100"
+            )}
+          >
             <div className="p-4 bg-white rounded-full shadow-sm mb-4">
               <UploadCloud className="w-8 h-8 text-blue-500" />
             </div>
             <h3 className="text-lg font-semibold text-slate-900 mb-1">
-              点击或拖拽文件到此处上传
+              {isUploading ? '上传中...' : '点击选择或拖拽文件到此处（支持多选）'}
             </h3>
-            <p className="text-sm text-slate-500 max-w-md mb-4">
+            <p className="text-sm text-slate-500 max-w-2xl mb-4">
               {activeTab === 'xlsx' 
                 ? "支持 .xlsx, .xls 格式。请确保表格包含款号、品牌等关键字段以便系统解析。"
-                : "支持 .obj, .stl, .zip 格式。系统将尝试通过文件名自动匹配对应的款号或资产编号。"}
+                : "支持 .obj, .stl, .3dm 格式。后端将按文件名关键字自动分拨到 楦头/大底 目录。"}
             </p>
-            
+
             <div className="flex items-center gap-2 text-xs text-amber-600 bg-amber-50 px-3 py-1.5 rounded-md border border-amber-100">
               <Info className="w-3.5 h-3.5" />
               <span>建议命名规范：<strong>日期前缀_文件名.xlsx</strong>（例如：20240414_product_info.xlsx，系统将自动提取为快照时间点）</span>
             </div>
 
-            <button className="mt-6 px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 transition-colors shadow-sm">
-              选择文件
-            </button>
+            {uploadError && (
+              <div className="mt-4 text-xs text-red-600 bg-red-50 border border-red-200 px-3 py-2 rounded-lg max-w-2xl w-full">
+                {uploadError}
+              </div>
+            )}
+
+            <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
+              <button
+                type="button"
+                onClick={(ev) => {
+                  ev.stopPropagation();
+                  handlePickFile();
+                }}
+                disabled={isUploading}
+                className="px-4 py-2 bg-white border border-slate-200 text-slate-700 text-sm font-medium rounded-lg hover:bg-slate-50 transition-colors shadow-sm disabled:opacity-50"
+              >
+                选择文件
+              </button>
+              <button
+                type="button"
+                onClick={(ev) => {
+                  ev.stopPropagation();
+                  void startUpload();
+                }}
+                disabled={isUploading || queue.every((q) => q.status !== 'queued' && q.status !== 'failed')}
+                className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 transition-colors shadow-sm disabled:opacity-50"
+              >
+                <Play className="w-4 h-4" />
+                开始上传
+              </button>
+              <button
+                type="button"
+                onClick={(ev) => {
+                  ev.stopPropagation();
+                  clearQueue();
+                }}
+                disabled={isUploading || queue.length === 0}
+                className="flex items-center gap-2 px-4 py-2 bg-slate-900 text-white text-sm font-medium rounded-lg hover:bg-slate-800 transition-colors shadow-sm disabled:opacity-50"
+              >
+                <Trash2 className="w-4 h-4" />
+                清空队列
+              </button>
+            </div>
+          </div>
+
+          <div className="mt-6 bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden w-full">
+            <div className="px-5 py-4 border-b border-slate-200 flex justify-between items-center bg-slate-50/50">
+              <h3 className="text-base font-semibold text-slate-900">待上传队列</h3>
+              <div className="text-sm text-slate-500">
+                共 <span className="font-medium text-slate-900">{queue.length}</span> 个文件
+              </div>
+            </div>
+            {queue.length === 0 ? (
+              <div className="p-8 text-sm text-slate-500">
+                暂无待上传文件。可点击选择或直接拖拽多个文件到上方区域。
+              </div>
+            ) : (
+              <div className="divide-y divide-slate-100">
+                {queue.map((q) => (
+                  <div key={q.id} className="px-5 py-4 flex flex-col gap-2">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="font-medium text-slate-900 truncate max-w-[70vw]">{q.file.name}</div>
+                        <div className="text-xs text-slate-500">{formatBytes(q.file.size)}</div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        {q.status === 'queued' && <span className="text-xs px-2 py-1 rounded-md bg-slate-100 text-slate-600 border border-slate-200">等待中</span>}
+                        {q.status === 'uploading' && <span className="text-xs px-2 py-1 rounded-md bg-blue-50 text-blue-700 border border-blue-200">上传中</span>}
+                        {q.status === 'success' && <span className="text-xs px-2 py-1 rounded-md bg-emerald-50 text-emerald-700 border border-emerald-200">成功</span>}
+                        {q.status === 'failed' && <span className="text-xs px-2 py-1 rounded-md bg-red-50 text-red-700 border border-red-200">失败</span>}
+                      </div>
+                    </div>
+                    <div className="w-full h-2 bg-slate-100 rounded-full overflow-hidden">
+                      <div
+                        className={cn(
+                          "h-full transition-all duration-200",
+                          q.status === 'failed' ? "bg-red-500" : q.status === 'success' ? "bg-emerald-500" : "bg-blue-500"
+                        )}
+                        style={{ width: `${q.progress}%` }}
+                      />
+                    </div>
+                    {q.status === 'failed' && q.error && (
+                      <div className="text-xs text-red-600 bg-red-50 border border-red-200 px-3 py-2 rounded-lg">
+                        {q.error}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         </div>
       </div>
 
       {/* History List */}
-      <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+      <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden w-full">
         <div className="px-5 py-4 border-b border-slate-200 flex justify-between items-center bg-slate-50/50">
           <h3 className="text-base font-semibold text-slate-900">历史导入记录</h3>
           <div className="relative">
@@ -102,7 +394,7 @@ export default function DataCenter() {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {mockHistory.map((item) => (
+              {history.map((item) => (
                 <tr key={item.id} className="hover:bg-slate-50/50 transition-colors">
                   <td className="px-5 py-3 font-medium text-slate-900 flex items-center gap-2">
                     {item.type === 'xlsx' ? <FileSpreadsheet className="w-4 h-4 text-emerald-500" /> : <Box className="w-4 h-4 text-blue-500" />}

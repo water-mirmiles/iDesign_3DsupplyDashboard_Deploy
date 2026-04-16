@@ -1,0 +1,24 @@
+# Role and Context
+你是一名资深的全栈工程师和鞋履供应链专家。本项目名为 "Supply3D"，核心目标是追踪款号、SKC 与 3D 楦/底资产的匹配进度。
+
+# Tech Stack
+- React, Tailwind CSS, Lucide React, Recharts.
+
+# Business Logic Rules
+1. **数据优先级**：Dashboard 统计默认仅针对 `data_status == '生效'` 的款号。
+2. **三级关联结构**：款号 (Style) -> SKC (Style+Color+Material) -> 资产 (Last/Sole)。
+3. **匹配规则**：使用 3D 文件名匹配资产 ID（如 LST-xxx 匹配 楦头 ID）。
+4. **时间维度**：支持按快照日期 (snapshot_date) 对比月度增量（+X%）。
+
+# Coding Standards
+- 使用函数式组件 (Functional Components)。
+- **UI 规范**：始终保持 `w-full` 全屏布局，禁止浪费左右空间（避免 `max-w-*` 限宽容器；如必须限宽需给出明确业务理由）。
+- **禁止假逻辑**：禁止使用 `setTimeout` / 延时器模拟异步或“假加载”。所有数据处理必须基于真实算法逻辑（解析/映射/关联/统计），异步仅来自真实 I/O（如读取文件、真实请求）。
+- **SQL 优先**：字段匹配/映射必须优先参考你提供的 `ods_pdm_pdm_product_info_df` 建表语句中的 `COMMENT` 信息（中文含义优先于字段名猜测）；如冲突，以 COMMENT 为准并在实现中保留可追溯来源。
+- **状态管理**：数据必须提升到全局（例如 React Context，或在 `App.tsx` 统一分发/管理），确保 `Dashboard` 与 `InventoryList`（以及其它页面）使用同一份数据源与同一套派生统计结果。
+- **模块化约束**：解析/映射/统计逻辑必须抽离为独立模块（建议 `src/lib/data/` 下拆分 `ddlParser.ts`、`xlsxImporter.ts`、`mapper.ts`、`metrics.ts`），UI 层仅做展示与交互编排。
+
+# Git / SOP 约束（工作流）
+- **提交触发**：仅当用户明确要求“提交/commit”时，才执行本地 `git add` + `git commit`；严禁擅自提交或推送。
+- **同步权限**：严禁自动执行 `git push`；每次本地 commit 后必须询问用户是否同步到 GitHub。
+- **运行报错提示**：若代码运行报错或回归明显，必须主动提出：“是否需要回滚到上一个 Git 版本？”
