@@ -107,13 +107,7 @@ type DdlSchemaResponse = {
   error?: string;
 };
 
-type SandboxUploadedFile = {
-  originalName: string;
-  storedName?: string;
-  headers?: string[];
-  firstRow?: Record<string, string>;
-  error?: string;
-};
+type Column = { name: string; comment?: string };
 
 export default function SchemaMapping() {
   const [standardFields, setStandardFields] = useState<GlobalSchemaField[]>(initialStandardFields);
@@ -123,6 +117,7 @@ export default function SchemaMapping() {
   const [ddlParsed, setDdlParsed] = useState<DdlColumn[]>([]);
   // Step 1 parsing result: tableName -> columns (from backend local parser)
   const [parsedTables, setParsedTables] = useState<AiTable[]>([]);
+  const [parsedTableMap, setParsedTableMap] = useState<Record<string, Column[]>>({});
   const [isParsingDdl, setIsParsingDdl] = useState(false);
   const ddlParseTimerRef = useRef<number | null>(null);
   const ddlParseAbortRef = useRef<AbortController | null>(null);
@@ -154,18 +149,14 @@ export default function SchemaMapping() {
   const [error, setError] = useState<string | null>(null);
   const [hasAttemptedAuth, setHasAttemptedAuth] = useState(false);
 
-  /** 沙盒样本：上传文件清单（不做跨表合并，避免命名冲突） */
-  const [sandboxFiles, setSandboxFiles] = useState<SandboxUploadedFile[]>([]);
-  const [activeSandboxFileIdx, setActiveSandboxFileIdx] = useState(0);
-  const [sandboxUploadHint, setSandboxUploadHint] = useState<string>('');
-  const [isParsingFiles, setIsParsingFiles] = useState(false);
+  const [isUploadingDataTables, setIsUploadingDataTables] = useState(false);
 
   const [authSyncing, setAuthSyncing] = useState(false);
   const [authSyncHint, setAuthSyncHint] = useState<string>('');
   const authSyncHintTimerRef = useRef<number | null>(null);
 
   const ddlTableNames = useMemo(() => {
-    const out = (parsedTables || []).map((t) => String(t?.tableName || '').trim()).filter(Boolean);
+    const out = Object.keys(parsedTableMap || {}).map((k) => String(k || '').trim()).filter(Boolean);
     if (out.length) return out;
     const text = String(ddlText || '');
     const re = /create\s+table\s+([`"]?)([\w.]+)\1/gi;
@@ -181,35 +172,15 @@ export default function SchemaMapping() {
       fallback.push(name);
     }
     return fallback;
-  }, [parsedTables, ddlText]);
-
-  const ddlColumnsByTable = useMemo(() => {
-    const map: Record<string, Array<{ name: string; comment?: string }>> = {};
-    for (const t of parsedTables || []) {
-      const tn = String(t?.tableName || '').trim();
-      if (!tn) continue;
-      map[tn] = Array.isArray(t?.columns) ? t.columns : [];
-    }
-    return map;
-  }, [parsedTables]);
+  }, [parsedTableMap, ddlText]);
 
   const mappingPreview: MappingEntry[] = useMemo(() => buildCertifiedMapping(standardFields), [standardFields]);
-
-  const normalizeTableName = (s: string) => String(s || '').trim().toLowerCase().replace(/\.xlsx$/i, '');
 
   // 主表字段对齐由 AI 自动完成：不在点击前做“尚未映射”的硬校验
   const masterTableErrors = useMemo(() => {
     if (!masterTable) return ['请先选择业务主表'];
     return [];
   }, [masterTable]);
-
-  // 选择主表后：自动对齐样本文件（名字包含主表名）
-  useEffect(() => {
-    if (!masterTable || sandboxFiles.length === 0) return;
-    const mt = normalizeTableName(masterTable);
-    const idx = sandboxFiles.findIndex((f) => normalizeTableName(f.originalName).includes(mt));
-    if (idx >= 0) setActiveSandboxFileIdx(idx);
-  }, [masterTable, sandboxFiles]);
 
   // Step 1：DDL 粘贴后，后端即时解析“表名 + 字段列表”
   useEffect(() => {
@@ -235,12 +206,27 @@ export default function SchemaMapping() {
           const json = (await resp.json().catch(() => null)) as DdlSchemaResponse | null;
           if (!resp.ok || !json?.ok) {
             setParsedTables([]);
+            setParsedTableMap({});
             return;
           }
-          setParsedTables(Array.isArray(json.tables) ? json.tables : []);
+          const tablesArr = Array.isArray(json.tables) ? json.tables : [];
+          setParsedTables(tablesArr);
+          const map: Record<string, Column[]> = {};
+          for (const t of tablesArr) {
+            const tn = String(t?.tableName || '').trim();
+            if (!tn) continue;
+            const cols = Array.isArray(t?.columns)
+              ? t.columns
+                  .map((c: any) => ({ name: String(c?.name || '').trim(), comment: c?.comment ? String(c.comment) : '' }))
+                  .filter((c: any) => c.name)
+              : [];
+            map[tn] = cols;
+          }
+          setParsedTableMap(map);
         } catch (e) {
           if (String((e as any)?.name || '').includes('AbortError')) return;
           setParsedTables([]);
+          setParsedTableMap({});
         } finally {
           setIsParsingDdl(false);
         }
@@ -470,6 +456,28 @@ export default function SchemaMapping() {
     }
   };
 
+  const handleDataTablesUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    setError(null);
+    const files = e.target.files;
+    if (!files?.length) return;
+    const all = Array.from(files) as File[];
+    const fd = new FormData();
+    for (const f of all) fd.append('files', f);
+    try {
+      setIsUploadingDataTables(true);
+      const resp = await fetch(`${API_BASE}/api/upload`, { method: 'POST', body: fd });
+      if (!resp.ok) throw new Error(`上传失败（HTTP ${resp.status}）`);
+      const json = (await resp.json().catch(() => null)) as any;
+      if (!json?.ok) throw new Error(json?.error || '上传失败');
+      await refreshHeaders();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '上传失败');
+    } finally {
+      setIsUploadingDataTables(false);
+    }
+    e.target.value = '';
+  };
+
   const loadSamples = async (fileName: string) => {
     if (!fileName) return;
     try {
@@ -567,18 +575,12 @@ export default function SchemaMapping() {
       setAiTables([]);
       const controller = new AbortController();
       const t = window.setTimeout(() => controller.abort(), 180000);
-      const activeSandboxFile = sandboxFiles[activeSandboxFileIdx];
-      const sampleRow =
-        activeSandboxFile?.firstRow && Object.keys(activeSandboxFile.firstRow).length > 0
-          ? activeSandboxFile.firstRow
-          : undefined;
       const resp = await fetch('/api/ai-parse-multi-sql', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,
         body: JSON.stringify({
           sqlText: ddlText,
-          sampleRow: sampleRow || undefined,
           masterTable: masterTable || undefined,
           goldenSamples: goldenSamples.map((s) => ({ tableName: s.tableName, fieldName: s.fieldName, value: s.value })),
         }),
@@ -692,41 +694,7 @@ export default function SchemaMapping() {
     }
   };
 
-  const handleSandboxUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    setError(null);
-    const files = e.target.files;
-    if (!files?.length) return;
-    const all = Array.from(files) as File[];
-    const fd = new FormData();
-    for (const f of all) fd.append('files', f);
-    try {
-      setIsParsingFiles(true);
-      const resp = await fetch('/api/upload-sandbox-xlsx', { method: 'POST', body: fd });
-      if (!resp.ok) throw new Error(`沙盒上传失败（HTTP ${resp.status}）`);
-      const json = (await resp.json()) as { ok: boolean; files?: SandboxUploadedFile[] };
-      if (!json.ok) throw new Error('沙盒上传失败');
-      const normalized = (json.files || []).map((f) => ({
-        originalName: String((f as any).originalName || (f as any).storedName || 'unknown.xlsx'),
-        storedName: typeof (f as any).storedName === 'string' ? (f as any).storedName : undefined,
-        headers: Array.isArray((f as any).headers) ? (f as any).headers.map(String) : undefined,
-        firstRow:
-          (f as any).firstRow && typeof (f as any).firstRow === 'object' && !Array.isArray((f as any).firstRow)
-            ? Object.fromEntries(Object.entries((f as any).firstRow).map(([k, v]) => [String(k), String(v ?? '')]))
-            : undefined,
-        error: typeof (f as any).error === 'string' ? (f as any).error : undefined,
-      }));
-      setSandboxFiles(normalized);
-      setActiveSandboxFileIdx(0);
-      setSandboxUploadHint(`已上传 ${normalized.length} 个样本文件（不合并，按表分组）`);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : '沙盒上传失败');
-    } finally {
-      setIsParsingFiles(false);
-    }
-    e.target.value = '';
-  };
-
-  // NOTE: 旧版“沙盒 7 维校验”已从主流程移除（改为右侧真实数据预览 + 手工纠偏）
+  // NOTE: 旧版“沙盒 7 维校验/沙盒上传”已从主流程移除（改为 data_tables 文件列表 + 真实数据预览 + 手工纠偏）
 
   const handleAuthAndSync = async () => {
     if (authSyncing) return;
@@ -757,7 +725,7 @@ export default function SchemaMapping() {
 
   // 并发保护：仅在“AI 建模 / 发布 / 真实值预览抓取 / 样本 XLSX 解析”期间禁止用户修改配置
   // DDL 的即时解析（isParsingDdl）不应阻塞用户继续编辑
-  const busy = isAiModeling || authSyncing || isParsingFiles || resolvingRow;
+  const busy = isAiModeling || authSyncing || isUploadingDataTables || resolvingRow;
   const activeMapping = mappingPreview.find((m) => m.standardKey === activeFieldKey);
   const activeToken = String(activeMapping?.physicalColumn || '');
   const resolvedValueForActive = useMemo(() => {
@@ -779,7 +747,7 @@ export default function SchemaMapping() {
       )}
 
       <div className="w-full px-2 lg:px-4 h-[calc(100vh-8rem)] flex flex-col gap-2">
-        {/* Step 1: SQL 输入区（逻辑底座） */}
+        {/* Step 1: 提供原材料（SQL & 样本文件） */}
         <div className="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
           <div className="px-3 py-2 bg-slate-900 text-white flex flex-wrap items-center justify-between gap-2">
             <div className="text-sm font-semibold">Step 1 · 提供原材料（SQL & 样本文件）</div>
@@ -789,51 +757,75 @@ export default function SchemaMapping() {
               已解析 <span className="font-mono">{parsedTables.length}</span> 张表结构
             </div>
           </div>
-          <div className="p-3 space-y-2">
-            <textarea
-              value={ddlText}
-              onChange={(e) => setDdlText(e.target.value)}
-              placeholder="粘贴多表 DDL（含 COMMENT 更佳）。粘贴后系统会即时解析表名与字段列表…"
-              className="w-full min-h-[180px] max-h-[360px] p-3 text-xs border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent resize-y font-mono text-slate-700 bg-slate-50/30"
-              disabled={busy}
-            />
-            {isParsingDdl && <div className="text-[11px] text-slate-500">正在解析 DDL…</div>}
-
-            <div className="flex flex-wrap items-center gap-2 pt-1">
-              <label className="inline-flex items-center gap-2 px-3 py-1.5 text-[11px] font-medium rounded-lg bg-white border border-emerald-400 text-emerald-900 cursor-pointer hover:bg-emerald-50">
-                <input
-                  type="file"
-                  accept=".xlsx,.xls"
-                  multiple
-                  className="hidden"
-                  disabled={busy}
-                  onChange={(e) => void handleSandboxUpload(e)}
-                />
-                {isParsingFiles ? '解析中…' : '上传样本 XLSX（可选）'}
-              </label>
-              {sandboxFiles.length > 0 && (
-                <>
-                  <span className="text-[11px] text-slate-600">用于 AI sampleRow：</span>
-                  <select
-                    value={activeSandboxFileIdx}
+          <div className="p-3 grid grid-cols-12 gap-3">
+            {/* Left: Physical files (data_tables) */}
+            <div className="col-span-12 lg:col-span-6 border border-slate-200 rounded-xl overflow-hidden">
+              <div className="px-3 py-2 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-2">
+                <div className="text-[11px] font-semibold text-slate-800">物理文件区（data_tables）</div>
+                <label className="inline-flex items-center gap-2 px-3 py-1.5 text-[11px] font-medium rounded-lg bg-white border border-emerald-400 text-emerald-900 cursor-pointer hover:bg-emerald-50">
+                  <input
+                    type="file"
+                    accept=".xlsx,.xls"
+                    multiple
+                    className="hidden"
                     disabled={busy}
-                    onChange={(e) => setActiveSandboxFileIdx(Number(e.target.value) || 0)}
-                    className="text-[11px] border border-slate-200 rounded-lg px-2 py-1 bg-white text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                  >
-                    {sandboxFiles.map((f, idx) => (
-                      <option key={`${f.originalName}-${idx}`} value={idx}>
-                        {f.originalName}
-                      </option>
-                    ))}
-                  </select>
-                  <span className="text-[11px] text-slate-500">
-                    {sandboxFiles[activeSandboxFileIdx]?.firstRow
-                      ? `${Object.keys(sandboxFiles[activeSandboxFileIdx]?.firstRow || {}).length} 列样本行`
-                      : '无首行样本'}
-                  </span>
-                </>
-              )}
-              {sandboxUploadHint ? <span className="text-[11px] text-slate-500">{sandboxUploadHint}</span> : null}
+                    onChange={(e) => void handleDataTablesUpload(e)}
+                  />
+                  {isUploadingDataTables ? '上传中…' : '上传样本 XLSX'}
+                </label>
+              </div>
+              <div className="p-3 space-y-2">
+                <div className="text-[11px] text-slate-600">
+                  最新目录：<span className="font-mono text-slate-800">{latestDir || '-'}</span>
+                  <span className="mx-2 text-slate-300">|</span>
+                  文件数：<span className="font-mono text-slate-800">{Object.keys(tables || {}).length}</span>
+                </div>
+                <div className="max-h-[260px] overflow-y-auto border border-slate-200 rounded-lg bg-white">
+                  {Object.keys(tables || {}).length ? (
+                    <div className="divide-y divide-slate-100">
+                      {Object.keys(tables || {}).map((fileName) => (
+                        <button
+                          key={fileName}
+                          type="button"
+                          disabled={busy}
+                          onClick={() => {
+                            setSelectedFile(fileName);
+                            void loadSamples(fileName);
+                          }}
+                          className={cn(
+                            'w-full text-left px-3 py-2 text-[11px] font-mono hover:bg-slate-50',
+                            selectedFile === fileName ? 'bg-indigo-50 text-indigo-900' : 'text-slate-700'
+                          )}
+                        >
+                          {fileName}
+                        </button>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="p-3 text-[11px] text-slate-500">暂无文件。请先上传，或检查 `server/storage/data_tables`。</div>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Right: SQL / DDL */}
+            <div className="col-span-12 lg:col-span-6 border border-slate-200 rounded-xl overflow-hidden">
+              <div className="px-3 py-2 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-2">
+                <div className="text-[11px] font-semibold text-slate-800">逻辑定义区（SQL/DDL）</div>
+                <div className="text-[11px] text-slate-600">
+                  已检测到 <span className="font-mono text-slate-900">{detectedTableCount}</span> 张表
+                </div>
+              </div>
+              <div className="p-3 space-y-2">
+                <textarea
+                  value={ddlText}
+                  onChange={(e) => setDdlText(e.target.value)}
+                  placeholder="粘贴多表 DDL（含 COMMENT 更佳）。粘贴后系统会即时解析表名与字段列表…"
+                  className="w-full min-h-[240px] max-h-[360px] p-3 text-xs border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent resize-y font-mono text-slate-700 bg-slate-50/30"
+                  disabled={busy}
+                />
+                {isParsingDdl && <div className="text-[11px] text-slate-500">正在解析 DDL…</div>}
+              </div>
             </div>
           </div>
         </div>
@@ -894,9 +886,6 @@ export default function SchemaMapping() {
                     setDdlParsed([]);
                     setResolvedRow(null);
                     setResolvedMeta(null);
-                    setSandboxFiles([]);
-                    setSandboxUploadHint('');
-                    setActiveSandboxFileIdx(0);
                   }}
                   className="px-3 py-2 text-[11px] font-semibold rounded-lg bg-white border border-red-200 text-red-700 hover:bg-red-50 disabled:opacity-50"
                 >
@@ -929,7 +918,7 @@ export default function SchemaMapping() {
                   </div>
                 ) : (
                   goldenSamples.map((row) => {
-                    const colsRaw = row.tableName ? ddlColumnsByTable[row.tableName] || [] : [];
+                    const colsRaw = row.tableName ? parsedTableMap[row.tableName] || [] : [];
                     const cols = (() => {
                       // 体验优化：当选中“主表”时，在字段下拉里置顶/高亮“款号/品牌/状态”候选
                       if (!masterTable || row.tableName !== masterTable) return colsRaw;
@@ -981,7 +970,7 @@ export default function SchemaMapping() {
                             return (
                             <option key={c.name} value={c.name}>
                               {isHot ? `★ ${c.name}` : c.name}
-                              {c.comment ? `  #${c.comment}` : ''}
+                              {c.comment ? ` (${c.comment})` : ''}
                             </option>
                           )})}
                         </select>
