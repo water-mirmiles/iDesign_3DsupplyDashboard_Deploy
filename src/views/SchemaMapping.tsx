@@ -1,9 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AlertCircle, CheckCircle2, ChevronDown, ChevronUp, Database, Link as LinkIcon, Save, Sparkles } from 'lucide-react';
+import { AlertCircle, CheckCircle2, ChevronDown, ChevronUp, Database, Link as LinkIcon, Sparkles } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { GlobalSchemaField } from '@/types';
 
 const API_BASE = 'http://localhost:3001';
+const REQUIRED_MASTER_TABLE = 'ods_pdm_pdm_product_info_df';
 
 const initialStandardFields: GlobalSchemaField[] = [
   { id: 'f1', standardName: '款号', standardKey: 'styleCode', mappedSources: [], description: '产品的唯一标识符' },
@@ -158,8 +159,6 @@ export default function SchemaMapping() {
   const [isSuccess, setIsSuccess] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  /** 配置阶段 | 预览阶段（生产表头预览仍可随时查看） */
-  const [mapPhase, setMapPhase] = useState<'config' | 'preview'>('config');
   /** 沙盒样本：上传文件清单（不做跨表合并，避免命名冲突） */
   const [sandboxFiles, setSandboxFiles] = useState<SandboxUploadedFile[]>([]);
   const [activeSandboxFileIdx, setActiveSandboxFileIdx] = useState(0);
@@ -171,8 +170,9 @@ export default function SchemaMapping() {
   const [referenceDataOpen, setReferenceDataOpen] = useState(false);
   const [isParsingFiles, setIsParsingFiles] = useState(false);
 
-  const draftStatusClearTimerRef = useRef<number | null>(null);
-  const [draftSaveStatus, setDraftSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  const [authSyncing, setAuthSyncing] = useState(false);
+  const [authSyncHint, setAuthSyncHint] = useState<string>('');
+  const authSyncHintTimerRef = useRef<number | null>(null);
 
   const ddlTableNames = useMemo(() => {
     const text = String(ddlText || '');
@@ -201,6 +201,12 @@ export default function SchemaMapping() {
       errors.push('错误：请先指定业务主表（Master Table）。');
       return errors;
     }
+    // 若 DDL 中包含固定主表名，则必须选择该主表
+    const ddlHasRequired = ddlTableNames.some((t) => normalizeTableName(t) === normalizeTableName(REQUIRED_MASTER_TABLE));
+    if (ddlHasRequired && normalizeTableName(masterTable) !== normalizeTableName(REQUIRED_MASTER_TABLE)) {
+      errors.push(`错误：当前 DDL 检测到主表 ${REQUIRED_MASTER_TABLE}，请将其指定为业务主表。`);
+      return errors;
+    }
     const required: Array<{ key: string; label: string }> = [
       { key: 'styleCode', label: '款号' },
       { key: 'brand', label: '品牌' },
@@ -226,10 +232,9 @@ export default function SchemaMapping() {
       }
     }
     return errors;
-  }, [masterTable, mappingPreview]);
+  }, [ddlTableNames, masterTable, mappingPreview]);
 
-  const flushDraftSave = useCallback(async () => {
-    setDraftSaveStatus('saving');
+  const saveSchemaDraft = useCallback(async () => {
     try {
       // Golden Record（按产品要求：5 维度）
       const goldenRecord: SchemaDraftGolden = {
@@ -265,16 +270,12 @@ export default function SchemaMapping() {
         }
         throw new Error(detail);
       }
-      setDraftSaveStatus('saved');
-      if (draftStatusClearTimerRef.current) window.clearTimeout(draftStatusClearTimerRef.current);
-      draftStatusClearTimerRef.current = window.setTimeout(() => setDraftSaveStatus('idle'), 3000);
+      return { ok: true as const };
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       // eslint-disable-next-line no-console
       console.error('[save-schema-draft] 保存异常', msg, e);
-      setDraftSaveStatus('error');
-      if (draftStatusClearTimerRef.current) window.clearTimeout(draftStatusClearTimerRef.current);
-      draftStatusClearTimerRef.current = window.setTimeout(() => setDraftSaveStatus('idle'), 4000);
+      return { ok: false as const, error: msg };
     }
   }, [ddlText, masterTable, referenceColorCode, referenceLastCode, referenceMaterialCode, referenceSoleCode, referenceStyleCode]);
 
@@ -309,7 +310,7 @@ export default function SchemaMapping() {
 
   useEffect(() => {
     return () => {
-      if (draftStatusClearTimerRef.current) window.clearTimeout(draftStatusClearTimerRef.current);
+      if (authSyncHintTimerRef.current) window.clearTimeout(authSyncHintTimerRef.current);
     };
   }, []);
 
@@ -493,7 +494,7 @@ export default function SchemaMapping() {
     setIsSuccess(true);
   };
 
-  const handleAiLogicModeling = async () => {
+  const handleAiLogicModeling = async (): Promise<{ ok: true } | { ok: false; error: string }> => {
     setError(null);
     setAiBusy503(false);
     setAiQueueHint(true);
@@ -566,16 +567,18 @@ export default function SchemaMapping() {
       setAiQueueHint(false);
       applyAiResultsToFields(sug, jp);
       setAiReportOpen(true);
+      return { ok: true };
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'AI 多表解析失败';
       if (String((e as any)?.name || '').includes('AbortError')) {
         setAiQueueHint(false);
         setAiBusy503(false);
         setError('AI 解析超时（>180s），建议分批粘贴 SQL 或减少沙盒文件体积。');
-        return;
+        return { ok: false, error: 'AI 解析超时（>180s），建议分批粘贴 SQL 或减少沙盒文件体积。' };
       }
       if (String(msg).includes('503')) setAiBusy503(true);
       setError(msg);
+      return { ok: false, error: msg };
     } finally {
       setIsAiModeling(false);
     }
@@ -611,7 +614,7 @@ export default function SchemaMapping() {
     );
   };
 
-  const handleSaveMappingAuthenticated = async () => {
+  const handleSaveMappingAuthenticated = async (): Promise<{ ok: true } | { ok: false; error: string }> => {
     setError(null);
     try {
       const payload = {
@@ -629,8 +632,11 @@ export default function SchemaMapping() {
       const json = (await resp.json()) as { ok: boolean; error?: string };
       if (!json.ok) throw new Error(json.error || '保存失败');
       setIsSuccess(true);
+      return { ok: true };
     } catch (e) {
-      setError(e instanceof Error ? e.message : '保存失败');
+      const msg = e instanceof Error ? e.message : '保存失败';
+      setError(msg);
+      return { ok: false, error: msg };
     }
   };
 
@@ -670,7 +676,7 @@ export default function SchemaMapping() {
     e.target.value = '';
   };
 
-  const handleSandboxValidate = async () => {
+  const handleSandboxValidate = async (): Promise<{ ok: true; allPass: boolean } | { ok: false; error: string }> => {
     setError(null);
     setSandboxValidating(true);
     setSandboxChecks(null);
@@ -722,10 +728,62 @@ export default function SchemaMapping() {
       setSandboxAllPass(Boolean(json.allPass));
       // eslint-disable-next-line no-console
       console.log('[sandbox-validate]', json);
+      return { ok: true, allPass: Boolean(json.allPass) };
     } catch (err) {
-      setError(err instanceof Error ? err.message : '沙盒校验失败');
+      const msg = err instanceof Error ? err.message : '沙盒校验失败';
+      setError(msg);
+      return { ok: false, error: msg };
     } finally {
       setSandboxValidating(false);
+    }
+  };
+
+  const handleAuthAndSync = async () => {
+    if (authSyncing) return;
+    setError(null);
+    setAuthSyncHint('');
+    if (masterTableErrors.length > 0) {
+      setError(masterTableErrors[0]);
+      return;
+    }
+    if (!ddlText.trim()) {
+      setError('请先粘贴 DDL/SQL');
+      return;
+    }
+    if (!referenceStyleCode.trim()) {
+      setError('请先填写黄金样本：款号（styleCode）');
+      return;
+    }
+    if (sandboxFiles.length === 0) {
+      setError('请先上传样本 XLSX（用于自动沙盒验证）');
+      return;
+    }
+
+    setAuthSyncing(true);
+    try {
+      setAuthSyncHint('AI 解析中…');
+      const ai = await handleAiLogicModeling();
+      if (ai.ok === false) throw new Error(ai.error);
+
+      setAuthSyncHint('沙盒验证中…');
+      const sb = await handleSandboxValidate();
+      if (sb.ok === false) throw new Error(sb.error);
+      if (!sb.allPass) throw new Error('沙盒验证未通过：请检查黄金样本或映射链路');
+
+      setAuthSyncHint('保存配置中…');
+      const savedMapping = await handleSaveMappingAuthenticated();
+      if (savedMapping.ok === false) throw new Error(savedMapping.error);
+
+      const draft = await saveSchemaDraft();
+      if (draft.ok === false) throw new Error(draft.error);
+
+      setAuthSyncHint('逻辑已认证！看板数据已根据最新映射完成重算。');
+      if (authSyncHintTimerRef.current) window.clearTimeout(authSyncHintTimerRef.current);
+      authSyncHintTimerRef.current = window.setTimeout(() => setAuthSyncHint(''), 6000);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '一键认证失败');
+    } finally {
+      setAuthSyncing(false);
     }
   };
 
@@ -813,80 +871,6 @@ export default function SchemaMapping() {
               当前槽位：<span className="font-medium text-slate-800">{activeField.standardName}</span>
             </div>
           </div>
-          <div className="flex flex-wrap items-center gap-3 shrink-0">
-            <div
-              className="flex items-center gap-2 rounded-full border border-slate-200 bg-white pl-2.5 pr-1 py-1"
-              title={mapPhase === 'config' ? '当前：配置映射与沙盒验证' : '当前：查看生产表头抽样预览'}
-            >
-              <span className={cn('text-[11px] font-medium', mapPhase === 'config' ? 'text-slate-900' : 'text-slate-400')}>
-                配置
-              </span>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={mapPhase === 'preview'}
-                onClick={() => setMapPhase((p) => (p === 'config' ? 'preview' : 'config'))}
-                className={cn(
-                  'relative h-7 w-12 shrink-0 rounded-full transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:ring-offset-2',
-                  mapPhase === 'preview' ? 'bg-indigo-600' : 'bg-slate-300'
-                )}
-              >
-                <span
-                  className={cn(
-                    'absolute top-1 left-1 h-5 w-5 rounded-full bg-white shadow transition-transform',
-                    mapPhase === 'preview' && 'translate-x-5'
-                  )}
-                />
-              </button>
-              <span className={cn('text-[11px] font-medium', mapPhase === 'preview' ? 'text-slate-900' : 'text-slate-400')}>
-                预览
-              </span>
-            </div>
-            <button
-              type="button"
-              onClick={() => void refreshHeaders()}
-              className="px-2.5 py-1.5 text-xs font-medium rounded-lg bg-white border border-slate-200 text-slate-700 hover:bg-slate-50"
-            >
-              刷新表头
-            </button>
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => void flushDraftSave()}
-                disabled={draftSaveStatus === 'saving'}
-                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-lg bg-white border border-slate-200 text-slate-800 hover:bg-slate-50"
-                title="将 DDL、Golden、沙盒合并行与左侧映射写入 schema_draft.json（非生产认证）"
-              >
-                <Save className="w-3.5 h-3.5" />
-                {draftSaveStatus === 'saving' ? '保存中…' : '保存当前配置草稿'}
-              </button>
-              {draftSaveStatus === 'saving' && (
-                <span className="text-[10px] text-slate-400 whitespace-nowrap">保存中…</span>
-              )}
-              {draftSaveStatus === 'saved' && (
-                <span className="text-[10px] text-emerald-600 whitespace-nowrap">已保存</span>
-              )}
-              {draftSaveStatus === 'error' && (
-                <span className="text-[10px] text-red-600 whitespace-nowrap">保存失败</span>
-              )}
-            </div>
-            <button
-              type="button"
-              onClick={handleSaveMappingAuthenticated}
-              disabled={!sandboxAllPass || masterTableErrors.length > 0}
-              title={
-                !sandboxAllPass
-                  ? '请先运行逻辑测试并通过沙盒校验'
-                  : masterTableErrors.length > 0
-                    ? masterTableErrors[0]
-                    : '沙盒校验通过，且主表核心字段已映射到主表，可认证'
-              }
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-emerald-700 text-white border border-emerald-800 hover:bg-emerald-800 disabled:opacity-40 disabled:cursor-not-allowed"
-            >
-              <CheckCircle2 className="w-4 h-4" />
-              保存并认证逻辑
-            </button>
-          </div>
         </div>
 
         {error && (
@@ -905,6 +889,30 @@ export default function SchemaMapping() {
                   <CheckCircle2 className="w-3.5 h-3.5" /> 7 维逻辑已打通
                 </span>
               )}
+            </div>
+            <div className="px-3 py-2 border-b border-slate-200 bg-white">
+              <div className="text-[11px] font-semibold text-slate-900">第一步：指定业务主表</div>
+              <div className="mt-1 flex flex-wrap items-center gap-2">
+                <select
+                  value={masterTable}
+                  onChange={(e) => setMasterTable(e.target.value)}
+                  className="text-[11px] px-2 py-1.5 rounded-lg bg-white border border-slate-200 text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                >
+                  <option value="">请选择 DDL 中的表名…</option>
+                  {ddlTableNames.map((t) => (
+                    <option key={t} value={t}>
+                      {t}
+                    </option>
+                  ))}
+                </select>
+                {masterTable ? (
+                  <span className="text-[11px] text-slate-600">
+                    已锁定 <span className="font-mono text-slate-900">{masterTable}</span> 为业务底盘
+                  </span>
+                ) : (
+                  <span className="text-[11px] text-amber-700">未选择主表时无法认证</span>
+                )}
+              </div>
             </div>
             {masterTable && (
               <div className="px-3 py-2 text-[11px] bg-slate-50 border-b border-slate-200 text-slate-700">
@@ -1010,13 +1018,19 @@ export default function SchemaMapping() {
                 </label>
                 <button
                   type="button"
-                  onClick={() => void handleSandboxValidate()}
-                  disabled={sandboxValidating}
-                  className="px-3 py-1.5 text-[11px] font-semibold rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50"
+                  onClick={() => void handleAuthAndSync()}
+                  disabled={authSyncing || isAiModeling || sandboxValidating || isParsingFiles}
+                  className="px-3 py-1.5 text-[11px] font-semibold rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
+                  title="AI 解析 → Join 推导 → 沙盒验证 → 保存并触发看板重算"
                 >
-                  {sandboxValidating ? '校验中…' : '运行逻辑测试'}
+                  {authSyncing ? '认证中…' : '一键认证并同步看板 (Auth & Sync)'}
                 </button>
               </div>
+              {authSyncHint && (
+                <div className="text-[11px] text-indigo-700 bg-indigo-50 border border-indigo-200 px-3 py-2 rounded-lg">
+                  {authSyncHint}
+                </div>
+              )}
               {sandboxPassSummary && (
                 <div className="flex flex-wrap items-center gap-3 text-[11px]">
                   <span className="font-semibold text-slate-800">
@@ -1037,47 +1051,7 @@ export default function SchemaMapping() {
           <div className={cn('border rounded-xl overflow-hidden', activeFieldKey ? 'border-indigo-400 ring-2 ring-indigo-100' : 'border-slate-200')}>
             <div className="px-3 py-2 bg-slate-900 text-white flex flex-wrap items-center justify-between gap-2">
               <div className="text-xs font-semibold">DDL/SQL 批量粘贴区</div>
-              <div className="flex items-center gap-2">
-                {isSuccess && (
-                  <span className="inline-flex items-center gap-1 text-[11px] text-emerald-200">
-                    <CheckCircle2 className="w-4 h-4" /> 已建模
-                  </span>
-                )}
-                <div className="hidden md:flex items-center gap-2">
-                  <span className="text-[11px] text-slate-200">指定业务主表</span>
-                  <select
-                    value={masterTable}
-                    onChange={(e) => setMasterTable(e.target.value)}
-                    className="text-[11px] px-2 py-1 rounded-lg bg-white/10 border border-white/20 text-white focus:outline-none focus:ring-2 focus:ring-indigo-400"
-                    title="从 DDL 中识别的表名列表选择主表"
-                  >
-                    <option value="">请选择…</option>
-                    {ddlTableNames.map((t) => (
-                      <option key={t} value={t}>
-                        {t}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => void handleAiLogicModeling()}
-                  disabled={isAiModeling}
-                  title={aiBusy503 ? '上次请求繁忙，可重试' : undefined}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-[11px] font-semibold rounded-lg bg-indigo-500 hover:bg-indigo-600 disabled:opacity-50"
-                >
-                  {isAiModeling ? (
-                    <span className="w-3.5 h-3.5 rounded-full border-2 border-white/30 border-t-white animate-spin inline-block" />
-                  ) : (
-                    <Sparkles className="w-3.5 h-3.5" />
-                  )}
-                  {isAiModeling
-                    ? '建模中…'
-                    : detectedTableCount > 0
-                      ? `AI 逻辑建模（${detectedTableCount} 张表）`
-                      : 'AI 逻辑建模（全关联解析）'}
-                </button>
-              </div>
+              <div className="text-[11px] text-slate-300">当前检测到 {detectedTableCount} 张表</div>
             </div>
             <div className="p-3 grid grid-cols-1 gap-2">
               {isAiModeling && (
@@ -1117,9 +1091,6 @@ export default function SchemaMapping() {
                 placeholder="粘贴多表 DDL（含 COMMENT 更佳）…"
                 className="w-full min-h-[220px] max-h-[360px] p-3 text-xs border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent resize-y font-mono text-slate-700 bg-slate-50/30"
               />
-              <div className="text-[11px] text-slate-500">
-                当前检测到 <span className="font-mono text-slate-800">{detectedTableCount}</span> 张表
-              </div>
             </div>
           </div>
 
