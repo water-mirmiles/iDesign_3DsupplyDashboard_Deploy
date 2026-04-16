@@ -745,6 +745,26 @@ app.get('/api/health', (_req, res) => {
   res.json({ ok: true });
 });
 
+// 本地快速解析：从多表 DDL 中提取表名 + 字段名列表（供前端动态样本配置下拉框使用）
+app.post('/api/parse-ddl-schema', async (req, res) => {
+  const sqlText = String(req.body?.sqlText || '');
+  if (!sqlText.trim()) return res.status(400).json({ ok: false, error: 'sqlText is required' });
+  try {
+    const ddls = splitCreateTableStatements(sqlText);
+    if (!ddls.length) return res.json({ ok: true, tables: [] });
+    const tables = ddls
+      .map((ddl, idx) => {
+        const parsed = parseSingleTableLocal(ddl);
+        if (!parsed?.tableName) parsed.tableName = extractTableNameFromDdl(ddl) || `table_${idx + 1}`;
+        return parsed;
+      })
+      .filter((t) => t?.tableName);
+    return res.json({ ok: true, tables });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e instanceof Error ? e.message : 'parse failed' });
+  }
+});
+
 // 调试：列出当前 API Key 可用模型
 app.get('/api/debug/gemini-models', async (_req, res) => {
   const out = await listGeminiModels();
@@ -817,6 +837,29 @@ app.get('/api/table-samples', async (req, res) => {
   return res.json({ ok: true, fileName, headers, samples });
 });
 
+// 预览：根据当前 mapping（含 CHAIN joinPath）从最新 XLSX 抽取一行真实数据
+app.post('/api/preview-mapping-row', async (req, res) => {
+  await ensureStorageDirs();
+  try {
+    const mappingArr = Array.isArray(req.body?.mapping) ? req.body.mapping : null;
+    if (!mappingArr?.length) return res.status(400).json({ ok: false, error: 'mapping array required' });
+    const latestDir = await getLatestDataTablesDir();
+    const standardMap = buildStandardMap(mappingArr);
+    const resolved = await resolveFirstActiveRowFromFolder({ folderPath: latestDir, standardMap });
+    if (!resolved.ok) return res.json({ ok: false, error: resolved.error || 'resolve failed' });
+    return res.json({
+      ok: true,
+      latestDir: path.basename(latestDir),
+      mainTable: resolved.mainTable,
+      usedFallbackRow: resolved.usedFallbackRow,
+      warning: resolved.warning,
+      row: resolved.row || {},
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e instanceof Error ? e.message : 'preview failed' });
+  }
+});
+
 // Gemini AI 解析 DDL：仅返回 JSON 数组 [{"fieldName","comment"}]
 app.post('/api/ai-parse-ddl', async (req, res) => {
   const sqlText = String(req.body?.sqlText || '');
@@ -884,6 +927,15 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
   const sqlText = String(req.body?.sqlText || '');
   const reference = req.body?.reference || null;
   const masterTable = typeof req.body?.masterTable === 'string' ? String(req.body.masterTable).trim() : '';
+  const goldenSamples = Array.isArray(req.body?.goldenSamples)
+    ? req.body.goldenSamples
+        .map((x) => ({
+          tableName: typeof x?.tableName === 'string' ? String(x.tableName).trim() : '',
+          fieldName: typeof x?.fieldName === 'string' ? String(x.fieldName).trim() : '',
+          value: typeof x?.value === 'string' ? String(x.value) : '',
+        }))
+        .filter((x) => x.tableName && x.fieldName)
+    : [];
   const sampleRow =
     req.body?.sampleRow && typeof req.body.sampleRow === 'object' && !Array.isArray(req.body.sampleRow)
       ? req.body.sampleRow
@@ -1010,6 +1062,16 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
           `你现在是一个数据专家/数据侦探。请解析以下提供的所有 SQL DDL 表结构信息。用户共提供了 ${total} 张表。`,
           partTotal > 1 ? `为性能考虑，本次是第 ${partIndex + 1}/${partTotal} 批（每批最多 5 张表）。请在本批次内尽可能推断 Join 关系与映射。` : '',
           masterTable ? `用户已手动指定 ${masterTable} 为业务主表（Master Table）。请以该表为起点寻找到其它表的 Join Path。` : '',
+          goldenSamples.length
+            ? [
+                '',
+                '用户提供了“动态黄金样本（Dynamic Golden Sample）”—— 每条样本是 (table.field = value)。',
+                '你的任务之一：推断【主表】如何通过 Join 到达这些样本字段，并保证该字段在正确链路下能得到该 value（用于你推理外键/关联字段）。',
+                '样本清单：',
+                ...goldenSamples.slice(0, 50).map((s) => `- ${s.tableName}.${s.fieldName} = ${JSON.stringify(String(s.value ?? ''))}`),
+                goldenSamples.length > 50 ? `- ... 省略 ${goldenSamples.length - 50} 条` : '',
+              ].filter(Boolean).join('\n')
+            : '',
           '已知存在“黄金样本 (Golden Record)”用于验证最终链路是否正确。',
           '',
           '新增关键任务（必须完成）：',
@@ -1186,11 +1248,22 @@ app.post('/api/save-schema-draft', async (req, res) => {
     const goldenRaw = body.goldenRecord;
     const goldenRecord =
       goldenRaw && typeof goldenRaw === 'object' && !Array.isArray(goldenRaw) ? goldenRaw : {};
+    const goldenSamplesRaw = body.goldenSamples;
+    const goldenSamples = Array.isArray(goldenSamplesRaw)
+      ? goldenSamplesRaw
+          .map((x) => ({
+            tableName: typeof x?.tableName === 'string' ? x.tableName : '',
+            fieldName: typeof x?.fieldName === 'string' ? x.fieldName : '',
+            value: typeof x?.value === 'string' ? x.value : '',
+          }))
+          .filter((x) => x.tableName || x.fieldName || x.value)
+      : [];
 
     const out = {
       savedAt: new Date().toISOString(),
       ddlText,
       goldenRecord,
+      goldenSamples,
       masterTable,
     };
 

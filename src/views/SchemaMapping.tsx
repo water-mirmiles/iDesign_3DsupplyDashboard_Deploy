@@ -92,27 +92,19 @@ function normalize(s: string) {
   return (s || '').trim().toLowerCase();
 }
 
-const SANDBOX_DIM_KEYS = ['styleCode', 'brand', 'lastCode', 'soleCode', 'colorCode', 'materialCode', 'status'] as const;
-type SandboxDimKey = (typeof SANDBOX_DIM_KEYS)[number];
+// NOTE: 沙盒校验（7 维逐项比对）已从主流程移除；保留样本 XLSX 上传仅用于 AI sampleRow 与右侧数据预览。
 
-const SANDBOX_DIM_LABEL: Record<SandboxDimKey, string> = {
-  styleCode: '款号',
-  brand: '品牌',
-  lastCode: '楦编号',
-  soleCode: '大底编号',
-  colorCode: '颜色',
-  materialCode: '材质',
-  status: '状态',
+type GoldenSampleEntry = {
+  id: string;
+  tableName: string;
+  fieldName: string;
+  value: string;
 };
 
-type SchemaDraftGolden = {
-  styleCode?: string;
-  brand?: string;
-  lastCode?: string;
-  soleCode?: string;
-  colorCode?: string;
-  materialCode?: string;
-  status?: string;
+type DdlSchemaResponse = {
+  ok: boolean;
+  tables?: AiTable[];
+  error?: string;
 };
 
 type SandboxUploadedFile = {
@@ -129,21 +121,21 @@ export default function SchemaMapping() {
 
   const [ddlText, setDdlText] = useState('');
   const [ddlParsed, setDdlParsed] = useState<DdlColumn[]>([]);
+  // Step 1 parsing result: tableName -> columns (from backend local parser)
+  const [parsedTables, setParsedTables] = useState<AiTable[]>([]);
+  const [isParsingDdl, setIsParsingDdl] = useState(false);
+  const ddlParseTimerRef = useRef<number | null>(null);
+  const ddlParseAbortRef = useRef<AbortController | null>(null);
+
   const [aiTables, setAiTables] = useState<AiTable[]>([]);
   const [aiSuggestions, setAiSuggestions] = useState<AiSuggestion[]>([]);
   const [aiJoinPaths, setAiJoinPaths] = useState<AiJoinPath[]>([]);
   const [activeAiTable, setActiveAiTable] = useState<string>('');
   const [activeAiField, setActiveAiField] = useState<{ tableName: string; fieldName: string } | null>(null);
   const [isAiModeling, setIsAiModeling] = useState(false);
-  const [referenceStyleCode, setReferenceStyleCode] = useState('');
-  const [referenceBrand, setReferenceBrand] = useState('');
-  const [referenceLastCode, setReferenceLastCode] = useState('');
-  const [referenceSoleCode, setReferenceSoleCode] = useState('');
-  const [referenceColorCode, setReferenceColorCode] = useState('');
-  const [referenceMaterialCode, setReferenceMaterialCode] = useState('');
-  const [referenceStatus, setReferenceStatus] = useState('');
   const [masterTable, setMasterTable] = useState('');
-  const [aiReportOpen, setAiReportOpen] = useState(false);
+  const [goldenSamples, setGoldenSamples] = useState<GoldenSampleEntry[]>([]);
+  const [ddlRefOpen, setDdlRefOpen] = useState(false);
   const [aiBusy503, setAiBusy503] = useState(false);
   const [aiQueueHint, setAiQueueHint] = useState(false);
   const [aiStatusText, setAiStatusText] = useState('');
@@ -154,6 +146,9 @@ export default function SchemaMapping() {
   const [selectedFile, setSelectedFile] = useState<string>('');
   const [samples, setSamples] = useState<Record<string, string[]>>({});
   const [headerSearch, setHeaderSearch] = useState('');
+  const [resolvedRow, setResolvedRow] = useState<Record<string, string> | null>(null);
+  const [resolvedMeta, setResolvedMeta] = useState<{ latestDir?: string; mainTable?: string; warning?: string } | null>(null);
+  const [resolvingRow, setResolvingRow] = useState(false);
 
   const [isSuccess, setIsSuccess] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -163,11 +158,6 @@ export default function SchemaMapping() {
   const [sandboxFiles, setSandboxFiles] = useState<SandboxUploadedFile[]>([]);
   const [activeSandboxFileIdx, setActiveSandboxFileIdx] = useState(0);
   const [sandboxUploadHint, setSandboxUploadHint] = useState<string>('');
-  const [sandboxChecks, setSandboxChecks] = useState<Record<string, { expected: string; actual: string; pass: boolean }> | null>(null);
-  const [sandboxAllPass, setSandboxAllPass] = useState<boolean | null>(null);
-  const [sandboxValidating, setSandboxValidating] = useState(false);
-  const [sandboxDetailOpen, setSandboxDetailOpen] = useState(false);
-  const [referenceDataOpen, setReferenceDataOpen] = useState(false);
   const [isParsingFiles, setIsParsingFiles] = useState(false);
 
   const [authSyncing, setAuthSyncing] = useState(false);
@@ -175,9 +165,11 @@ export default function SchemaMapping() {
   const authSyncHintTimerRef = useRef<number | null>(null);
 
   const ddlTableNames = useMemo(() => {
+    const out = (parsedTables || []).map((t) => String(t?.tableName || '').trim()).filter(Boolean);
+    if (out.length) return out;
     const text = String(ddlText || '');
     const re = /create\s+table\s+([`"]?)([\w.]+)\1/gi;
-    const out: string[] = [];
+    const fallback: string[] = [];
     const seen = new Set<string>();
     let m: RegExpExecArray | null = null;
     while ((m = re.exec(text))) {
@@ -186,10 +178,20 @@ export default function SchemaMapping() {
       const k = name.toLowerCase();
       if (seen.has(k)) continue;
       seen.add(k);
-      out.push(name);
+      fallback.push(name);
     }
-    return out;
-  }, [ddlText]);
+    return fallback;
+  }, [parsedTables, ddlText]);
+
+  const ddlColumnsByTable = useMemo(() => {
+    const map: Record<string, Array<{ name: string; comment?: string }>> = {};
+    for (const t of parsedTables || []) {
+      const tn = String(t?.tableName || '').trim();
+      if (!tn) continue;
+      map[tn] = Array.isArray(t?.columns) ? t.columns : [];
+    }
+    return map;
+  }, [parsedTables]);
 
   const mappingPreview: MappingEntry[] = useMemo(() => buildCertifiedMapping(standardFields), [standardFields]);
 
@@ -209,18 +211,54 @@ export default function SchemaMapping() {
     if (idx >= 0) setActiveSandboxFileIdx(idx);
   }, [masterTable, sandboxFiles]);
 
+  // Step 1：DDL 粘贴后，后端即时解析“表名 + 字段列表”
+  useEffect(() => {
+    if (ddlParseTimerRef.current) window.clearTimeout(ddlParseTimerRef.current);
+    if (ddlParseAbortRef.current) ddlParseAbortRef.current.abort();
+    const text = String(ddlText || '').trim();
+    if (!text) {
+      setParsedTables([]);
+      return;
+    }
+    ddlParseTimerRef.current = window.setTimeout(() => {
+      const controller = new AbortController();
+      ddlParseAbortRef.current = controller;
+      setIsParsingDdl(true);
+      (async () => {
+        try {
+          const resp = await fetch(`${API_BASE}/api/parse-ddl-schema`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal: controller.signal,
+            body: JSON.stringify({ sqlText: ddlText }),
+          });
+          const json = (await resp.json().catch(() => null)) as DdlSchemaResponse | null;
+          if (!resp.ok || !json?.ok) {
+            setParsedTables([]);
+            return;
+          }
+          setParsedTables(Array.isArray(json.tables) ? json.tables : []);
+        } catch (e) {
+          if (String((e as any)?.name || '').includes('AbortError')) return;
+          setParsedTables([]);
+        } finally {
+          setIsParsingDdl(false);
+        }
+      })().catch(() => {});
+    }, 250);
+    return () => {
+      if (ddlParseTimerRef.current) window.clearTimeout(ddlParseTimerRef.current);
+      if (ddlParseAbortRef.current) ddlParseAbortRef.current.abort();
+    };
+  }, [ddlText]);
+
   const saveSchemaDraft = useCallback(async () => {
     try {
-      // Golden Record（按产品要求：5 维度）
-      const goldenRecord: SchemaDraftGolden = {
-        styleCode: referenceStyleCode,
-        lastCode: referenceLastCode,
-        soleCode: referenceSoleCode,
-        colorCode: referenceColorCode,
-        materialCode: referenceMaterialCode,
+      const data = {
+        ddlText,
+        masterTable,
+        goldenSamples: goldenSamples.map((s) => ({ tableName: s.tableName, fieldName: s.fieldName, value: s.value })),
       };
-
-      const data = { ddlText, goldenRecord, masterTable };
       // eslint-disable-next-line no-console
       console.log('🚀 准备发送草稿:', data);
 
@@ -252,7 +290,7 @@ export default function SchemaMapping() {
       console.error('[save-schema-draft] 保存异常', msg, e);
       return { ok: false as const, error: msg };
     }
-  }, [ddlText, masterTable, referenceColorCode, referenceLastCode, referenceMaterialCode, referenceSoleCode, referenceStyleCode]);
+  }, [ddlText, goldenSamples, masterTable]);
 
   useEffect(() => {
     let alive = true;
@@ -265,14 +303,17 @@ export default function SchemaMapping() {
         const d = json.draft && typeof json.draft === 'object' && !Array.isArray(json.draft) ? json.draft : {};
         if (typeof d.ddlText === 'string') setDdlText(d.ddlText);
         if (typeof (d as any).masterTable === 'string') setMasterTable((d as any).masterTable);
-        const g = d.goldenRecord;
-        if (g && typeof g === 'object' && !Array.isArray(g)) {
-          const gr = g as SchemaDraftGolden;
-          if (typeof gr.styleCode === 'string') setReferenceStyleCode(gr.styleCode);
-          if (typeof gr.lastCode === 'string') setReferenceLastCode(gr.lastCode);
-          if (typeof gr.soleCode === 'string') setReferenceSoleCode(gr.soleCode);
-          if (typeof gr.colorCode === 'string') setReferenceColorCode(gr.colorCode);
-          if (typeof gr.materialCode === 'string') setReferenceMaterialCode(gr.materialCode);
+        const gs = (d as any).goldenSamples;
+        if (Array.isArray(gs)) {
+          const normalized = gs
+            .map((x: any, idx: number) => ({
+              id: `${Date.now()}_${idx}`,
+              tableName: typeof x?.tableName === 'string' ? x.tableName : '',
+              fieldName: typeof x?.fieldName === 'string' ? x.fieldName : '',
+              value: typeof x?.value === 'string' ? x.value : '',
+            }))
+            .filter((x: any) => x.tableName || x.fieldName || x.value);
+          setGoldenSamples(normalized);
         }
       } catch {
         // ignore load errors — 草稿可选
@@ -450,6 +491,54 @@ export default function SchemaMapping() {
     void loadSamples(selectedFile);
   }, [selectedFile]);
 
+  // Step 4：基于当前 mapping（含 Join Path）从最新 XLSX 抽取一行真实值用于预览
+  useEffect(() => {
+    const hasAny = mappingPreview.some((m) => Boolean(m.physicalColumn));
+    if (!hasAny) {
+      setResolvedRow(null);
+      setResolvedMeta(null);
+      return;
+    }
+    let alive = true;
+    setResolvingRow(true);
+    (async () => {
+      try {
+        const resp = await fetch(`${API_BASE}/api/preview-mapping-row`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mapping: mappingPreview }),
+        });
+        const json = (await resp.json().catch(() => null)) as any;
+        if (!alive) return;
+        if (!resp.ok || !json?.ok) {
+          setResolvedRow(null);
+          setResolvedMeta(null);
+          return;
+        }
+        const row =
+          json.row && typeof json.row === 'object' && !Array.isArray(json.row)
+            ? Object.fromEntries(Object.entries(json.row).map(([k, v]) => [String(k), String(v ?? '')]))
+            : null;
+        setResolvedRow(row);
+        setResolvedMeta({
+          latestDir: typeof json.latestDir === 'string' ? json.latestDir : undefined,
+          mainTable: typeof json.mainTable === 'string' ? json.mainTable : undefined,
+          warning: typeof json.warning === 'string' ? json.warning : undefined,
+        });
+      } catch {
+        if (!alive) return;
+        setResolvedRow(null);
+        setResolvedMeta(null);
+      } finally {
+        if (!alive) return;
+        setResolvingRow(false);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [mappingPreview]);
+
   /** 将 AI 返回的直连字段 + Join 链路一次性写入标准字段（Join 优先覆盖同 key） */
   const applyAiResultsToFields = (sug: AiSuggestion[], jp: AiJoinPath[]) => {
     setStandardFields((prev) => {
@@ -491,17 +580,7 @@ export default function SchemaMapping() {
           sqlText: ddlText,
           sampleRow: sampleRow || undefined,
           masterTable: masterTable || undefined,
-          reference: referenceStyleCode.trim()
-            ? {
-                styleCode: referenceStyleCode.trim(),
-                ...(referenceBrand.trim() ? { brand: referenceBrand.trim() } : {}),
-                ...(referenceLastCode.trim() ? { lastCode: referenceLastCode.trim() } : {}),
-                ...(referenceSoleCode.trim() ? { soleCode: referenceSoleCode.trim() } : {}),
-                ...(referenceColorCode.trim() ? { colorCode: referenceColorCode.trim() } : {}),
-                ...(referenceMaterialCode.trim() ? { materialCode: referenceMaterialCode.trim() } : {}),
-                ...(referenceStatus.trim() ? { status: referenceStatus.trim() } : {}),
-              }
-            : null,
+          goldenSamples: goldenSamples.map((s) => ({ tableName: s.tableName, fieldName: s.fieldName, value: s.value })),
         }),
       });
       window.clearTimeout(t);
@@ -541,7 +620,6 @@ export default function SchemaMapping() {
       setDdlParsed(flattened);
       setAiQueueHint(false);
       applyAiResultsToFields(sug, jp);
-      setAiReportOpen(true);
       return { ok: true };
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'AI 多表解析失败';
@@ -596,7 +674,6 @@ export default function SchemaMapping() {
         latestDir,
         mapping: mappingPreview,
         mappingAuthenticated: true,
-        sandboxValidatedAt: sandboxAllPass ? new Date().toISOString() : undefined,
       };
       const resp = await fetch('/api/save-mapping', {
         method: 'POST',
@@ -641,8 +718,6 @@ export default function SchemaMapping() {
       setSandboxFiles(normalized);
       setActiveSandboxFileIdx(0);
       setSandboxUploadHint(`已上传 ${normalized.length} 个样本文件（不合并，按表分组）`);
-      setSandboxChecks(null);
-      setSandboxAllPass(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : '沙盒上传失败');
     } finally {
@@ -651,89 +726,18 @@ export default function SchemaMapping() {
     e.target.value = '';
   };
 
-  const handleSandboxValidate = async (): Promise<{ ok: true; allPass: boolean } | { ok: false; error: string }> => {
-    setError(null);
-    setSandboxValidating(true);
-    setSandboxChecks(null);
-    setSandboxAllPass(null);
-    try {
-      if (!masterTable) throw new Error('请先指定业务主表（Master Table）');
-      const styleMap = mappingPreview.find((m) => m.standardKey === 'styleCode');
-      if (!styleMap?.physicalColumn || String(styleMap.physicalColumn).startsWith('CHAIN|')) {
-        throw new Error('沙盒校验前请先将【款号】直接映射到主表列');
-      }
-      const styleCol = String(styleMap.physicalColumn);
-      const sandboxMaster = sandboxFiles.find((f) => normalizeTableName(f.originalName) === normalizeTableName(masterTable) || f.originalName.includes(masterTable));
-      if (sandboxFiles.length > 0 && !sandboxMaster) {
-        throw new Error(`沙盒样本中未找到主表文件：${masterTable}（请确保样本文件名包含主表名）`);
-      }
-      if (sandboxMaster) {
-        const headers = sandboxMaster.headers || Object.keys(sandboxMaster.firstRow || {});
-        if (!headers.some((h) => normalize(h) === normalize(styleCol))) {
-          throw new Error(`沙盒主表 ${sandboxMaster.originalName} 缺少款号列：${styleCol}`);
-        }
-      }
-
-      const mapping = buildCertifiedMapping(standardFields);
-      const resp = await fetch('/api/sandbox-validate-mapping', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          mapping,
-          expected: {
-            styleCode: referenceStyleCode.trim(),
-            brand: referenceBrand.trim(),
-            lastCode: referenceLastCode.trim(),
-            soleCode: referenceSoleCode.trim(),
-            colorCode: referenceColorCode.trim(),
-            materialCode: referenceMaterialCode.trim(),
-            status: referenceStatus.trim(),
-          },
-        }),
-      });
-      const json = (await resp.json()) as {
-        ok: boolean;
-        checks?: Record<string, { expected: string; actual: string; pass: boolean }>;
-        allPass?: boolean;
-        error?: string;
-        resolvedRow?: Record<string, string>;
-      };
-      if (!json.ok) throw new Error(json.error || '沙盒校验失败');
-      setSandboxChecks(json.checks || null);
-      setSandboxAllPass(Boolean(json.allPass));
-      // eslint-disable-next-line no-console
-      console.log('[sandbox-validate]', json);
-      return { ok: true, allPass: Boolean(json.allPass) };
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : '沙盒校验失败';
-      setError(msg);
-      return { ok: false, error: msg };
-    } finally {
-      setSandboxValidating(false);
-    }
-  };
+  // NOTE: 旧版“沙盒 7 维校验”已从主流程移除（改为右侧真实数据预览 + 手工纠偏）
 
   const handleAuthAndSync = async () => {
     if (authSyncing) return;
     setHasAttemptedAuth(true);
     setError(null);
     setAuthSyncHint('');
-    if (!ddlText.trim()) return setError('请先粘贴 SQL/DDL');
-    if (!masterTable.trim()) return setError('请先从 DDL 中选择一个业务主表');
+    const hasAny = mappingPreview.some((m) => Boolean(m.physicalColumn));
+    if (!hasAny) return setError('尚无可发布的结果：请先执行 AI 逻辑建模或手动纠偏映射');
 
     setAuthSyncing(true);
     try {
-      setAuthSyncHint('AI 解析中…');
-      const ai = await handleAiLogicModeling();
-      if (ai.ok === false) throw new Error(ai.error);
-
-      setAuthSyncHint('沙盒验证中…');
-      if (sandboxFiles.length > 0) {
-        const sb = await handleSandboxValidate();
-        if (sb.ok === false) throw new Error(sb.error);
-        if (!sb.allPass) throw new Error('沙盒验证未通过：请检查黄金样本或映射链路');
-      }
-
       setAuthSyncHint('保存配置中…');
       const savedMapping = await handleSaveMappingAuthenticated();
       if (savedMapping.ok === false) throw new Error(savedMapping.error);
@@ -751,120 +755,107 @@ export default function SchemaMapping() {
     }
   };
 
-  const sandboxPassSummary = useMemo(() => {
-    if (!sandboxChecks) return null;
-    const passed = SANDBOX_DIM_KEYS.filter((k) => sandboxChecks[k]?.pass).length;
-    return { passed, total: SANDBOX_DIM_KEYS.length };
-  }, [sandboxChecks]);
+  // 并发保护：仅在“AI 建模 / 发布 / 真实值预览抓取 / 样本 XLSX 解析”期间禁止用户修改配置
+  // DDL 的即时解析（isParsingDdl）不应阻塞用户继续编辑
+  const busy = isAiModeling || authSyncing || isParsingFiles || resolvingRow;
+  const activeMapping = mappingPreview.find((m) => m.standardKey === activeFieldKey);
+  const activeToken = String(activeMapping?.physicalColumn || '');
+  const resolvedValueForActive = useMemo(() => {
+    const row = resolvedRow || {};
+    if (activeFieldKey === 'styleCode') return String((row as any).style_wms ?? '');
+    return String((row as any)[activeFieldKey] ?? '');
+  }, [activeFieldKey, resolvedRow]);
 
   return (
     <>
-    <div className="grid grid-cols-12 gap-2 w-full px-2 lg:px-4 h-[calc(100vh-8rem)]">
-      {/* Left: col-span-2 */}
-      <div className="col-span-12 lg:col-span-2 min-h-0 flex flex-col bg-white border border-slate-200 rounded-xl shadow-sm">
-        <div className="px-3 py-2 border-b border-slate-200 bg-slate-50/50">
-          <div className="text-sm font-semibold text-slate-900">标准字段</div>
-          <div className="text-[11px] text-slate-500 mt-0.5">点击后开始映射</div>
+      {busy && (
+        <div className="fixed inset-0 z-40 bg-black/20 backdrop-blur-[1px]">
+          <div className="absolute inset-x-0 top-0">
+            <div className="mx-auto w-full px-3 py-2 text-[11px] text-white bg-slate-900/90 border-b border-white/10">
+              {isAiModeling ? 'AI 建模中…' : authSyncing ? '正在发布到看板…' : resolvingRow ? '正在抓取真实数据预览…' : '处理中…'}
+            </div>
+          </div>
         </div>
-        <div className="flex-1 overflow-y-auto p-2 space-y-1 min-h-0">
-          {standardFields.map((field) => {
-            const isActive = field.standardKey === activeFieldKey;
-            const warn = hasUnmappedWarning(field);
-            return (
-              <button
-                key={field.id}
-                type="button"
-                onClick={() => setActiveFieldKey(field.standardKey)}
-                className={cn(
-                  "w-full text-left px-2.5 py-2 rounded-lg border transition-all",
-                  "bg-white hover:bg-slate-50",
-                  isActive ? "border-indigo-500 ring-2 ring-indigo-200 shadow-sm" : "border-slate-200",
-                  warn ? "border-red-300" : ""
-                )}
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <div className="flex items-center gap-2 min-w-0">
-                    <Database className={cn("w-4 h-4 shrink-0", warn ? "text-red-500" : isActive ? "text-indigo-600" : "text-slate-500")} />
-                    <span className={cn("text-sm font-medium truncate", isActive ? "text-slate-900" : "text-slate-800")}>
-                      {field.standardName}
-                    </span>
-                    {warn && <AlertCircle className="w-4 h-4 text-red-500 shrink-0" />}
-                  </div>
-                  <span className={cn("text-[10px] font-mono px-1.5 py-0.5 rounded border shrink-0",
-                    isActive ? "bg-indigo-50 text-indigo-700 border-indigo-200" : "bg-slate-50 text-slate-500 border-slate-200"
-                  )}>
-                    {field.standardKey}
+      )}
+
+      <div className="w-full px-2 lg:px-4 h-[calc(100vh-8rem)] flex flex-col gap-2">
+        {/* Step 1: SQL 输入区（逻辑底座） */}
+        <div className="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+          <div className="px-3 py-2 bg-slate-900 text-white flex flex-wrap items-center justify-between gap-2">
+            <div className="text-sm font-semibold">Step 1 · 提供原材料（SQL & 样本文件）</div>
+            <div className="text-[11px] text-slate-200">
+              已检测到 <span className="font-mono">{detectedTableCount}</span> 张表
+              <span className="mx-2 text-slate-500">|</span>
+              已解析 <span className="font-mono">{parsedTables.length}</span> 张表结构
+            </div>
+          </div>
+          <div className="p-3 space-y-2">
+            <textarea
+              value={ddlText}
+              onChange={(e) => setDdlText(e.target.value)}
+              placeholder="粘贴多表 DDL（含 COMMENT 更佳）。粘贴后系统会即时解析表名与字段列表…"
+              className="w-full min-h-[180px] max-h-[360px] p-3 text-xs border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent resize-y font-mono text-slate-700 bg-slate-50/30"
+              disabled={busy}
+            />
+            {isParsingDdl && <div className="text-[11px] text-slate-500">正在解析 DDL…</div>}
+
+            <div className="flex flex-wrap items-center gap-2 pt-1">
+              <label className="inline-flex items-center gap-2 px-3 py-1.5 text-[11px] font-medium rounded-lg bg-white border border-emerald-400 text-emerald-900 cursor-pointer hover:bg-emerald-50">
+                <input
+                  type="file"
+                  accept=".xlsx,.xls"
+                  multiple
+                  className="hidden"
+                  disabled={busy}
+                  onChange={(e) => void handleSandboxUpload(e)}
+                />
+                {isParsingFiles ? '解析中…' : '上传样本 XLSX（可选）'}
+              </label>
+              {sandboxFiles.length > 0 && (
+                <>
+                  <span className="text-[11px] text-slate-600">用于 AI sampleRow：</span>
+                  <select
+                    value={activeSandboxFileIdx}
+                    disabled={busy}
+                    onChange={(e) => setActiveSandboxFileIdx(Number(e.target.value) || 0)}
+                    className="text-[11px] border border-slate-200 rounded-lg px-2 py-1 bg-white text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  >
+                    {sandboxFiles.map((f, idx) => (
+                      <option key={`${f.originalName}-${idx}`} value={idx}>
+                        {f.originalName}
+                      </option>
+                    ))}
+                  </select>
+                  <span className="text-[11px] text-slate-500">
+                    {sandboxFiles[activeSandboxFileIdx]?.firstRow
+                      ? `${Object.keys(sandboxFiles[activeSandboxFileIdx]?.firstRow || {}).length} 列样本行`
+                      : '无首行样本'}
                   </span>
-                </div>
-                <div className="mt-1.5">
-                  {field.mappedSources.length > 0 ? (
-                    <div className="flex flex-wrap gap-1">
-                      {field.mappedSources.slice(0, 2).map((source, idx) => (
-                        <span key={idx} className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[11px] font-medium bg-slate-900 text-white border border-slate-800">
-                          <LinkIcon className="w-3 h-3" />
-                          {source}
-                        </span>
-                      ))}
-                      {field.mappedSources.length > 2 && (
-                        <span className="text-[11px] text-slate-500">+{field.mappedSources.length - 2}</span>
-                      )}
-                    </div>
-                  ) : (
-                    <div className="text-[11px] text-slate-500">未映射</div>
-                  )}
-                  {chainPreviewForStandardKey(field.standardKey) && (
-                    <div className="mt-1 text-[10px] text-slate-500">
-                      {chainPreviewForStandardKey(field.standardKey)}
-                    </div>
-                  )}
-                </div>
-              </button>
-            );
-          })}
-        </div>
-      </div>
-
-      {/* Middle: col-span-6 */}
-      <div className="col-span-12 lg:col-span-6 min-h-0 flex flex-col bg-white border border-slate-200 rounded-xl shadow-sm">
-        <div className="px-3 py-2 border-b border-slate-200 bg-slate-50/50 flex items-center justify-between gap-2">
-          <div className="min-w-0">
-            <div className="text-sm font-semibold text-slate-900">AI Logic & Source Tables</div>
-            <div className="text-[11px] text-slate-500 truncate">
-              最新目录：<span className="font-mono text-slate-700">{latestDir || '-'}</span>
-              <span className="mx-2 text-slate-300">|</span>
-              当前槽位：<span className="font-medium text-slate-800">{activeField.standardName}</span>
-            </div>
-          </div>
-        </div>
-
-        {hasAttemptedAuth && error && (
-          <div className="mx-3 mt-3 text-[11px] text-red-700 bg-red-50 border border-red-200 px-3 py-2 rounded-lg">
-            {error}
-          </div>
-        )}
-
-        {/* Middle body independent scroll */}
-        <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-3">
-          <div className="border border-indigo-200 rounded-xl bg-gradient-to-b from-indigo-50/50 to-white overflow-hidden shadow-sm">
-            <div className="px-3 py-2 bg-slate-900 text-white text-xs font-semibold flex items-center justify-between gap-2">
-              <span>材料驱动认证流程</span>
-              {sandboxAllPass === true && (
-                <span className="inline-flex items-center gap-1 text-[10px] font-normal text-emerald-300">
-                  <CheckCircle2 className="w-3.5 h-3.5" /> 7 维逻辑已打通
-                </span>
+                </>
               )}
+              {sandboxUploadHint ? <span className="text-[11px] text-slate-500">{sandboxUploadHint}</span> : null}
             </div>
-            <div className="px-3 py-2 border-b border-slate-200 bg-white">
-              <div className="text-[11px] font-semibold text-slate-900">Step 2: 指定核心</div>
-              <div className="mt-1 flex flex-wrap items-center gap-2">
+          </div>
+        </div>
+
+        {/* Step 2: 动态样本配置（核心重构） */}
+        <div className="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+          <div className="px-3 py-2 bg-slate-900 text-white flex items-center justify-between gap-2">
+            <div className="text-sm font-semibold">Step 2 · AI 学习区（动态样本配置）</div>
+            <div className="text-[11px] text-slate-200">严禁分析后清空：配置会一直保留并可保存草稿</div>
+          </div>
+          <div className="p-3 space-y-3">
+            <div className="grid grid-cols-12 gap-2 items-end">
+              <div className="col-span-12 lg:col-span-6">
+                <div className="text-[11px] font-medium text-slate-700 mb-1">业务主表（Master Table）</div>
                 <select
                   value={masterTable}
                   onChange={(e) => setMasterTable(e.target.value)}
-                  disabled={ddlTableNames.length === 0}
-                  className="text-[11px] px-2 py-1.5 rounded-lg bg-white border border-slate-200 text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  disabled={ddlTableNames.length === 0 || busy}
+                  className="w-full text-[11px] px-2 py-2 rounded-lg bg-white border border-slate-200 text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:bg-slate-50"
                 >
                   <option value="">
-                    {ddlTableNames.length === 0 ? '请先在下方粘贴 SQL/DDL…' : '请选择 DDL 中的表名…'}
+                    {ddlTableNames.length === 0 ? '请先粘贴 DDL（解析出表名后可选）…' : '请选择 DDL 中的表名…'}
                   </option>
                   {ddlTableNames.map((t) => (
                     <option key={t} value={t}>
@@ -872,523 +863,456 @@ export default function SchemaMapping() {
                     </option>
                   ))}
                 </select>
-                {masterTable ? (
-                  <span className="text-[11px] text-slate-600">
-                    已锁定 <span className="font-mono text-slate-900">{masterTable}</span> 为业务底盘
-                  </span>
+              </div>
+              <div className="col-span-12 lg:col-span-6 flex flex-wrap gap-2 justify-end">
+                <button
+                  type="button"
+                  onClick={() => void saveSchemaDraft()}
+                  disabled={busy}
+                  className="px-3 py-2 text-[11px] font-semibold rounded-lg bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-50"
+                  title="写入 server/storage/schema_draft.json"
+                >
+                  保存当前配置草稿
+                </button>
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => {
+                    setError(null);
+                    setHasAttemptedAuth(false);
+                    setAuthSyncHint('');
+                    setIsSuccess(false);
+                    setDdlText('');
+                    setParsedTables([]);
+                    setMasterTable('');
+                    setGoldenSamples([]);
+                    setStandardFields(initialStandardFields);
+                    setActiveFieldKey(initialStandardFields[0].standardKey);
+                    setAiTables([]);
+                    setAiSuggestions([]);
+                    setAiJoinPaths([]);
+                    setDdlParsed([]);
+                    setResolvedRow(null);
+                    setResolvedMeta(null);
+                    setSandboxFiles([]);
+                    setSandboxUploadHint('');
+                    setActiveSandboxFileIdx(0);
+                  }}
+                  className="px-3 py-2 text-[11px] font-semibold rounded-lg bg-white border border-red-200 text-red-700 hover:bg-red-50 disabled:opacity-50"
+                >
+                  一键清空配置
+                </button>
+              </div>
+            </div>
+
+            <div className="border border-slate-200 rounded-xl overflow-hidden">
+              <div className="px-3 py-2 bg-slate-50 border-b border-slate-200 flex items-center justify-between">
+                <div className="text-[11px] font-semibold text-slate-800">动态黄金样本（Dynamic Golden Sample）</div>
+                <button
+                  type="button"
+                  disabled={ddlTableNames.length === 0 || busy}
+                  onClick={() =>
+                    setGoldenSamples((prev) => [
+                      ...prev,
+                      { id: `${Date.now()}_${Math.random().toString(16).slice(2)}`, tableName: '', fieldName: '', value: '' },
+                    ])
+                  }
+                  className="px-2.5 py-1.5 text-[11px] font-semibold rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
+                >
+                  + 添加样本字段
+                </button>
+              </div>
+              <div className="p-3 space-y-2">
+                {goldenSamples.length === 0 ? (
+                  <div className="text-[11px] text-slate-500">
+                    还没有样本行。点击右上角「+ 添加样本字段」，用 (table.field=value) 给 AI 提供强约束路标。
+                  </div>
                 ) : (
-                  <span className="text-[11px] text-amber-700">未选择主表时无法认证</span>
+                  goldenSamples.map((row) => {
+                    const colsRaw = row.tableName ? ddlColumnsByTable[row.tableName] || [] : [];
+                    const cols = (() => {
+                      // 体验优化：当选中“主表”时，在字段下拉里置顶/高亮“款号/品牌/状态”候选
+                      if (!masterTable || row.tableName !== masterTable) return colsRaw;
+                      const score = (c: { name: string; comment?: string }) => {
+                        const hay = `${c.name || ''} ${(c.comment || '')}`.toLowerCase();
+                        const hasStyle = hay.includes('款号') || hay.includes('style') || hay.includes('style_wms');
+                        const hasBrand = hay.includes('品牌') || hay.includes('brand');
+                        const hasStatus = hay.includes('状态') || hay.includes('status') || hay.includes('data_status');
+                        return (hasStyle ? 30 : 0) + (hasBrand ? 20 : 0) + (hasStatus ? 10 : 0);
+                      };
+                      return [...colsRaw].sort((a, b) => score(b) - score(a));
+                    })();
+                    return (
+                      <div key={row.id} className="grid grid-cols-12 gap-2 items-center">
+                        <select
+                          value={row.tableName}
+                          disabled={busy}
+                          onChange={(e) => {
+                            const nextTable = e.target.value;
+                            setGoldenSamples((prev) =>
+                              prev.map((x) => (x.id === row.id ? { ...x, tableName: nextTable, fieldName: '' } : x))
+                            );
+                          }}
+                          className="col-span-12 lg:col-span-4 text-[11px] px-2 py-2 rounded-lg bg-white border border-slate-200 text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                        >
+                          <option value="">选择表名…</option>
+                          {ddlTableNames.map((t) => (
+                            <option key={t} value={t}>
+                              {t}
+                            </option>
+                          ))}
+                        </select>
+                        <select
+                          value={row.fieldName}
+                          disabled={!row.tableName || busy}
+                          onChange={(e) => {
+                            const nextField = e.target.value;
+                            setGoldenSamples((prev) => prev.map((x) => (x.id === row.id ? { ...x, fieldName: nextField } : x)));
+                          }}
+                          className="col-span-12 lg:col-span-4 text-[11px] px-2 py-2 rounded-lg bg-white border border-slate-200 text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:bg-slate-50"
+                        >
+                          <option value="">选择字段…</option>
+                          {cols.map((c) => {
+                            const hay = `${c.name || ''} ${(c.comment || '')}`.toLowerCase();
+                            const isHot =
+                              masterTable &&
+                              row.tableName === masterTable &&
+                              (hay.includes('款号') || hay.includes('style') || hay.includes('style_wms') || hay.includes('品牌') || hay.includes('brand') || hay.includes('状态') || hay.includes('status') || hay.includes('data_status'));
+                            return (
+                            <option key={c.name} value={c.name}>
+                              {isHot ? `★ ${c.name}` : c.name}
+                              {c.comment ? `  #${c.comment}` : ''}
+                            </option>
+                          )})}
+                        </select>
+                        <input
+                          value={row.value}
+                          disabled={busy}
+                          onChange={(e) => {
+                            const v = e.target.value;
+                            setGoldenSamples((prev) => prev.map((x) => (x.id === row.id ? { ...x, value: v } : x)));
+                          }}
+                          placeholder="填入该字段的正确值（黄金样本）"
+                          className="col-span-12 lg:col-span-3 text-[11px] border border-slate-200 rounded-lg px-2 py-2 bg-white text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                        />
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => setGoldenSamples((prev) => prev.filter((x) => x.id !== row.id))}
+                          className="col-span-12 lg:col-span-1 text-[11px] px-2 py-2 rounded-lg bg-white border border-slate-200 text-slate-600 hover:bg-slate-50"
+                          title="删除该样本行"
+                        >
+                          删除
+                        </button>
+                      </div>
+                    );
+                  })
                 )}
               </div>
             </div>
-            {masterTable && (
-              <div className="px-3 py-2 text-[11px] bg-slate-50 border-b border-slate-200 text-slate-700">
-                已锁定 <span className="font-mono text-slate-900">{masterTable}</span> 为业务底盘（Master Table）
+          </div>
+        </div>
+
+        {/* Step 3: AI 逻辑建模 */}
+        <div className="bg-slate-950 border border-slate-900 rounded-xl shadow-sm overflow-hidden">
+          <div className="p-3">
+            <button
+              type="button"
+              disabled={busy}
+              onClick={async () => {
+                setHasAttemptedAuth(true);
+                setError(null);
+                if (!ddlText.trim()) return setError('请先粘贴 SQL/DDL');
+                if (!masterTable.trim()) return setError('请先选择业务主表（Master Table）');
+                const ai = await handleAiLogicModeling();
+                if (ai.ok === false) return;
+                // 分析后：严禁清空输入；仅做一次草稿落盘（可选但强烈建议）
+                await saveSchemaDraft();
+              }}
+              className="w-full py-4 rounded-xl font-semibold tracking-wide shadow-sm bg-white text-slate-950 hover:bg-slate-100 disabled:opacity-60"
+              title="SQL + 动态样本配置 → Gemini 推导主表 Join 链路 → 回填 7 维结果"
+            >
+              <div className="flex items-center justify-center gap-3">
+                <Sparkles className="w-5 h-5" />
+                <span className="text-base lg:text-lg">Step 3 · 执行 AI 逻辑建模</span>
+              </div>
+              <div className="mt-1 text-[11px] text-slate-600">SQL → 动态样本配置 → AI 链路推导 → 下方检查与应用</div>
+            </button>
+
+            {(isAiModeling || aiStatusText || aiQueueHint || aiBusy503) && (
+              <div className="mt-2 text-[11px] text-slate-200">
+                {isAiModeling ? (aiStatusText || 'AI 正在解析并建模…') : null}
+                {aiProgress.total > 0 && isAiModeling && (
+                  <div className="mt-1 flex items-center gap-2">
+                    <div className="flex-1 h-2 rounded bg-slate-800 overflow-hidden">
+                      <div
+                        className="h-2 bg-indigo-500"
+                        style={{ width: `${Math.min(100, Math.round((aiProgress.done / Math.max(1, aiProgress.total)) * 100))}%` }}
+                      />
+                    </div>
+                    <div className="text-[10px] font-mono text-slate-300">
+                      {Math.min(aiProgress.done + 1, aiProgress.total)}/{aiProgress.total}
+                    </div>
+                  </div>
+                )}
+                {(aiBusy503 || aiQueueHint) && !isAiModeling && <div className="text-amber-200">AI 曾排队或繁忙；可再次点击重试。</div>}
               </div>
             )}
-            <div className="p-3 grid grid-cols-12 gap-2 border-b border-slate-100">
-              <div className="col-span-12 text-[11px] font-semibold text-slate-900">Step 1: 提供原材料</div>
-              <input
-                value={referenceStyleCode}
-                onChange={(e) => setReferenceStyleCode(e.target.value)}
-                placeholder="款号（styleCode）"
-                className="col-span-12 sm:col-span-6 md:col-span-4 text-[11px] border border-slate-200 rounded-lg px-2 py-1.5 bg-white text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              />
-              <input
-                value={referenceBrand}
-                onChange={(e) => setReferenceBrand(e.target.value)}
-                placeholder="品牌（brand）"
-                className="col-span-12 sm:col-span-6 md:col-span-4 text-[11px] border border-slate-200 rounded-lg px-2 py-1.5 bg-white text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              />
-              <input
-                value={referenceStatus}
-                onChange={(e) => setReferenceStatus(e.target.value)}
-                placeholder="状态（status）例如：生效"
-                className="col-span-12 sm:col-span-6 md:col-span-4 text-[11px] border border-slate-200 rounded-lg px-2 py-1.5 bg-white text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              />
-              <input
-                value={referenceLastCode}
-                onChange={(e) => setReferenceLastCode(e.target.value)}
-                placeholder="楦号（lastCode）"
-                className="col-span-12 sm:col-span-6 md:col-span-4 text-[11px] border border-slate-200 rounded-lg px-2 py-1.5 bg-white text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              />
-              <input
-                value={referenceSoleCode}
-                onChange={(e) => setReferenceSoleCode(e.target.value)}
-                placeholder="底号（soleCode）"
-                className="col-span-12 sm:col-span-6 md:col-span-4 text-[11px] border border-slate-200 rounded-lg px-2 py-1.5 bg-white text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              />
-              <input
-                value={referenceColorCode}
-                onChange={(e) => setReferenceColorCode(e.target.value)}
-                placeholder="颜色（colorCode）"
-                className="col-span-12 sm:col-span-6 md:col-span-4 text-[11px] border border-slate-200 rounded-lg px-2 py-1.5 bg-white text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              />
-              <input
-                value={referenceMaterialCode}
-                onChange={(e) => setReferenceMaterialCode(e.target.value)}
-                placeholder="材质（materialCode）"
-                className="col-span-12 sm:col-span-6 md:col-span-4 text-[11px] border border-slate-200 rounded-lg px-2 py-1.5 bg-white text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              />
-              <div className="col-span-12 text-[11px] text-slate-600">
-                Golden Record 与沙盒解析结果逐项比对；AI 会优先在主表中自动识别款号/品牌/状态字段。
-              </div>
+          </div>
+        </div>
+
+        {/* Step 4: 检查与应用 */}
+        <div className="grid grid-cols-12 gap-2 w-full flex-1 min-h-0">
+          <div className="col-span-12 lg:col-span-3 min-h-0 flex flex-col bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+            <div className="px-3 py-2 bg-slate-900 text-white">
+              <div className="text-sm font-semibold">Step 4 · 结果维度</div>
+              <div className="text-[11px] text-slate-300">直连/Join 路径回填后在此呈现</div>
             </div>
-            <div className="p-3 space-y-2 bg-emerald-50/20">
-              <div className="text-[11px] font-semibold text-slate-900">Step 3: 启动 AI</div>
-              {sandboxFiles.length === 0 ? (
-                <div className="text-[11px] text-slate-600">
-                  （可选）选择样本 XLSX 用于沙盒验证。若未提供，将跳过沙盒验证，仅保存 AI 推导结果。
+            <div className="flex-1 min-h-0 overflow-y-auto p-2 space-y-2">
+              {mappingPreview.map((m) => {
+                const isActive = m.standardKey === activeFieldKey;
+                const token = String(m.physicalColumn || '');
+                const has = Boolean(token);
+                const isJoin = token.startsWith('CHAIN|');
+                return (
+                  <button
+                    key={m.standardKey}
+                    type="button"
+                    onClick={() => setActiveFieldKey(m.standardKey)}
+                    className={cn(
+                      "w-full text-left rounded-xl border px-3 py-2 transition-all",
+                      isActive ? "border-indigo-500 ring-2 ring-indigo-100" : "border-slate-200 hover:bg-slate-50",
+                      !has ? "bg-slate-50" : isJoin ? "bg-amber-50/40" : "bg-emerald-50/40"
+                    )}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="text-sm font-semibold text-slate-900">{m.standardName}</div>
+                      <span className="text-[10px] font-mono text-slate-500 bg-white border border-slate-200 px-1.5 py-0.5 rounded">
+                        {m.standardKey}
+                      </span>
+                    </div>
+                    <div className="mt-1 text-[11px]">
+                      {!has ? (
+                        <span className="text-slate-400">未回填</span>
+                      ) : isJoin ? (
+                        <span className="text-amber-800 font-medium">Join 路径</span>
+                      ) : (
+                        <span className="text-emerald-800 font-medium">直连</span>
+                      )}
+                    </div>
+                    {has && (
+                      <div className="mt-1 text-[10px] font-mono text-slate-600 break-all">
+                        {isJoin ? chainPreviewForStandardKey(m.standardKey) : token}
+                      </div>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="col-span-12 lg:col-span-9 min-h-0 flex flex-col bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+            <div className="px-3 py-2 border-b border-slate-200 bg-slate-50/50 flex flex-wrap items-center justify-between gap-2">
+              <div className="min-w-0">
+                <div className="text-sm font-semibold text-slate-900">预览校验与纠偏</div>
+                <div className="text-[11px] text-slate-500 truncate">
+                  当前维度：<span className="font-semibold text-slate-800">{activeField.standardName}</span>
+                  <span className="mx-2 text-slate-300">|</span>
+                  预览来源：<span className="font-mono">{resolvedMeta?.latestDir || latestDir || '-'}</span>
                 </div>
-              ) : (
-                <div className="space-y-2">
-                  <p className="text-[11px] text-emerald-900">{sandboxUploadHint || `已就绪：${sandboxFiles.length} 个样本文件`}</p>
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="text-[11px] text-slate-600">AI 样本来源：</span>
-                    <select
-                      value={activeSandboxFileIdx}
-                      onChange={(e) => setActiveSandboxFileIdx(Number(e.target.value) || 0)}
-                      className="text-[11px] border border-slate-200 rounded-lg px-2 py-1 bg-white text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                    >
-                      {sandboxFiles.map((f, idx) => (
-                        <option key={`${f.originalName}-${idx}`} value={idx}>
-                          {f.originalName}
-                        </option>
-                      ))}
-                    </select>
-                    <span className="text-[11px] text-slate-500">
-                      {sandboxFiles[activeSandboxFileIdx]?.firstRow
-                        ? `${Object.keys(sandboxFiles[activeSandboxFileIdx]?.firstRow || {}).length} 列样本行`
-                        : '无首行样本'}
-                    </span>
-                  </div>
-                </div>
-              )}
-              <div className="flex flex-wrap items-center gap-2">
-                <label className="inline-flex items-center gap-2 px-3 py-1.5 text-[11px] font-medium rounded-lg bg-white border border-emerald-400 text-emerald-900 cursor-pointer hover:bg-emerald-50">
-                  <input
-                    type="file"
-                    accept=".xlsx,.xls"
-                    multiple
-                    className="hidden"
-                    disabled={isParsingFiles}
-                    onChange={(e) => void handleSandboxUpload(e)}
-                  />
-                  {isParsingFiles ? '解析中…' : '选择样本 XLSX'}
-                </label>
+              </div>
+              <div className="flex items-center gap-2">
                 <button
                   type="button"
                   onClick={() => void handleAuthAndSync()}
-                  disabled={authSyncing || isAiModeling || sandboxValidating || isParsingFiles}
+                  disabled={busy}
                   className="px-3 py-1.5 text-[11px] font-semibold rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
-                  title="AI 解析 → Join 推导 → 沙盒验证 → 保存并触发看板重算"
+                  title="认证并应用到看板（写入 mapping_config 并触发看板重算）"
                 >
-                  {authSyncing ? '认证中…' : '一键认证并同步看板 (Auth & Sync)'}
+                  {authSyncing ? '发布中…' : '认证并应用到看板'}
                 </button>
               </div>
-              {authSyncHint && (
-                <div className="text-[11px] text-indigo-700 bg-indigo-50 border border-indigo-200 px-3 py-2 rounded-lg">
-                  {authSyncHint}
-                </div>
-              )}
-              {sandboxPassSummary && (
-                <div className="flex flex-wrap items-center gap-3 text-[11px]">
-                  <span className="font-semibold text-slate-800">
-                    逻辑通过率：<span className="text-emerald-700">{sandboxPassSummary.passed}</span>/{sandboxPassSummary.total}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => setSandboxDetailOpen(true)}
-                    className="text-indigo-600 font-medium hover:underline"
-                  >
-                    查看测试明细
-                  </button>
-                </div>
-              )}
             </div>
-          </div>
 
-          <div className={cn('border rounded-xl overflow-hidden', activeFieldKey ? 'border-indigo-400 ring-2 ring-indigo-100' : 'border-slate-200')}>
-            <div className="px-3 py-2 bg-slate-900 text-white flex flex-wrap items-center justify-between gap-2">
-              <div className="text-xs font-semibold">DDL/SQL 批量粘贴区</div>
-              <div className="text-[11px] text-slate-300">当前检测到 {detectedTableCount} 张表</div>
-            </div>
-            <div className="p-3 grid grid-cols-1 gap-2">
-              {isAiModeling && (
-                <div className="text-[11px] text-indigo-700 bg-indigo-50 border border-indigo-200 px-3 py-2 rounded-lg space-y-1">
-                  <div>正在解析 DDL、结合 Golden / 样本推导 Join Path…</div>
-                  {aiProgress.total > 0 && (
-                    <div className="flex items-center gap-2">
-                      <div className="flex-1 h-2 rounded bg-indigo-100 overflow-hidden">
-                        <div
-                          className="h-2 bg-indigo-500"
-                          style={{ width: `${Math.min(100, Math.round((aiProgress.done / Math.max(1, aiProgress.total)) * 100))}%` }}
-                        />
-                      </div>
-                      <div className="text-[10px] font-mono text-indigo-700">
-                        {Math.min(aiProgress.done + 1, aiProgress.total)}/{aiProgress.total}
-                      </div>
-                    </div>
-                  )}
-                  {aiProgress.tables?.length > 0 && (
-                    <div className="text-[10px] text-indigo-700">已完成：{aiProgress.tables.join('、')}</div>
-                  )}
-                </div>
-              )}
-              {(aiBusy503 || aiQueueHint) && !isAiModeling && (
-                <div className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 px-3 py-2 rounded-lg">
-                  AI 曾排队或繁忙；可再次点击「AI 逻辑建模」重试。
-                </div>
-              )}
-              {aiStatusText && isAiModeling && (
-                <div className="text-[11px] text-sky-700 bg-sky-50 border border-sky-200 px-3 py-2 rounded-lg">
-                  {aiStatusText}
-                </div>
-              )}
-              <textarea
-                value={ddlText}
-                onChange={(e) => setDdlText(e.target.value)}
-                placeholder="粘贴多表 DDL（含 COMMENT 更佳）…"
-                className="w-full min-h-[220px] max-h-[360px] p-3 text-xs border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent resize-y font-mono text-slate-700 bg-slate-50/30"
-              />
-            </div>
-          </div>
+            {hasAttemptedAuth && error && (
+              <div className="m-3 text-[11px] text-red-700 bg-red-50 border border-red-200 px-3 py-2 rounded-lg">{error}</div>
+            )}
+            {authSyncHint && (
+              <div className="mx-3 mt-3 text-[11px] text-indigo-700 bg-indigo-50 border border-indigo-200 px-3 py-2 rounded-lg">
+                {authSyncHint}
+              </div>
+            )}
+            {resolvedMeta?.warning && (
+              <div className="mx-3 mt-3 text-[11px] text-amber-800 bg-amber-50 border border-amber-200 px-3 py-2 rounded-lg">
+                {resolvedMeta.warning}
+              </div>
+            )}
 
-          <div className="border border-slate-200 rounded-xl overflow-hidden bg-slate-50/40">
-            <button
-              type="button"
-              onClick={() => setReferenceDataOpen((o) => !o)}
-              className="w-full px-3 py-2 flex items-center justify-between gap-2 text-left hover:bg-slate-100/80 transition-colors"
-            >
-              <div className="text-xs font-semibold text-slate-800">底层参考数据（解析表目录 · 字段 · DDL 列）</div>
-              {referenceDataOpen ? <ChevronUp className="w-4 h-4 text-slate-500 shrink-0" /> : <ChevronDown className="w-4 h-4 text-slate-500 shrink-0" />}
-            </button>
-            {referenceDataOpen && (
-              <div className="p-3 pt-0 space-y-3 border-t border-slate-200 bg-white">
-                {ddlParsed.length > 0 && (
-                  <div className="border border-slate-200 rounded-lg bg-white">
-                    <div className="px-3 py-2 border-b border-slate-200 text-[11px] text-slate-600 flex items-center justify-between">
-                      <span>
-                        DDL 列（含 COMMENT）：{ddlParsed.filter((c) => c.comment).length}/{ddlParsed.length}
-                      </span>
-                      <span className="text-slate-400">当前槽位命中：{activeDdlMatches.size}</span>
-                    </div>
-                    <div className="max-h-32 overflow-y-auto px-3 py-2 text-[11px] font-mono">
-                      {ddlParsed.slice(0, 80).map((c, idx) => {
-                        const hit = activeDdlMatches.has(normalize(c.column));
-                        return (
-                          <div
-                            key={`${c.table || ''}-${c.column}-${idx}`}
-                            className={cn('flex gap-2 py-0.5', hit && 'bg-indigo-50 border border-indigo-200 rounded px-2')}
-                          >
-                            <span className="text-slate-600">
-                              {c.table ? `${c.table}.` : ''}
-                              {c.column}
-                            </span>
-                            {c.comment && <span className={cn(hit ? 'text-indigo-800' : 'text-emerald-700')}>#{c.comment}</span>}
-                          </div>
-                        );
-                      })}
-                      {ddlParsed.length > 80 && <div className="text-slate-400 py-1">… 共 {ddlParsed.length} 列</div>}
-                    </div>
-                  </div>
-                )}
-                <div className="flex items-center gap-2 mb-1">
-                  <input
-                    value={headerSearch}
-                    onChange={(e) => setHeaderSearch(e.target.value)}
-                    placeholder="搜索字段…"
-                    className="text-[11px] border border-slate-200 rounded-lg px-2 py-1 bg-white text-slate-700 w-full max-w-xs focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                  />
+            <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-3">
+              {/* 1) 当前维度的链路/直连信息 */}
+              <div className="border border-slate-200 rounded-xl overflow-hidden">
+                <div className="px-3 py-2 bg-slate-900 text-white text-xs font-semibold flex items-center justify-between">
+                  <span>AI 回填结果</span>
+                  <span className="text-[10px] text-slate-300 font-mono">{activeField.standardKey}</span>
                 </div>
-                <div className="grid grid-cols-12 gap-2">
-                  <div className="col-span-12 xl:col-span-5 border border-slate-200 rounded-lg bg-white overflow-hidden">
-                    <div className="px-3 py-2 border-b border-slate-200 text-[11px] text-slate-600 bg-slate-50">
-                      生产表头池（{Object.keys(tables || {}).length} 表）
-                    </div>
-                    <div className="max-h-[240px] overflow-y-auto p-2 space-y-1">
-                      {Object.keys(tables || {}).length ? (
-                        Object.keys(tables || {}).map((fileName) => (
-                          <button
-                            key={fileName}
-                            type="button"
-                            onClick={() => {
-                              setSelectedFile(fileName);
-                              void loadSamples(fileName);
-                            }}
-                            className={cn(
-                              'w-full text-left px-2 py-1.5 rounded-md border text-[11px] font-mono',
-                              selectedFile === fileName ? 'border-indigo-400 bg-indigo-50' : 'border-slate-200 hover:bg-slate-50'
-                            )}
-                          >
-                            {fileName}
-                          </button>
-                        ))
-                      ) : (
-                        <div className="text-[11px] text-slate-500 p-2">暂无生产表头。点击顶部「刷新表头」。</div>
-                      )}
-                    </div>
+                <div className="p-3 bg-white space-y-2">
+                  <div className="text-[11px] text-slate-600">
+                    类型：{' '}
+                    {activeToken.startsWith('CHAIN|') ? (
+                      <span className="font-semibold text-amber-800">Join 路径</span>
+                    ) : activeToken ? (
+                      <span className="font-semibold text-emerald-800">直连</span>
+                    ) : (
+                      <span className="font-semibold text-slate-500">未回填</span>
+                    )}
                   </div>
-                  <div className="col-span-12 xl:col-span-7 border border-slate-200 rounded-lg bg-white overflow-hidden">
-                    <div className="px-3 py-2 border-b border-slate-200 text-[11px] text-slate-600 bg-slate-50 flex items-center justify-between">
-                      <span>字段（{selectedFile ? (tables?.[selectedFile]?.length || 0) : 0}）</span>
-                      <span className="text-slate-400">点击列名：映射到当前槽位（col@file）</span>
+                  {activeToken.startsWith('CHAIN|') ? (
+                    <div className="text-[12px] text-slate-800">{chainPreviewForStandardKey(activeFieldKey)}</div>
+                  ) : activeToken ? (
+                    <div className="text-[12px] font-mono text-slate-900">{activeToken}</div>
+                  ) : null}
+
+                  <div className="text-[11px] text-slate-600">
+                    真实值预览：{' '}
+                    {resolvingRow ? (
+                      <span className="text-slate-400">抓取中…</span>
+                    ) : (
+                      <span className="font-mono text-slate-900">{resolvedValueForActive || '—'}</span>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* 2) 纠偏：选表/字段（直连纠偏） */}
+              <div className="border border-slate-200 rounded-xl overflow-hidden">
+                <div className="px-3 py-2 bg-slate-900 text-white text-xs font-semibold flex items-center justify-between gap-2">
+                  <span>纠偏（手动选择表/字段）</span>
+                  <span className="text-[10px] text-slate-300">点击字段：立即替换当前维度映射</span>
+                </div>
+                <div className="p-3 bg-white space-y-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="text-[11px] text-slate-600">搜索字段</div>
+                    <input
+                      value={headerSearch}
+                      onChange={(e) => setHeaderSearch(e.target.value)}
+                      placeholder="输入列名关键词…"
+                      className="text-[11px] border border-slate-200 rounded-lg px-2 py-1.5 bg-white text-slate-700 w-full max-w-xs focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                      disabled={busy}
+                    />
+                  </div>
+                  <div className="grid grid-cols-12 gap-2">
+                    <div className="col-span-12 xl:col-span-4 border border-slate-200 rounded-lg bg-white overflow-hidden">
+                      <div className="px-3 py-2 border-b border-slate-200 text-[11px] text-slate-600 bg-slate-50">
+                        表（{Object.keys(tables || {}).length}）
+                      </div>
+                      <div className="max-h-[240px] overflow-y-auto p-2 space-y-1">
+                        {Object.keys(tables || {}).length ? (
+                          Object.keys(tables || {}).map((fileName) => (
+                            <button
+                              key={fileName}
+                              type="button"
+                              disabled={busy}
+                              onClick={() => {
+                                setSelectedFile(fileName);
+                                void loadSamples(fileName);
+                              }}
+                              className={cn(
+                                'w-full text-left px-2 py-1.5 rounded-md border text-[11px] font-mono',
+                                selectedFile === fileName ? 'border-indigo-400 bg-indigo-50' : 'border-slate-200 hover:bg-slate-50'
+                              )}
+                            >
+                              {fileName}
+                            </button>
+                          ))
+                        ) : (
+                          <div className="text-[11px] text-slate-500 p-2">暂无生产表头（如果你刚启动服务，请稍等或刷新页面）。</div>
+                        )}
+                      </div>
                     </div>
-                    <div className="max-h-[240px] overflow-y-auto p-2">
-                      {selectedFile ? (
-                        <div className="flex flex-wrap gap-1.5">
-                          {(tables?.[selectedFile] || [])
-                            .filter((c) => !normalize(headerSearch) || normalize(c).includes(normalize(headerSearch)))
-                            .map((c) => (
+                    <div className="col-span-12 xl:col-span-8 border border-slate-200 rounded-lg bg-white overflow-hidden">
+                      <div className="px-3 py-2 border-b border-slate-200 text-[11px] text-slate-600 bg-slate-50 flex items-center justify-between">
+                        <span>字段（{selectedFile ? (tables?.[selectedFile]?.length || 0) : 0}）</span>
+                        <span className="text-slate-400">当前表：{selectedFile || '-'}</span>
+                      </div>
+                      <div className="max-h-[240px] overflow-y-auto p-2">
+                        {selectedFile ? (
+                          <div className="flex flex-wrap gap-1.5">
+                            {filteredHeaders.map((c) => (
                               <button
                                 key={`${selectedFile}-${c}`}
                                 type="button"
+                                disabled={busy}
                                 onClick={() => {
                                   assignPhysicalColumn(c, selectedFile);
                                   void loadSamples(selectedFile);
                                 }}
-                                className="px-2 py-1 text-[11px] font-mono rounded-md border shadow-sm transition-colors bg-white border-slate-200 hover:border-indigo-300 hover:bg-indigo-50"
+                                className="px-2 py-1 text-[11px] font-mono rounded-md border shadow-sm transition-colors bg-white border-slate-200 hover:border-indigo-300 hover:bg-indigo-50 disabled:opacity-50"
                                 title={`${c}（来自 ${selectedFile}）`}
                               >
                                 <span>{c}</span>
                                 <span className="ml-1 text-[10px] text-slate-400">(来自 {selectedFile})</span>
                               </button>
                             ))}
-                        </div>
-                      ) : (
-                        <div className="text-[11px] text-slate-500 p-2">请选择左侧表名查看字段。</div>
-                      )}
+                          </div>
+                        ) : (
+                          <div className="text-[11px] text-slate-500 p-2">先选择一个表，再选择字段。</div>
+                        )}
+                      </div>
                     </div>
                   </div>
                 </div>
               </div>
-            )}
-          </div>
-        </div>
-      </div>
 
-      {/* Right: col-span-4 */}
-      <div className="col-span-12 lg:col-span-4 min-h-0 flex flex-col bg-white border border-slate-200 rounded-xl shadow-sm">
-        <div className="px-3 py-2 border-b border-slate-200 bg-slate-50/50">
-          <div className="text-sm font-semibold text-slate-900">映射预览与抽样校验</div>
-          <div className="text-[11px] text-slate-500 mt-0.5">
-            校验文件：<span className="font-mono text-slate-700">{selectedFile || '-'}</span>
-          </div>
-        </div>
-
-        <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-2">
-          {/* Compact mapping list */}
-          <div className="grid grid-cols-1 gap-1.5">
-            {mappingPreview.map((m) => {
-              const isActive = m.standardKey === activeFieldKey;
-              const unmapped = !m.physicalColumn;
-              return (
-                <div
-                  key={m.standardKey}
-                  className={cn(
-                    "rounded-lg border px-3 py-2 transition-all",
-                    "border-slate-200",
-                    isActive ? "border-indigo-500 ring-2 ring-indigo-200 animate-pulse" : "",
-                    unmapped ? "bg-red-50/30" : "bg-white"
-                  )}
+              {/* 3) 底层参考（DDL comment 命中） */}
+              <div className="border border-slate-200 rounded-xl overflow-hidden bg-slate-50/40">
+                <button
+                  type="button"
+                  onClick={() => setDdlRefOpen((o) => !o)}
+                  className="w-full px-3 py-2 flex items-center justify-between gap-2 text-left hover:bg-slate-100/80 transition-colors"
+                  disabled={busy}
                 >
-                  <div className="flex items-center justify-between gap-2">
-                    <div className="text-sm font-medium text-slate-900">{m.standardName}</div>
-                    <span className="text-[10px] font-mono text-slate-500 bg-slate-50 border border-slate-200 px-1.5 py-0.5 rounded">
-                      {m.standardKey}
-                    </span>
-                  </div>
-                  <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px]">
-                    {m.physicalColumn ? (
-                      <>
-                        <span className="px-2 py-1 rounded-md bg-slate-900 text-white border border-slate-800 font-mono">
-                          {m.physicalColumn}
-                        </span>
-                        <span className="text-slate-400">来源</span>
-                        <span className="font-mono text-slate-700">{m.sourceTable || '-'}</span>
-                      </>
-                    ) : (
-                      <span className="inline-flex items-center gap-1 text-red-700">
-                        <AlertCircle className="w-4 h-4" /> 未映射
-                      </span>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-
-          {/* Excel-like sample table */}
-          <div className={cn(
-            "border border-slate-200 rounded-xl overflow-hidden",
-            activeFieldKey ? "ring-2 ring-indigo-100" : ""
-          )}>
-            <div className="px-3 py-2 bg-slate-900 text-white text-xs font-semibold">
-              抽样数据表（前 3 行）
-            </div>
-            <div className="overflow-x-auto">
-              <table className="min-w-full text-[11px]">
-                <thead className="bg-slate-50 border-b border-slate-200">
-                  <tr>
-                    <th className="px-2 py-2 text-left font-medium text-slate-600 w-10">#</th>
-                    {sampleGrid.cols.length ? (
-                      sampleGrid.cols.map((c) => (
-                        <th key={c.standardKey} className={cn(
-                          "px-2 py-2 text-left font-medium text-slate-700 whitespace-nowrap",
-                          c.standardKey === activeFieldKey ? "bg-indigo-50 text-indigo-800" : ""
-                        )}>
-                          <div className="flex flex-col leading-tight">
-                            <span>{c.standardName}</span>
-                            <span className="font-mono text-[10px] text-slate-500">{c.physicalColumn}</span>
-                          </div>
-                        </th>
-                      ))
-                    ) : (
-                      <th className="px-2 py-2 text-left font-medium text-slate-600">暂无可展示列（请选择有表头的文件并完成映射）</th>
-                    )}
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {sampleGrid.rows.map((r, idx) => (
-                    <tr key={idx} className="hover:bg-slate-50/60">
-                      <td className="px-2 py-2 font-mono text-slate-400">{idx + 1}</td>
-                      {sampleGrid.cols.length ? (
-                        sampleGrid.cols.map((c) => (
-                          <td key={c.standardKey} className={cn(
-                            "px-2 py-2 font-mono text-slate-800 whitespace-nowrap",
-                            c.standardKey === activeFieldKey ? "bg-indigo-50/50" : ""
-                          )}>
-                            {r[c.standardKey] || <span className="text-slate-300">-</span>}
-                          </td>
-                        ))
-                      ) : (
-                        <td className="px-2 py-2 text-slate-400">-</td>
-                      )}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-    {aiReportOpen && (
-      <div className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4">
-        <div className="w-[min(960px,95vw)] bg-white rounded-2xl shadow-2xl border border-slate-200 overflow-hidden">
-          <div className="px-5 py-4 bg-slate-900 text-white flex items-center justify-between">
-            <div>
-              <div className="text-sm font-semibold">AI 发现报告</div>
-              <div className="text-[11px] text-slate-300 mt-0.5">映射与 Join 已自动写入左侧标准字段，可关闭后继续沙盒测试与认证</div>
-            </div>
-            <button
-              type="button"
-              onClick={() => setAiReportOpen(false)}
-              className="px-3 py-1.5 text-[11px] rounded-lg bg-white/10 border border-white/15 hover:bg-white/15"
-            >
-              关闭
-            </button>
-          </div>
-          <div className="p-5 grid grid-cols-12 gap-4">
-            <div className="col-span-12 md:col-span-7">
-              <div className="text-xs font-semibold text-slate-900 mb-2">标准字段映射（smartSuggestions）</div>
-              <div className="border border-slate-200 rounded-xl overflow-hidden">
-                <div className="max-h-56 overflow-y-auto divide-y divide-slate-100">
-                  {(aiSuggestions || []).length ? (
-                    aiSuggestions.map((s, idx) => (
-                      <div key={idx} className="px-4 py-3 text-[11px] flex flex-wrap items-center gap-2">
-                        <span className="px-2 py-1 rounded-md bg-indigo-50 border border-indigo-200 text-indigo-800 font-mono">{s.standardKey}</span>
-                        <span className="text-slate-400">←</span>
-                        <span className="px-2 py-1 rounded-md bg-slate-900 text-white border border-slate-800 font-mono">{s.sourceTable}.{s.sourceField}</span>
-                      </div>
-                    ))
-                  ) : (
-                    <div className="px-4 py-6 text-[11px] text-slate-500">暂无 smartSuggestions</div>
-                  )}
-                </div>
-              </div>
-            </div>
-            <div className="col-span-12 md:col-span-5">
-              <div className="text-xs font-semibold text-slate-900 mb-2">Join 链路（joinPathSuggestions）</div>
-              <div className="border border-slate-200 rounded-xl overflow-hidden">
-                <div className="max-h-56 overflow-y-auto divide-y divide-slate-100">
-                  {(aiJoinPaths || []).length ? (
-                    aiJoinPaths.map((j, idx) => (
-                      <div key={idx} className="px-4 py-3 text-[11px]">
-                        <div className="flex items-center gap-2 mb-2">
-                          <span className="px-2 py-1 rounded-md bg-amber-50 border border-amber-200 text-amber-800 font-mono">{j.targetStandardKey}</span>
+                  <div className="text-xs font-semibold text-slate-800">底层参考（DDL COMMENT 命中）</div>
+                  {ddlRefOpen ? <ChevronUp className="w-4 h-4 text-slate-500 shrink-0" /> : <ChevronDown className="w-4 h-4 text-slate-500 shrink-0" />}
+                </button>
+                {ddlRefOpen && (
+                  <div className="p-3 pt-0 space-y-3 border-t border-slate-200 bg-white">
+                    {ddlParsed.length > 0 ? (
+                      <div className="border border-slate-200 rounded-lg bg-white">
+                        <div className="px-3 py-2 border-b border-slate-200 text-[11px] text-slate-600 flex items-center justify-between">
+                          <span>
+                            DDL 列（含 COMMENT）：{ddlParsed.filter((c) => c.comment).length}/{ddlParsed.length}
+                          </span>
+                          <span className="text-slate-400">命中：{activeDdlMatches.size}</span>
                         </div>
-                        <div className="text-[10px] text-slate-600 font-mono break-all">
-                          {j.path.join(' -> ')}
+                        <div className="max-h-40 overflow-y-auto px-3 py-2 text-[11px] font-mono">
+                          {ddlParsed.slice(0, 120).map((c, idx) => {
+                            const hit = activeDdlMatches.has(normalize(c.column));
+                            return (
+                              <div
+                                key={`${c.table || ''}-${c.column}-${idx}`}
+                                className={cn('flex gap-2 py-0.5', hit && 'bg-indigo-50 border border-indigo-200 rounded px-2')}
+                              >
+                                <span className="text-slate-600">
+                                  {c.table ? `${c.table}.` : ''}
+                                  {c.column}
+                                </span>
+                                {c.comment && <span className={cn(hit ? 'text-indigo-800' : 'text-emerald-700')}>#{c.comment}</span>}
+                              </div>
+                            );
+                          })}
+                          {ddlParsed.length > 120 && <div className="text-slate-400 py-1">… 共 {ddlParsed.length} 列</div>}
                         </div>
                       </div>
-                    ))
-                  ) : (
-                    <div className="px-4 py-6 text-[11px] text-slate-500">暂无 joinPathSuggestions</div>
-                  )}
-                </div>
+                    ) : (
+                      <div className="text-[11px] text-slate-500">尚未解析 DDL。请先执行 AI 建模。</div>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
-
-            <div className="col-span-12 flex items-center justify-end gap-2 pt-2 border-t border-slate-100">
-              <button
-                type="button"
-                onClick={() => setAiReportOpen(false)}
-                className="px-4 py-2 text-sm font-semibold rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 shadow-sm"
-              >
-                知道了
-              </button>
-            </div>
           </div>
         </div>
       </div>
-    )}
-    {sandboxDetailOpen && sandboxChecks && (
-      <div className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4">
-        <div className="w-[min(520px,95vw)] bg-white rounded-2xl shadow-2xl border border-slate-200 overflow-hidden">
-          <div className="px-4 py-3 bg-slate-900 text-white flex items-center justify-between">
-            <div className="text-sm font-semibold">沙盒测试明细（7 维）</div>
-            <button
-              type="button"
-              onClick={() => setSandboxDetailOpen(false)}
-              className="px-2.5 py-1 text-[11px] rounded-lg bg-white/10 border border-white/15 hover:bg-white/15"
-            >
-              关闭
-            </button>
-          </div>
-          <div className="p-4 max-h-[min(70vh,480px)] overflow-y-auto space-y-2">
-            {SANDBOX_DIM_KEYS.map((k) => {
-              const c = sandboxChecks[k];
-              if (!c) return null;
-              const label = SANDBOX_DIM_LABEL[k];
-              const skipped = !c.expected && !c.actual;
-              return (
-                <div
-                  key={k}
-                  className={cn(
-                    'rounded-lg border px-3 py-2 text-[11px]',
-                    skipped ? 'border-slate-100 bg-slate-50 text-slate-400' : c.pass ? 'border-emerald-200 bg-emerald-50/50' : 'border-amber-200 bg-amber-50/50'
-                  )}
-                >
-                  <div className="flex items-center gap-2 font-medium text-slate-800">
-                    {skipped ? null : c.pass ? (
-                      <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-                    ) : (
-                      <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
-                    )}
-                    <span className="font-mono">{k}</span>
-                    <span className="text-slate-500 font-normal">({label})</span>
-                  </div>
-                  <div className="mt-1 text-slate-600">
-                    {skipped ? '未填写期望且无实际值（跳过）' : `期望：${c.expected || '—'} · 实际：${c.actual || '—'}`}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      </div>
-    )}
     </>
   );
 }
