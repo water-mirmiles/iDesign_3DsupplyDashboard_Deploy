@@ -742,16 +742,12 @@ export default function SchemaMapping() {
     if (authSyncing) return;
     setError(null);
     setAuthSyncHint('');
-    if (masterTableErrors.length > 0) {
-      setError(masterTableErrors[0]);
+    if (!masterTable.trim()) {
+      setError('请先完成第一步：指定业务主表（Master Table）');
       return;
     }
     if (!ddlText.trim()) {
       setError('请先粘贴 DDL/SQL');
-      return;
-    }
-    if (!referenceStyleCode.trim()) {
-      setError('请先填写黄金样本：款号（styleCode）');
       return;
     }
     if (sandboxFiles.length === 0) {
