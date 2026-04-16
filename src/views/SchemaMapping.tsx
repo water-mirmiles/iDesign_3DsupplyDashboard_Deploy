@@ -4,7 +4,6 @@ import { cn } from '@/lib/utils';
 import { GlobalSchemaField } from '@/types';
 
 const API_BASE = 'http://localhost:3001';
-const REQUIRED_MASTER_TABLE = 'ods_pdm_pdm_product_info_df';
 
 const initialStandardFields: GlobalSchemaField[] = [
   { id: 'f1', standardName: '款号', standardKey: 'styleCode', mappedSources: [], description: '产品的唯一标识符' },
@@ -158,6 +157,7 @@ export default function SchemaMapping() {
 
   const [isSuccess, setIsSuccess] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [hasAttemptedAuth, setHasAttemptedAuth] = useState(false);
 
   /** 沙盒样本：上传文件清单（不做跨表合并，避免命名冲突） */
   const [sandboxFiles, setSandboxFiles] = useState<SandboxUploadedFile[]>([]);
@@ -195,44 +195,19 @@ export default function SchemaMapping() {
 
   const normalizeTableName = (s: string) => String(s || '').trim().toLowerCase().replace(/\.xlsx$/i, '');
 
+  // 主表字段对齐由 AI 自动完成：不在点击前做“尚未映射”的硬校验
   const masterTableErrors = useMemo(() => {
-    const errors: string[] = [];
-    if (!masterTable) {
-      errors.push('错误：请先指定业务主表（Master Table）。');
-      return errors;
-    }
-    // 若 DDL 中包含固定主表名，则必须选择该主表
-    const ddlHasRequired = ddlTableNames.some((t) => normalizeTableName(t) === normalizeTableName(REQUIRED_MASTER_TABLE));
-    if (ddlHasRequired && normalizeTableName(masterTable) !== normalizeTableName(REQUIRED_MASTER_TABLE)) {
-      errors.push(`错误：当前 DDL 检测到主表 ${REQUIRED_MASTER_TABLE}，请将其指定为业务主表。`);
-      return errors;
-    }
-    const required: Array<{ key: string; label: string }> = [
-      { key: 'styleCode', label: '款号' },
-      { key: 'brand', label: '品牌' },
-      { key: 'status', label: '状态' },
-    ];
-    for (const r of required) {
-      const m = mappingPreview.find((x) => x.standardKey === r.key);
-      if (!m?.physicalColumn) {
-        errors.push(`错误：主表 ${masterTable} 尚未映射【${r.label}】字段。`);
-        continue;
-      }
-      if (String(m.physicalColumn).startsWith('CHAIN|')) {
-        errors.push(`错误：主表 ${masterTable} 的【${r.label}】必须直接映射主表列（不支持 CHAIN 链路）。`);
-        continue;
-      }
-      const src = String(m.sourceTable || '');
-      if (!src) {
-        errors.push(`错误：主表 ${masterTable} 尚未映射【${r.label}】字段。`);
-        continue;
-      }
-      if (normalizeTableName(src) !== normalizeTableName(masterTable)) {
-        errors.push(`错误：主表 ${masterTable} 的【${r.label}】目前映射在 ${src}，必须映射到主表。`);
-      }
-    }
-    return errors;
-  }, [ddlTableNames, masterTable, mappingPreview]);
+    if (!masterTable) return ['请先选择业务主表'];
+    return [];
+  }, [masterTable]);
+
+  // 选择主表后：自动对齐样本文件（名字包含主表名）
+  useEffect(() => {
+    if (!masterTable || sandboxFiles.length === 0) return;
+    const mt = normalizeTableName(masterTable);
+    const idx = sandboxFiles.findIndex((f) => normalizeTableName(f.originalName).includes(mt));
+    if (idx >= 0) setActiveSandboxFileIdx(idx);
+  }, [masterTable, sandboxFiles]);
 
   const saveSchemaDraft = useCallback(async () => {
     try {
@@ -740,20 +715,11 @@ export default function SchemaMapping() {
 
   const handleAuthAndSync = async () => {
     if (authSyncing) return;
+    setHasAttemptedAuth(true);
     setError(null);
     setAuthSyncHint('');
-    if (!masterTable.trim()) {
-      setError('请先完成第一步：指定业务主表（Master Table）');
-      return;
-    }
-    if (!ddlText.trim()) {
-      setError('请先粘贴 DDL/SQL');
-      return;
-    }
-    if (sandboxFiles.length === 0) {
-      setError('请先上传样本 XLSX（用于自动沙盒验证）');
-      return;
-    }
+    if (!ddlText.trim()) return setError('请先粘贴 SQL/DDL');
+    if (!masterTable.trim()) return setError('请先从 DDL 中选择一个业务主表');
 
     setAuthSyncing(true);
     try {
@@ -762,9 +728,11 @@ export default function SchemaMapping() {
       if (ai.ok === false) throw new Error(ai.error);
 
       setAuthSyncHint('沙盒验证中…');
-      const sb = await handleSandboxValidate();
-      if (sb.ok === false) throw new Error(sb.error);
-      if (!sb.allPass) throw new Error('沙盒验证未通过：请检查黄金样本或映射链路');
+      if (sandboxFiles.length > 0) {
+        const sb = await handleSandboxValidate();
+        if (sb.ok === false) throw new Error(sb.error);
+        if (!sb.allPass) throw new Error('沙盒验证未通过：请检查黄金样本或映射链路');
+      }
 
       setAuthSyncHint('保存配置中…');
       const savedMapping = await handleSaveMappingAuthenticated();
@@ -869,7 +837,7 @@ export default function SchemaMapping() {
           </div>
         </div>
 
-        {error && (
+        {hasAttemptedAuth && error && (
           <div className="mx-3 mt-3 text-[11px] text-red-700 bg-red-50 border border-red-200 px-3 py-2 rounded-lg">
             {error}
           </div>
@@ -879,7 +847,7 @@ export default function SchemaMapping() {
         <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-3">
           <div className="border border-indigo-200 rounded-xl bg-gradient-to-b from-indigo-50/50 to-white overflow-hidden shadow-sm">
             <div className="px-3 py-2 bg-slate-900 text-white text-xs font-semibold flex items-center justify-between gap-2">
-              <span>AI 学习与样本认证</span>
+              <span>材料驱动认证流程</span>
               {sandboxAllPass === true && (
                 <span className="inline-flex items-center gap-1 text-[10px] font-normal text-emerald-300">
                   <CheckCircle2 className="w-3.5 h-3.5" /> 7 维逻辑已打通
@@ -887,14 +855,17 @@ export default function SchemaMapping() {
               )}
             </div>
             <div className="px-3 py-2 border-b border-slate-200 bg-white">
-              <div className="text-[11px] font-semibold text-slate-900">第一步：指定业务主表</div>
+              <div className="text-[11px] font-semibold text-slate-900">Step 2: 指定核心</div>
               <div className="mt-1 flex flex-wrap items-center gap-2">
                 <select
                   value={masterTable}
                   onChange={(e) => setMasterTable(e.target.value)}
+                  disabled={ddlTableNames.length === 0}
                   className="text-[11px] px-2 py-1.5 rounded-lg bg-white border border-slate-200 text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500"
                 >
-                  <option value="">请选择 DDL 中的表名…</option>
+                  <option value="">
+                    {ddlTableNames.length === 0 ? '请先在下方粘贴 SQL/DDL…' : '请选择 DDL 中的表名…'}
+                  </option>
                   {ddlTableNames.map((t) => (
                     <option key={t} value={t}>
                       {t}
@@ -916,6 +887,7 @@ export default function SchemaMapping() {
               </div>
             )}
             <div className="p-3 grid grid-cols-12 gap-2 border-b border-slate-100">
+              <div className="col-span-12 text-[11px] font-semibold text-slate-900">Step 1: 提供原材料</div>
               <input
                 value={referenceStyleCode}
                 onChange={(e) => setReferenceStyleCode(e.target.value)}
@@ -959,23 +931,15 @@ export default function SchemaMapping() {
                 className="col-span-12 sm:col-span-6 md:col-span-4 text-[11px] border border-slate-200 rounded-lg px-2 py-1.5 bg-white text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-500"
               />
               <div className="col-span-12 text-[11px] text-slate-600">
-                Golden Record 与沙盒解析结果逐项比对；样本 Excel 文件名需与生产侧逻辑表名一致。
+                Golden Record 与沙盒解析结果逐项比对；AI 会优先在主表中自动识别款号/品牌/状态字段。
               </div>
             </div>
-            {masterTableErrors.length > 0 && (
-              <div className="px-3 pb-3">
-                <div className="text-[11px] text-red-700 bg-red-50 border border-red-200 px-3 py-2 rounded-lg space-y-1">
-                  {masterTableErrors.map((t, idx) => (
-                    <div key={idx}>{t}</div>
-                  ))}
-                </div>
-              </div>
-            )}
             <div className="p-3 space-y-2 bg-emerald-50/20">
+              <div className="text-[11px] font-semibold text-slate-900">Step 3: 启动 AI</div>
               {sandboxFiles.length === 0 ? (
-                <p className="text-[11px] text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
-                  上传样本 Excel 以认证逻辑（可多选；不合并，避免跨表同名字段冲突）。
-                </p>
+                <div className="text-[11px] text-slate-600">
+                  （可选）选择样本 XLSX 用于沙盒验证。若未提供，将跳过沙盒验证，仅保存 AI 推导结果。
+                </div>
               ) : (
                 <div className="space-y-2">
                   <p className="text-[11px] text-emerald-900">{sandboxUploadHint || `已就绪：${sandboxFiles.length} 个样本文件`}</p>
