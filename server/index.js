@@ -1261,7 +1261,7 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
           '',
           '【硬性约束 — 必须遵守，否则视为错误输出】',
           '1) 终点必须匹配「值」：joinPathSuggestions.path 与 concatMappingSuggestions.parts[].joinPath 的最后一个节点，其字段取值形态必须与用户黄金样本一致（例如款号样本 SBOX…、楦号 L-B…、材质 LT04）。你必须在脑中校验：沿该 path 取到的末字段值应与样本同类型（字符串编码、可打印业务号），而不是内部自增 ID。',
-          '2) 严禁「ID 陷阱」：路径最后一节不得为 .id / *_id（除非用户黄金样本的值本身就是纯数字 ID 且与 DDL 一致）。若当前唯一可达列为维表主键 id，你必须在同表继续延伸到业务列：优先寻找列名或 COMMENT 含「编号」「编码」「代码」「款」「楦」「底」「材质」的字段，如 .code、.style_no、.category_code、.last_code、.sole_code、.material_code、.number、.name 等，使 path 末节点为这些「值列」。',
+          '2) 严禁「ID 终点」与「纯数字陷阱」：路径最后一节不得为 .id / *_id；若末字段取值为纯数字且用户黄金样本不是纯数字，也视为错误终点（这通常仍是内部 ID）。除非用户黄金样本值本身就是该数字 ID 且与 DDL 一致。若当前唯一可达列为维表主键 id，你必须在同表继续延伸到业务列：优先寻找列名或 COMMENT 含「编号」「编码」「代码」「款」「楦」「底」「材质」的字段，如 .code、.style_no、.category_code、.last_code、.sole_code、.material_code、.number、.name 等，使 path 末节点为这些「值列」。',
           '3) 路径完整性：从主表到目标值列的每一跳关联都必须写入 path（不得跳步）。例如 Master 上外键列 -> 维表主键/唯一键 -> 维表业务编码列，应完整输出三步：["master_table.fk_col","dim_table.id","dim_table.code"]（表名用 DDL 原名）。',
           '4) 表名严格对齐：smartSuggestions.sourceTable、path 与 joinPath 中出现的所有 table 名称必须与「DDL 表名清单」中的字符串 100% 一致（大小写、下划线、前缀如 ods_ 均不得改写或缩写）。若不确定表名，只能从清单中择一，禁止臆造缩写表名。',
           '',

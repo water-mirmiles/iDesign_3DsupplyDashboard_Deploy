@@ -457,6 +457,45 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
   }, [parsedTableMap, ddlText]);
 
   const mappingPreview: MappingEntry[] = useMemo(() => buildCertifiedMapping(standardFields), [standardFields]);
+  const expectedByStandardKey = useMemo(() => {
+    const out: Record<string, string> = {};
+    for (const f of initialStandardFields) {
+      const b = dimensionSamples[f.standardKey] || { targetGoal: '', rows: [] };
+      const goal = String(b.targetGoal || '').trim();
+      if (goal) {
+        out[f.standardKey] = goal;
+        continue;
+      }
+      const rows = Array.isArray(b.rows) ? b.rows : [];
+      const joined = rows
+        .map((r) => (Array.isArray(r?.segments) ? r.segments.map((s) => String(s?.value ?? '')).join('') : ''))
+        .join('');
+      out[f.standardKey] = String(joined || '').trim();
+    }
+    return out;
+  }, [dimensionSamples]);
+
+  const actualByStandardKey = useMemo(() => {
+    const row = resolvedRow || {};
+    const out: Record<string, string> = {};
+    for (const f of initialStandardFields) {
+      const v =
+        f.standardKey === 'styleCode' ? String((row as any).style_wms ?? '') : String((row as any)[f.standardKey] ?? '');
+      out[f.standardKey] = String(v || '').trim();
+    }
+    return out;
+  }, [resolvedRow]);
+
+  const previewMatchByStandardKey = useMemo(() => {
+    const out: Record<string, { expected: string; actual: string; ok: boolean; hasExpectation: boolean }> = {};
+    for (const f of initialStandardFields) {
+      const expected = String(expectedByStandardKey[f.standardKey] || '').trim();
+      const actual = String(actualByStandardKey[f.standardKey] || '').trim();
+      const hasExpectation = Boolean(expected);
+      out[f.standardKey] = { expected, actual, hasExpectation, ok: hasExpectation ? expected === actual : false };
+    }
+    return out;
+  }, [actualByStandardKey, expectedByStandardKey]);
 
   // 主表字段对齐由 AI 自动完成：不在点击前做“尚未映射”的硬校验
   const masterTableErrors = useMemo(() => {
@@ -1694,6 +1733,10 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                 const has = mappingEntryIsPublishable(m);
                 const isJoin = token.startsWith('CHAIN|');
                 const isConcat = m.operator === 'CONCAT' || token.startsWith('CONCAT|');
+                const pm = previewMatchByStandardKey[m.standardKey] || { expected: '', actual: '', ok: false, hasExpectation: false };
+                const hasPreview = Boolean(pm.actual);
+                const isMismatch = has && pm.hasExpectation && hasPreview && !pm.ok;
+                const isMatched = has && pm.hasExpectation && hasPreview && pm.ok;
                 return (
                   <button
                     key={m.standardKey}
@@ -1708,11 +1751,28 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                     className={cn(
                       "w-full text-left rounded-xl border px-3 py-2 transition-all",
                       isActive ? "border-indigo-500 ring-2 ring-indigo-100" : "border-slate-200 hover:bg-slate-50",
-                      !has ? "bg-slate-50" : isConcat ? "bg-violet-50/50" : isJoin ? "bg-amber-50/40" : "bg-emerald-50/40"
+                      !has
+                        ? "bg-slate-50"
+                        : isMismatch
+                          ? "bg-orange-50/60 border-orange-200"
+                          : isMatched
+                            ? "bg-emerald-50/60 border-emerald-200"
+                            : isConcat
+                              ? "bg-violet-50/50"
+                              : isJoin
+                                ? "bg-amber-50/40"
+                                : "bg-emerald-50/40"
                     )}
                   >
                     <div className="flex items-center justify-between gap-2">
-                      <div className="text-sm font-semibold text-slate-900">{m.standardName}</div>
+                      <div className="text-sm font-semibold text-slate-900 flex items-center gap-2 min-w-0">
+                        <span className="truncate">{m.standardName}</span>
+                        {isMatched ? (
+                          <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" aria-hidden />
+                        ) : isMismatch ? (
+                          <AlertCircle className="w-4 h-4 text-orange-600 shrink-0" aria-hidden />
+                        ) : null}
+                      </div>
                       <span className="text-[10px] font-mono text-slate-500 bg-white border border-slate-200 px-1.5 py-0.5 rounded">
                         {m.standardKey}
                       </span>
@@ -1724,6 +1784,8 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                         ) : (
                           <span className="text-slate-400">未回填</span>
                         )
+                      ) : isMismatch ? (
+                        <span className="text-orange-800 font-medium">路径偏移，请检查终点字段</span>
                       ) : isConcat ? (
                         <span className="text-violet-900 font-medium">拼接 CONCAT</span>
                       ) : isJoin ? (
@@ -1739,6 +1801,13 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                           : isJoin
                             ? chainPreviewForStandardKey(m.standardKey)
                             : token}
+                      </div>
+                    )}
+                    {has && pm.hasExpectation && (
+                      <div className="mt-1 text-[10px] text-slate-500">
+                        期望：<span className="font-mono text-slate-700">{pm.expected || '-'}</span>
+                        <span className="mx-2 text-slate-300">|</span>
+                        预览：<span className={cn('font-mono', isMatched ? 'text-emerald-700' : isMismatch ? 'text-orange-700' : 'text-slate-700')}>{pm.actual || '-'}</span>
                       </div>
                     )}
                   </button>
