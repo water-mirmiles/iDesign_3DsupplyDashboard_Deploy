@@ -1180,6 +1180,37 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
       };
 
       const allDdlTableNames = parsedTables.map((t) => String(t.tableName || '').trim()).filter(Boolean);
+      const isNumericLike = (s) => {
+        const x = String(s ?? '').trim();
+        return Boolean(x) && /^[0-9]+$/.test(x);
+      };
+      const expectedValueByStandardKey = (() => {
+        const out = new Map();
+        if (goldenBlocks && goldenBlocks.length) {
+          for (const b of goldenBlocks) {
+            const sk = String(b.standardKey || '').trim();
+            if (!sk) continue;
+            const goal = String(b.targetGoal || '').trim();
+            if (goal) {
+              out.set(sk, goal);
+              continue;
+            }
+            const rows = Array.isArray(b.rows) ? b.rows : [];
+            const joined = rows
+              .map((r) => (Array.isArray(r?.segments) ? r.segments.map((s) => String(s?.value ?? '')).join('') : ''))
+              .join('');
+            if (joined.trim()) out.set(sk, joined.trim());
+          }
+        } else if (goldenSamples && goldenSamples.length) {
+          for (const g of goldenSamples) {
+            const sk = String(g.standardKey || '').trim();
+            if (!sk) continue;
+            const joined = Array.isArray(g.segments) ? g.segments.map((s) => String(s?.value ?? '')).join('') : '';
+            if (joined.trim() && !out.has(sk)) out.set(sk, joined.trim());
+          }
+        }
+        return out;
+      })();
       const goldenKeysWithMultiRows =
         goldenBlocks && goldenBlocks.length
           ? goldenBlocks.filter((b) => b.rows.length > 1).map((b) => b.standardKey)
@@ -1259,6 +1290,10 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
           partTotal > 1 ? `为性能考虑，本次是第 ${partIndex + 1}/${partTotal} 批（每批最多 5 张表）。请在本批次内尽可能推断 Join 关系与映射。` : '',
           masterTable ? `用户已手动指定 ${masterTable} 为业务主表（Master Table）。请以该表为起点寻找到其它表的 Join Path。` : '',
           '',
+          '【User-Defined First — 用户指定优先（绝对硬性规则）】',
+          '当用户在 Step2 的黄金样本中明确选择了 tableName 与 fieldName（即某个具体的 目标表.目标字段），你严禁改选其它字段作为终点（尤其禁止把 *.id 替换为 *.code 或其它列）。',
+          '你的任务从“猜字段”变为“找路径”：必须输出从【主表】出发，经哪些中间 ID/外键字段，才能连到用户指定的那个 目标表.目标字段；并确保 path/parts[].joinPath 的最后一个节点就是该 目标表.目标字段（字符串必须 100% 与用户选择一致）。',
+          '',
           '【硬性约束 — 必须遵守，否则视为错误输出】',
           '1) 终点必须匹配「值」：joinPathSuggestions.path 与 concatMappingSuggestions.parts[].joinPath 的最后一个节点，其字段取值形态必须与用户黄金样本一致（例如款号样本 SBOX…、楦号 L-B…、材质 LT04）。你必须在脑中校验：沿该 path 取到的末字段值应与样本同类型（字符串编码、可打印业务号），而不是内部自增 ID。',
           '2) 严禁「ID 终点」与「纯数字陷阱」：路径最后一节不得为 .id / *_id；若末字段取值为纯数字且用户黄金样本不是纯数字，也视为错误终点（这通常仍是内部 ID）。除非用户黄金样本值本身就是该数字 ID 且与 DDL 一致。若当前唯一可达列为维表主键 id，你必须在同表继续延伸到业务列：优先寻找列名或 COMMENT 含「编号」「编码」「代码」「款」「楦」「底」「材质」的字段，如 .code、.style_no、.category_code、.last_code、.sole_code、.material_code、.number、.name 等，使 path 末节点为这些「值列」。',
@@ -1293,6 +1328,10 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
           '}',
           '',
           'concatMappingSuggestions：需要拼接时 operator 恒为 "CONCAT"；parts≥2；每 part 的 joinPath 最后一节必须是值列（见硬性约束）；sourceTable 必须来自 DDL 表名清单；若全路径已由 joinPath 表达，sourceField 填路径终点字段名。',
+          '',
+          '【复合维度 CONCAT（多行）— 必须读 notes】',
+          '若同一 standardKey 在 Step2 中有多行样本（rows.length>1），必须返回 operator:"CONCAT" 且 parts 顺序与行顺序一致。',
+          '你必须阅读每行 notes 线索：例如材质 LT04，若 notes 提示父子关系，请利用 parent_id 做自连接（Self-Join）：(Parent.category_code) + (Child.category_code)。在 parts 中分别给出父段与子段的 joinPath，并确保终点字段仍是用户指定的 category_code（或用户指定字段）。',
           '',
           '侦探式推理步骤（必须按这个思路找链路并给出 path）：',
           '1) 哪张表能找到款号（通常是 product_info 的 style_wms 或类似字段）？',
@@ -1350,11 +1389,10 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
           const targetStandardKey = typeof j?.targetStandardKey === 'string' ? j.targetStandardKey.trim() : '';
           const pathArr = Array.isArray(j?.path) ? j.path.map((p) => String(p).trim()).filter(Boolean) : [];
           if (!targetStandardKey || pathArr.length < 2) continue;
-          if (
-            (targetStandardKey === 'lastCode' || targetStandardKey === 'soleCode') &&
-            joinPathLastFieldLower(pathArr) === 'id'
-          ) {
-            continue;
+          const expected = expectedValueByStandardKey.get(targetStandardKey) || '';
+          const lastLower = joinPathLastFieldLower(pathArr);
+          if (lastLower === 'id' || lastLower.endsWith('_id')) {
+            if (!isNumericLike(expected)) continue;
           }
           if (!joinByKey.has(targetStandardKey)) joinByKey.set(targetStandardKey, { targetStandardKey, path: pathArr });
         }
@@ -1372,13 +1410,12 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
             .filter((p) => {
               if (!p.sourceField || !p.sourceTable) return false;
               const jpArr = p.joinPath;
-              if (
-                Array.isArray(jpArr) &&
-                jpArr.length >= 2 &&
-                (standardKey === 'lastCode' || standardKey === 'soleCode') &&
-                joinPathLastFieldLower(jpArr) === 'id'
-              ) {
-                return false;
+              const expected = expectedValueByStandardKey.get(standardKey) || '';
+              if (Array.isArray(jpArr) && jpArr.length >= 2) {
+                const lastLower = joinPathLastFieldLower(jpArr);
+                if (lastLower === 'id' || lastLower.endsWith('_id')) {
+                  if (!isNumericLike(expected)) return false;
+                }
               }
               return true;
             });

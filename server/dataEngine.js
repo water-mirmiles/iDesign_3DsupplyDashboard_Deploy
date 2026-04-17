@@ -272,8 +272,10 @@ function resolveChainValue({ mainRow, mainTableName, chainNodes, tablesMap }) {
   for (let i = 1; i < chainNodes.length; i += 2) {
     const keyNode = chainNodes[i];
     const valNode = chainNodes[i + 1];
-    if (!keyNode || !valNode) break;
-    if (keyNode.table !== valNode.table) break;
+    // CHAIN 必须成对出现：key -> value；若缺失，说明链路不完整（常见于只到 id 层），直接判失败
+    if (!keyNode || !valNode) return '';
+    // 若 AI 给出了跨表但缺少中间列（如 master.fk->t1.id->t2.code），无法确定性执行 join，直接判失败
+    if (keyNode.table !== valNode.table) return '';
 
     const t = tablesMap.get(keyNode.table);
     if (!t) return '';

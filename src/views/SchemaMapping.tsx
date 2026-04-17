@@ -1035,17 +1035,22 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
     const tok = `${physicalColumn}@${sourceFile}`;
     const append = concatPickNext;
     if (append) setConcatPickNext(false);
-    setStandardFields((prev) =>
-      prev.map((f) => {
-        if (f.standardKey !== activeFieldKey) return f;
-        const cur = (f.mappedSources || []).map((s) => String(s).trim()).filter(Boolean);
-        if (append) {
-          if (!cur.length) return { ...f, mappedSources: [tok] };
-          return { ...f, mappedSources: [...cur, tok] };
-        }
-        return { ...f, mappedSources: [tok] };
-      })
-    );
+    let nextFields: GlobalSchemaField[] = [];
+    flushSync(() => {
+      setStandardFields((prev) => {
+        nextFields = prev.map((f) => {
+          if (f.standardKey !== activeFieldKey) return f;
+          const cur = (f.mappedSources || []).map((s) => String(s).trim()).filter(Boolean);
+          if (append) {
+            if (!cur.length) return { ...f, mappedSources: [tok] };
+            return { ...f, mappedSources: [...cur, tok] };
+          }
+          return { ...f, mappedSources: [tok] };
+        });
+        return nextFields;
+      });
+    });
+    if (nextFields.length) void runPreviewMappingRow(buildCertifiedMapping(nextFields));
   };
 
   const handleSaveMappingAuthenticated = async (): Promise<{ ok: true } | { ok: false; error: string }> => {
