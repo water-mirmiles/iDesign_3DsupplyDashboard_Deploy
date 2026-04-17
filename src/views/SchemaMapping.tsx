@@ -28,6 +28,13 @@ type TableSamplesResponse = {
   samples: Record<string, string[]>;
 };
 
+type MappingPart = {
+  sourceField: string;
+  sourceTable: string;
+  physicalColumn?: string;
+  joinPath?: string[];
+};
+
 type MappingEntry = {
   standardKey: string;
   standardName: string;
@@ -35,12 +42,66 @@ type MappingEntry = {
   sourceTable?: string;
   sourceField?: string;
   joinPath?: string[];
+  operator?: 'CONCAT';
+  parts?: MappingPart[];
 };
 
-/** 写入 mapping_config 的完整条目（含 joinPath） */
+function tokenToMappingPart(token: string): MappingPart | null {
+  const t = String(token || '').trim();
+  if (!t) return null;
+  if (t.startsWith('CHAIN|')) {
+    const joinPath = t.slice('CHAIN|'.length).split('->').map((x) => x.trim()).filter(Boolean);
+    const head = joinPath[0] || '';
+    const dot = head.indexOf('.');
+    const tbl = dot > 0 ? head.slice(0, dot) : '';
+    const fld = dot > 0 ? head.slice(dot + 1) : head;
+    return { sourceField: fld, sourceTable: tbl, joinPath, physicalColumn: t };
+  }
+  if (t.includes('@')) {
+    const at = t.lastIndexOf('@');
+    const col = t.slice(0, at);
+    const file = t.slice(at + 1);
+    return { sourceField: col, sourceTable: file, physicalColumn: col };
+  }
+  return { sourceField: t, sourceTable: '', physicalColumn: t };
+}
+
+/** 写入 mapping_config 的完整条目（含 joinPath / CONCAT 多段） */
 function buildCertifiedMapping(fields: GlobalSchemaField[]): MappingEntry[] {
   return fields.map((f) => {
-    const token = f.mappedSources?.[0] || '';
+    const tokens = (f.mappedSources || []).map((s) => String(s || '').trim()).filter(Boolean);
+    if (tokens.length >= 2) {
+      const parts = tokens.map((tok) => tokenToMappingPart(tok)).filter(Boolean) as MappingPart[];
+      if (parts.length >= 2) {
+        return {
+          standardKey: f.standardKey,
+          standardName: f.standardName,
+          operator: 'CONCAT',
+          parts,
+          physicalColumn: `CONCAT|${tokens.join('||')}`,
+        };
+      }
+    }
+    if (tokens.length === 1 && tokens[0].startsWith('CONCAT|')) {
+      const sub = tokens[0]
+        .slice('CONCAT|'.length)
+        .split('||')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (sub.length >= 2) {
+        const parts = sub.map((tok) => tokenToMappingPart(tok)).filter(Boolean) as MappingPart[];
+        if (parts.length >= 2) {
+          return {
+            standardKey: f.standardKey,
+            standardName: f.standardName,
+            operator: 'CONCAT',
+            parts,
+            physicalColumn: tokens[0],
+          };
+        }
+      }
+    }
+    const token = tokens[0] || '';
     if (token.startsWith('CHAIN|')) {
       const joinPath = token.slice('CHAIN|'.length).split('->').map((x) => x.trim()).filter(Boolean);
       const head = joinPath[0] || '';
@@ -78,6 +139,11 @@ function buildCertifiedMapping(fields: GlobalSchemaField[]): MappingEntry[] {
   });
 }
 
+function mappingEntryIsPublishable(m: MappingEntry): boolean {
+  if (m.operator === 'CONCAT' && Array.isArray(m.parts) && m.parts.length >= 2) return true;
+  return Boolean(m.physicalColumn);
+}
+
 type DdlColumn = {
   table?: string;
   column: string;
@@ -87,23 +153,44 @@ type DdlColumn = {
 type AiTable = { tableName: string; columns: Array<{ name: string; comment?: string }> };
 type AiSuggestion = { standardKey: string; sourceField: string; sourceTable: string };
 type AiJoinPath = { targetStandardKey: string; path: string[] };
+type AiConcatPart = { sourceField: string; sourceTable: string; joinPath?: string[] };
+type AiConcatSuggestion = { standardKey: string; parts: AiConcatPart[] };
 
 function normalize(s: string) {
   return (s || '').trim().toLowerCase();
 }
 
+function sortDdlColumnsForGolden(
+  colsRaw: { name: string; comment?: string }[],
+  masterTable: string,
+  activeTable: string
+) {
+  if (!masterTable || activeTable !== masterTable) return colsRaw;
+  const score = (c: { name: string; comment?: string }) => {
+    const hay = `${c.name || ''} ${(c.comment || '')}`.toLowerCase();
+    const hasStyle = hay.includes('款号') || hay.includes('style') || hay.includes('style_wms');
+    const hasBrand = hay.includes('品牌') || hay.includes('brand');
+    const hasStatus = hay.includes('状态') || hay.includes('status') || hay.includes('data_status');
+    return (hasStyle ? 30 : 0) + (hasBrand ? 20 : 0) + (hasStatus ? 10 : 0);
+  };
+  return [...colsRaw].sort((a, b) => score(b) - score(a));
+}
+
 // NOTE: 沙盒校验（7 维逐项比对）已从主流程移除；保留样本 XLSX 上传仅用于 AI sampleRow 与右侧数据预览。
 
+type GoldenSampleSegment = { tableName: string; fieldName: string; value: string };
+
+/** 一条黄金样本：对应一个标准维度，可含多段物理字段（拼接语义） */
 type GoldenSampleEntry = {
   id: string;
-  tableName: string;
-  fieldName: string;
-  value: string;
+  standardKey: string;
+  segments: GoldenSampleSegment[];
 };
 
 type DdlSchemaResponse = {
   ok: boolean;
   tables?: AiTable[];
+  tableMap?: Record<string, Column[]>;
   error?: string;
 };
 
@@ -121,6 +208,8 @@ export default function SchemaMapping() {
   const [isParsingDdl, setIsParsingDdl] = useState(false);
   const ddlParseTimerRef = useRef<number | null>(null);
   const ddlParseAbortRef = useRef<AbortController | null>(null);
+  const ddlLenRef = useRef<number>(0);
+  const ddlPasteArmedRef = useRef<boolean>(false);
 
   const [aiTables, setAiTables] = useState<AiTable[]>([]);
   const [aiSuggestions, setAiSuggestions] = useState<AiSuggestion[]>([]);
@@ -130,6 +219,7 @@ export default function SchemaMapping() {
   const [isAiModeling, setIsAiModeling] = useState(false);
   const [masterTable, setMasterTable] = useState('');
   const [goldenSamples, setGoldenSamples] = useState<GoldenSampleEntry[]>([]);
+  const [concatPickNext, setConcatPickNext] = useState(false);
   const [ddlRefOpen, setDdlRefOpen] = useState(false);
   const [aiBusy503, setAiBusy503] = useState(false);
   const [aiQueueHint, setAiQueueHint] = useState(false);
@@ -183,6 +273,72 @@ export default function SchemaMapping() {
   }, [masterTable]);
 
   // Step 1：DDL 粘贴后，后端即时解析“表名 + 字段列表”
+  const runParseDdlSchema = useCallback(
+    async (sqlText: string, reason: 'typing' | 'debounced' | 'manual') => {
+      const text = String(sqlText || '').trim();
+      if (!text) {
+        setParsedTables([]);
+        setParsedTableMap({});
+        return;
+      }
+      if (ddlParseAbortRef.current) ddlParseAbortRef.current.abort();
+      const controller = new AbortController();
+      ddlParseAbortRef.current = controller;
+      setIsParsingDdl(true);
+      try {
+        const resp = await fetch(`${API_BASE}/api/parse-ddl-schema`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+          body: JSON.stringify({ sqlText }),
+        });
+        const rawText = await resp.text();
+        let json: DdlSchemaResponse | null = null;
+        try {
+          json = rawText ? (JSON.parse(rawText) as DdlSchemaResponse) : null;
+        } catch {
+          json = null;
+        }
+        if (!resp.ok || !json?.ok) {
+          // eslint-disable-next-line no-console
+          console.warn('[parse-ddl-schema] failed', { reason, status: resp.status, statusText: resp.statusText, body: json ?? rawText });
+          setParsedTables([]);
+          setParsedTableMap({});
+          return;
+        }
+        if (json.tableMap && typeof json.tableMap === 'object' && !Array.isArray(json.tableMap)) {
+          setParsedTableMap(json.tableMap as Record<string, Column[]>);
+          setParsedTables(Array.isArray(json.tables) ? json.tables : []);
+          return;
+        }
+        // backward-compatible fallback: build map from tables array
+        const tablesArr = Array.isArray(json.tables) ? json.tables : [];
+        setParsedTables(tablesArr);
+        const map: Record<string, Column[]> = {};
+        for (const t of tablesArr) {
+          const tn = String(t?.tableName || '').trim();
+          if (!tn) continue;
+          const cols = Array.isArray(t?.columns)
+            ? t.columns
+                .map((c: any) => ({ name: String(c?.name || '').trim(), comment: c?.comment ? String(c.comment) : '' }))
+                .filter((c: any) => c.name)
+            : [];
+          map[tn] = cols;
+        }
+        setParsedTableMap(map);
+      } catch (e) {
+        if (String((e as any)?.name || '').includes('AbortError')) return;
+        // eslint-disable-next-line no-console
+        console.warn('[parse-ddl-schema] exception', { reason, message: e instanceof Error ? e.message : String(e) });
+        setParsedTables([]);
+        setParsedTableMap({});
+      } finally {
+        setIsParsingDdl(false);
+      }
+    },
+    []
+  );
+
   useEffect(() => {
     if (ddlParseTimerRef.current) window.clearTimeout(ddlParseTimerRef.current);
     if (ddlParseAbortRef.current) ddlParseAbortRef.current.abort();
@@ -192,58 +348,23 @@ export default function SchemaMapping() {
       return;
     }
     ddlParseTimerRef.current = window.setTimeout(() => {
-      const controller = new AbortController();
-      ddlParseAbortRef.current = controller;
-      setIsParsingDdl(true);
-      (async () => {
-        try {
-          const resp = await fetch(`${API_BASE}/api/parse-ddl-schema`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            signal: controller.signal,
-            body: JSON.stringify({ sqlText: ddlText }),
-          });
-          const json = (await resp.json().catch(() => null)) as DdlSchemaResponse | null;
-          if (!resp.ok || !json?.ok) {
-            setParsedTables([]);
-            setParsedTableMap({});
-            return;
-          }
-          const tablesArr = Array.isArray(json.tables) ? json.tables : [];
-          setParsedTables(tablesArr);
-          const map: Record<string, Column[]> = {};
-          for (const t of tablesArr) {
-            const tn = String(t?.tableName || '').trim();
-            if (!tn) continue;
-            const cols = Array.isArray(t?.columns)
-              ? t.columns
-                  .map((c: any) => ({ name: String(c?.name || '').trim(), comment: c?.comment ? String(c.comment) : '' }))
-                  .filter((c: any) => c.name)
-              : [];
-            map[tn] = cols;
-          }
-          setParsedTableMap(map);
-        } catch (e) {
-          if (String((e as any)?.name || '').includes('AbortError')) return;
-          setParsedTables([]);
-          setParsedTableMap({});
-        } finally {
-          setIsParsingDdl(false);
-        }
-      })().catch(() => {});
-    }, 250);
+      void runParseDdlSchema(ddlText, 'debounced');
+    }, 500);
     return () => {
       if (ddlParseTimerRef.current) window.clearTimeout(ddlParseTimerRef.current);
       if (ddlParseAbortRef.current) ddlParseAbortRef.current.abort();
     };
-  }, [ddlText]);
+  }, [ddlText, runParseDdlSchema]);
 
   const saveSchemaDraft = useCallback(async () => {
     try {
       const data = {
         ddlText,
         masterTable,
-        goldenSamples: goldenSamples.map((s) => ({ tableName: s.tableName, fieldName: s.fieldName, value: s.value })),
+        goldenSamples: goldenSamples.map((s) => ({
+          standardKey: s.standardKey,
+          segments: s.segments.map((g) => ({ tableName: g.tableName, fieldName: g.fieldName, value: g.value })),
+        })),
       };
       // eslint-disable-next-line no-console
       console.log('🚀 准备发送草稿:', data);
@@ -291,14 +412,35 @@ export default function SchemaMapping() {
         if (typeof (d as any).masterTable === 'string') setMasterTable((d as any).masterTable);
         const gs = (d as any).goldenSamples;
         if (Array.isArray(gs)) {
-          const normalized = gs
-            .map((x: any, idx: number) => ({
-              id: `${Date.now()}_${idx}`,
-              tableName: typeof x?.tableName === 'string' ? x.tableName : '',
-              fieldName: typeof x?.fieldName === 'string' ? x.fieldName : '',
-              value: typeof x?.value === 'string' ? x.value : '',
-            }))
-            .filter((x: any) => x.tableName || x.fieldName || x.value);
+          const normalized: GoldenSampleEntry[] = gs
+            .map((x: any, idx: number) => {
+              if (Array.isArray(x?.segments) && x.segments.length) {
+                return {
+                  id: typeof x?.id === 'string' ? x.id : `${Date.now()}_${idx}`,
+                  standardKey: typeof x?.standardKey === 'string' ? x.standardKey : 'materialCode',
+                  segments: x.segments.map((seg: any) => ({
+                    tableName: typeof seg?.tableName === 'string' ? seg.tableName : '',
+                    fieldName: typeof seg?.fieldName === 'string' ? seg.fieldName : '',
+                    value: typeof seg?.value === 'string' ? seg.value : '',
+                  })),
+                };
+              }
+              return {
+                id: `${Date.now()}_${idx}`,
+                standardKey: typeof x?.standardKey === 'string' ? x.standardKey : 'materialCode',
+                segments: [
+                  {
+                    tableName: typeof x?.tableName === 'string' ? x.tableName : '',
+                    fieldName: typeof x?.fieldName === 'string' ? x.fieldName : '',
+                    value: typeof x?.value === 'string' ? x.value : '',
+                  },
+                ],
+              };
+            })
+            .filter(
+              (x: GoldenSampleEntry) =>
+                x.segments.some((s) => s.tableName || s.fieldName || s.value)
+            );
           setGoldenSamples(normalized);
         }
       } catch {
@@ -413,7 +555,10 @@ export default function SchemaMapping() {
   const sampleGrid = useMemo(() => {
     // 右侧“Excel 风格”抽样表：以当前 selectedFile 为主（表头来自 XLSX）
     const cols = mappingPreview.filter(
-      (m) => m.physicalColumn && !String(m.physicalColumn).startsWith('CHAIN|')
+      (m) =>
+        m.physicalColumn &&
+        !String(m.physicalColumn).startsWith('CHAIN|') &&
+        !String(m.physicalColumn).startsWith('CONCAT|')
     ) as Array<Required<Pick<MappingEntry, 'standardKey' | 'standardName' | 'physicalColumn'>>>;
     const rows = [0, 1, 2].map((rowIdx) => {
       const r: Record<string, string> = {};
@@ -501,7 +646,7 @@ export default function SchemaMapping() {
 
   // Step 4：基于当前 mapping（含 Join Path）从最新 XLSX 抽取一行真实值用于预览
   useEffect(() => {
-    const hasAny = mappingPreview.some((m) => Boolean(m.physicalColumn));
+    const hasAny = mappingPreview.some((m) => mappingEntryIsPublishable(m));
     if (!hasAny) {
       setResolvedRow(null);
       setResolvedMeta(null);
@@ -547,8 +692,8 @@ export default function SchemaMapping() {
     };
   }, [mappingPreview]);
 
-  /** 将 AI 返回的直连字段 + Join 链路一次性写入标准字段（Join 优先覆盖同 key） */
-  const applyAiResultsToFields = (sug: AiSuggestion[], jp: AiJoinPath[]) => {
+  /** 将 AI 返回的直连字段 + Join 链路 + 复合拼接映射一次性写入标准字段（concat 最后覆盖同 key） */
+  const applyAiResultsToFields = (sug: AiSuggestion[], jp: AiJoinPath[], concatSuggestions: AiConcatSuggestion[] = []) => {
     setStandardFields((prev) => {
       const next = prev.map((f) => ({ ...f, mappedSources: [...(f.mappedSources || [])] }));
       for (const s of sug) {
@@ -560,6 +705,21 @@ export default function SchemaMapping() {
         const target = next.find((f) => f.standardKey === j.targetStandardKey);
         if (!target) continue;
         target.mappedSources = [`CHAIN|${j.path.join('->')}`];
+      }
+      for (const c of concatSuggestions) {
+        const target = next.find((f) => f.standardKey === c.standardKey);
+        if (!target || !Array.isArray(c.parts) || c.parts.length < 2) continue;
+        const tokens = c.parts
+          .map((p) => {
+            const jpArr = Array.isArray(p.joinPath) ? p.joinPath.map((x) => String(x).trim()).filter(Boolean) : [];
+            if (jpArr.length >= 2) return `CHAIN|${jpArr.join('->')}`;
+            const sf = String(p.sourceField || '').trim();
+            const st = String(p.sourceTable || '').trim();
+            if (sf && st) return `${sf}@${st}`;
+            return '';
+          })
+          .filter(Boolean);
+        if (tokens.length >= 2) target.mappedSources = tokens;
       }
       return next;
     });
@@ -582,7 +742,10 @@ export default function SchemaMapping() {
         body: JSON.stringify({
           sqlText: ddlText,
           masterTable: masterTable || undefined,
-          goldenSamples: goldenSamples.map((s) => ({ tableName: s.tableName, fieldName: s.fieldName, value: s.value })),
+          goldenSamples: goldenSamples.map((s) => ({
+            standardKey: s.standardKey,
+            segments: s.segments.map((g) => ({ tableName: g.tableName, fieldName: g.fieldName, value: g.value })),
+          })),
         }),
       });
       window.clearTimeout(t);
@@ -598,7 +761,15 @@ export default function SchemaMapping() {
       }
       // eslint-disable-next-line no-console
       console.log('[ai-parse-multi-sql] raw:', text);
-      const json = JSON.parse(text) as { ok: boolean; tables?: AiTable[]; smartSuggestions?: AiSuggestion[]; joinPathSuggestions?: AiJoinPath[]; error?: string; _debug?: any };
+      const json = JSON.parse(text) as {
+        ok: boolean;
+        tables?: AiTable[];
+        smartSuggestions?: AiSuggestion[];
+        joinPathSuggestions?: AiJoinPath[];
+        concatMappingSuggestions?: AiConcatSuggestion[];
+        error?: string;
+        _debug?: any;
+      };
       // eslint-disable-next-line no-console
       console.log('[ai-parse-multi-sql] parsed:', json);
       if (!json.ok) throw new Error(json.error || 'AI 多表解析失败');
@@ -606,6 +777,7 @@ export default function SchemaMapping() {
       const parsedTables = (json.tables || []).filter((t) => t?.tableName);
       const sug = json.smartSuggestions || [];
       const jp = json.joinPathSuggestions || [];
+      const concatSug = json.concatMappingSuggestions || [];
       setAiSuggestions(sug);
       setAiJoinPaths(jp);
       setAiTables(parsedTables);
@@ -621,7 +793,7 @@ export default function SchemaMapping() {
       }
       setDdlParsed(flattened);
       setAiQueueHint(false);
-      applyAiResultsToFields(sug, jp);
+      applyAiResultsToFields(sug, jp, concatSug);
       return { ok: true };
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'AI 多表解析失败';
@@ -657,14 +829,18 @@ export default function SchemaMapping() {
   };
 
   const assignPhysicalColumn = (physicalColumn: string, sourceFile: string) => {
+    const tok = `${physicalColumn}@${sourceFile}`;
+    const append = concatPickNext;
+    if (append) setConcatPickNext(false);
     setStandardFields((prev) =>
       prev.map((f) => {
         if (f.standardKey !== activeFieldKey) return f;
-        return {
-          ...f,
-          // 简化：单选映射，保存为 "col@file"（兼容 mappedSources: string[]）
-          mappedSources: [`${physicalColumn}@${sourceFile}`],
-        };
+        const cur = (f.mappedSources || []).map((s) => String(s).trim()).filter(Boolean);
+        if (append) {
+          if (!cur.length) return { ...f, mappedSources: [tok] };
+          return { ...f, mappedSources: [...cur, tok] };
+        }
+        return { ...f, mappedSources: [tok] };
       })
     );
   };
@@ -701,7 +877,7 @@ export default function SchemaMapping() {
     setHasAttemptedAuth(true);
     setError(null);
     setAuthSyncHint('');
-    const hasAny = mappingPreview.some((m) => Boolean(m.physicalColumn));
+    const hasAny = mappingPreview.some((m) => mappingEntryIsPublishable(m));
     if (!hasAny) return setError('尚无可发布的结果：请先执行 AI 逻辑建模或手动纠偏映射');
 
     setAuthSyncing(true);
@@ -746,15 +922,25 @@ export default function SchemaMapping() {
         </div>
       )}
 
-      <div className="w-full px-2 lg:px-4 h-[calc(100vh-8rem)] flex flex-col gap-2">
+      <div className="w-full px-2 lg:px-4 min-h-full flex flex-col gap-4 pb-8">
         {/* Step 1: 提供原材料（SQL & 样本文件） */}
         <div className="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
           <div className="px-3 py-2 bg-slate-900 text-white flex flex-wrap items-center justify-between gap-2">
             <div className="text-sm font-semibold">Step 1 · 提供原材料（SQL & 样本文件）</div>
-            <div className="text-[11px] text-slate-200">
-              已检测到 <span className="font-mono">{detectedTableCount}</span> 张表
-              <span className="mx-2 text-slate-500">|</span>
-              已解析 <span className="font-mono">{parsedTables.length}</span> 张表结构
+            <div className="text-[11px] text-slate-200 flex items-center gap-2">
+              {isParsingDdl ? (
+                <span className="animate-pulse">AI 正在深度理解表结构...</span>
+              ) : (
+                <>
+                  <span>
+                    已检测到 <span className="font-mono">{detectedTableCount}</span> 张表
+                  </span>
+                  <span className="text-slate-500">|</span>
+                  <span>
+                    已解析 <span className="font-mono">{Object.keys(parsedTableMap || {}).length}</span> 张表结构
+                  </span>
+                </>
+              )}
             </div>
           </div>
           <div className="p-3 grid grid-cols-12 gap-3">
@@ -819,7 +1005,30 @@ export default function SchemaMapping() {
               <div className="p-3 space-y-2">
                 <textarea
                   value={ddlText}
-                  onChange={(e) => setDdlText(e.target.value)}
+                  onPaste={(e) => {
+                    // 只要发生 paste，就武断认为是“大幅变化”，下一次 onChange 立即解析
+                    ddlPasteArmedRef.current = true;
+                    // 解析在 onChange 中触发（此处不直接 fetch，避免读到旧 value）
+                    // eslint-disable-next-line no-console
+                    console.log('[ddl] paste armed', { clipChars: e.clipboardData?.getData('text')?.length || 0 });
+                  }}
+                  onChange={(e) => {
+                    const next = e.target.value;
+                    const prevLen = ddlLenRef.current || 0;
+                    const nextLen = next.length;
+                    const delta = Math.abs(nextLen - prevLen);
+                    ddlLenRef.current = nextLen;
+                    setDdlText(next);
+
+                    // 粘贴/大幅变化：立即解析
+                    const hugeChange = delta >= 200;
+                    if (ddlPasteArmedRef.current || hugeChange) {
+                      ddlPasteArmedRef.current = false;
+                      if (ddlParseTimerRef.current) window.clearTimeout(ddlParseTimerRef.current);
+                      void runParseDdlSchema(next, 'typing');
+                    }
+                    // 小幅编辑：静默走防抖 useEffect
+                  }}
                   placeholder="粘贴多表 DDL（含 COMMENT 更佳）。粘贴后系统会即时解析表名与字段列表…"
                   className="w-full min-h-[240px] max-h-[360px] p-3 text-xs border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent resize-y font-mono text-slate-700 bg-slate-50/30"
                   disabled={busy}
@@ -878,6 +1087,7 @@ export default function SchemaMapping() {
                     setParsedTables([]);
                     setMasterTable('');
                     setGoldenSamples([]);
+                    setConcatPickNext(false);
                     setStandardFields(initialStandardFields);
                     setActiveFieldKey(initialStandardFields[0].standardKey);
                     setAiTables([]);
@@ -894,108 +1104,199 @@ export default function SchemaMapping() {
               </div>
             </div>
 
-            <div className="border border-slate-200 rounded-xl overflow-hidden">
-              <div className="px-3 py-2 bg-slate-50 border-b border-slate-200 flex items-center justify-between">
+            <div className="border border-slate-200 rounded-xl">
+              <div className="px-3 py-2 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-2 flex-wrap">
                 <div className="text-[11px] font-semibold text-slate-800">动态黄金样本（Dynamic Golden Sample）</div>
                 <button
                   type="button"
-                  disabled={ddlTableNames.length === 0 || busy}
+                  disabled={Object.keys(parsedTableMap || {}).length === 0 || busy}
                   onClick={() =>
                     setGoldenSamples((prev) => [
                       ...prev,
-                      { id: `${Date.now()}_${Math.random().toString(16).slice(2)}`, tableName: '', fieldName: '', value: '' },
+                      {
+                        id: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
+                        standardKey: 'materialCode',
+                        segments: [{ tableName: '', fieldName: '', value: '' }],
+                      },
                     ])
                   }
                   className="px-2.5 py-1.5 text-[11px] font-semibold rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
                 >
-                  + 添加样本字段
+                  + 添加样本组
                 </button>
               </div>
-              <div className="p-3 space-y-2">
+              <div className="p-3 space-y-3">
+                <div className="text-[11px] text-slate-600">
+                  每条样本对应一个<strong>标准维度</strong>。同一维度下可用「+ 组合」添加多段物理字段，表示拼接关系（例如材质：<code className="font-mono">LT</code> +{' '}
+                  <code className="font-mono">04</code> → <code className="font-mono">LT04</code>）。
+                </div>
                 {goldenSamples.length === 0 ? (
                   <div className="text-[11px] text-slate-500">
-                    还没有样本行。点击右上角「+ 添加样本字段」，用 (table.field=value) 给 AI 提供强约束路标。
+                    {Object.keys(parsedTableMap || {}).length === 0
+                      ? '请先解析 SQL 或等待解析完成…（解析成功后即可添加样本行）'
+                      : '还没有样本。点击「+ 添加样本组」，按标准维度 + 多段 table.field=value 约束 AI。'}
                   </div>
                 ) : (
-                  goldenSamples.map((row) => {
-                    const colsRaw = row.tableName ? parsedTableMap[row.tableName] || [] : [];
-                    const cols = (() => {
-                      // 体验优化：当选中“主表”时，在字段下拉里置顶/高亮“款号/品牌/状态”候选
-                      if (!masterTable || row.tableName !== masterTable) return colsRaw;
-                      const score = (c: { name: string; comment?: string }) => {
-                        const hay = `${c.name || ''} ${(c.comment || '')}`.toLowerCase();
-                        const hasStyle = hay.includes('款号') || hay.includes('style') || hay.includes('style_wms');
-                        const hasBrand = hay.includes('品牌') || hay.includes('brand');
-                        const hasStatus = hay.includes('状态') || hay.includes('status') || hay.includes('data_status');
-                        return (hasStyle ? 30 : 0) + (hasBrand ? 20 : 0) + (hasStatus ? 10 : 0);
-                      };
-                      return [...colsRaw].sort((a, b) => score(b) - score(a));
-                    })();
-                    return (
-                      <div key={row.id} className="grid grid-cols-12 gap-2 items-center">
+                  goldenSamples.map((entry) => (
+                    <div key={entry.id} className="border border-slate-200 rounded-lg p-3 space-y-2 bg-white">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-[11px] text-slate-600 shrink-0">标准维度</span>
                         <select
-                          value={row.tableName}
+                          value={entry.standardKey}
                           disabled={busy}
                           onChange={(e) => {
-                            const nextTable = e.target.value;
-                            setGoldenSamples((prev) =>
-                              prev.map((x) => (x.id === row.id ? { ...x, tableName: nextTable, fieldName: '' } : x))
-                            );
+                            const sk = e.target.value;
+                            setGoldenSamples((prev) => prev.map((x) => (x.id === entry.id ? { ...x, standardKey: sk } : x)));
                           }}
-                          className="col-span-12 lg:col-span-4 text-[11px] px-2 py-2 rounded-lg bg-white border border-slate-200 text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                          className="text-[11px] px-2 py-1.5 rounded-lg bg-white border border-slate-200 text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500 min-w-[8rem]"
                         >
-                          <option value="">选择表名…</option>
-                          {ddlTableNames.map((t) => (
-                            <option key={t} value={t}>
-                              {t}
+                          {initialStandardFields.map((f) => (
+                            <option key={f.standardKey} value={f.standardKey}>
+                              {f.standardName} ({f.standardKey})
                             </option>
                           ))}
                         </select>
-                        <select
-                          value={row.fieldName}
-                          disabled={!row.tableName || busy}
-                          onChange={(e) => {
-                            const nextField = e.target.value;
-                            setGoldenSamples((prev) => prev.map((x) => (x.id === row.id ? { ...x, fieldName: nextField } : x)));
-                          }}
-                          className="col-span-12 lg:col-span-4 text-[11px] px-2 py-2 rounded-lg bg-white border border-slate-200 text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:bg-slate-50"
-                        >
-                          <option value="">选择字段…</option>
-                          {cols.map((c) => {
-                            const hay = `${c.name || ''} ${(c.comment || '')}`.toLowerCase();
-                            const isHot =
-                              masterTable &&
-                              row.tableName === masterTable &&
-                              (hay.includes('款号') || hay.includes('style') || hay.includes('style_wms') || hay.includes('品牌') || hay.includes('brand') || hay.includes('状态') || hay.includes('status') || hay.includes('data_status'));
-                            return (
-                            <option key={c.name} value={c.name}>
-                              {isHot ? `★ ${c.name}` : c.name}
-                              {c.comment ? ` (${c.comment})` : ''}
-                            </option>
-                          )})}
-                        </select>
-                        <input
-                          value={row.value}
-                          disabled={busy}
-                          onChange={(e) => {
-                            const v = e.target.value;
-                            setGoldenSamples((prev) => prev.map((x) => (x.id === row.id ? { ...x, value: v } : x)));
-                          }}
-                          placeholder="填入该字段的正确值（黄金样本）"
-                          className="col-span-12 lg:col-span-3 text-[11px] border border-slate-200 rounded-lg px-2 py-2 bg-white text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                        />
                         <button
                           type="button"
                           disabled={busy}
-                          onClick={() => setGoldenSamples((prev) => prev.filter((x) => x.id !== row.id))}
-                          className="col-span-12 lg:col-span-1 text-[11px] px-2 py-2 rounded-lg bg-white border border-slate-200 text-slate-600 hover:bg-slate-50"
-                          title="删除该样本行"
+                          onClick={() => setGoldenSamples((prev) => prev.filter((x) => x.id !== entry.id))}
+                          className="ml-auto text-[11px] px-2 py-1 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50"
+                          title="删除该样本组"
                         >
-                          删除
+                          删除整组
                         </button>
                       </div>
-                    );
-                  })
+                      {entry.segments.map((seg, segIdx) => {
+                        const colsRaw = seg.tableName ? parsedTableMap[seg.tableName] || [] : [];
+                        const cols = sortDdlColumnsForGolden(colsRaw, masterTable, seg.tableName);
+                        return (
+                          <div key={`${entry.id}_seg_${segIdx}`} className="grid grid-cols-12 gap-2 items-center">
+                            <select
+                              value={seg.tableName}
+                              disabled={busy}
+                              onChange={(e) => {
+                                const nextTable = e.target.value;
+                                setGoldenSamples((prev) =>
+                                  prev.map((x) => {
+                                    if (x.id !== entry.id) return x;
+                                    const nextSegs = x.segments.map((s, i) =>
+                                      i === segIdx ? { ...s, tableName: nextTable, fieldName: '' } : s
+                                    );
+                                    return { ...x, segments: nextSegs };
+                                  })
+                                );
+                              }}
+                              className="col-span-12 lg:col-span-3 text-[11px] px-2 py-2 rounded-lg bg-white border border-slate-200 text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                            >
+                              <option value="">选择表名…</option>
+                              {ddlTableNames.map((t) => (
+                                <option key={t} value={t}>
+                                  {t}
+                                </option>
+                              ))}
+                            </select>
+                            <select
+                              value={seg.fieldName}
+                              disabled={!seg.tableName || busy}
+                              onChange={(e) => {
+                                const nextField = e.target.value;
+                                setGoldenSamples((prev) =>
+                                  prev.map((x) => {
+                                    if (x.id !== entry.id) return x;
+                                    const nextSegs = x.segments.map((s, i) =>
+                                      i === segIdx ? { ...s, fieldName: nextField } : s
+                                    );
+                                    return { ...x, segments: nextSegs };
+                                  })
+                                );
+                              }}
+                              className="col-span-12 lg:col-span-4 text-[11px] px-2 py-2 rounded-lg bg-white border border-slate-200 text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:bg-slate-50"
+                            >
+                              <option value="">
+                                {seg.tableName && cols.length === 0 ? '请先解析 SQL 或等待解析...' : '选择字段…'}
+                              </option>
+                              {cols.map((c) => {
+                                const hay = `${c.name || ''} ${(c.comment || '')}`.toLowerCase();
+                                const isHot =
+                                  masterTable &&
+                                  seg.tableName === masterTable &&
+                                  (hay.includes('款号') ||
+                                    hay.includes('style') ||
+                                    hay.includes('style_wms') ||
+                                    hay.includes('品牌') ||
+                                    hay.includes('brand') ||
+                                    hay.includes('状态') ||
+                                    hay.includes('status') ||
+                                    hay.includes('data_status'));
+                                return (
+                                  <option key={c.name} value={c.name}>
+                                    {isHot ? `★ ${c.name}` : c.name}
+                                    {c.comment ? ` (${c.comment})` : ''}
+                                  </option>
+                                );
+                              })}
+                            </select>
+                            <input
+                              value={seg.value}
+                              disabled={busy}
+                              onChange={(e) => {
+                                const v = e.target.value;
+                                setGoldenSamples((prev) =>
+                                  prev.map((x) => {
+                                    if (x.id !== entry.id) return x;
+                                    const nextSegs = x.segments.map((s, i) => (i === segIdx ? { ...s, value: v } : s));
+                                    return { ...x, segments: nextSegs };
+                                  })
+                                );
+                              }}
+                              placeholder="该段样本值（如 LT / 04）"
+                              className="col-span-12 lg:col-span-3 text-[11px] border border-slate-200 rounded-lg px-2 py-2 bg-white text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                            />
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() =>
+                                setGoldenSamples((prev) =>
+                                  prev.map((x) => {
+                                    if (x.id !== entry.id) return x;
+                                    return {
+                                      ...x,
+                                      segments: [
+                                        ...x.segments.slice(0, segIdx + 1),
+                                        { tableName: '', fieldName: '', value: '' },
+                                        ...x.segments.slice(segIdx + 1),
+                                      ],
+                                    };
+                                  })
+                                )
+                              }
+                              className="col-span-6 sm:col-span-6 lg:col-span-1 text-[11px] px-2 py-2 rounded-lg bg-indigo-50 border border-indigo-200 text-indigo-800 hover:bg-indigo-100"
+                              title="为当前标准维度追加一段物理字段（拼接）"
+                            >
+                              + 组合
+                            </button>
+                            <button
+                              type="button"
+                              disabled={busy || entry.segments.length <= 1}
+                              onClick={() =>
+                                setGoldenSamples((prev) =>
+                                  prev.map((x) => {
+                                    if (x.id !== entry.id) return x;
+                                    if (x.segments.length <= 1) return x;
+                                    return { ...x, segments: x.segments.filter((_, i) => i !== segIdx) };
+                                  })
+                                )
+                              }
+                              className="col-span-6 sm:col-span-6 lg:col-span-1 text-[11px] px-2 py-2 rounded-lg bg-white border border-slate-200 text-slate-600 hover:bg-slate-50 disabled:opacity-40"
+                              title="移除此段"
+                            >
+                              删段
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ))
                 )}
               </div>
             </div>
@@ -1050,19 +1351,20 @@ export default function SchemaMapping() {
           </div>
         </div>
 
-        {/* Step 4: 检查与应用 */}
-        <div className="grid grid-cols-12 gap-2 w-full flex-1 min-h-0">
-          <div className="col-span-12 lg:col-span-3 min-h-0 flex flex-col bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+        {/* Step 4: 检查与应用（整页随内容增高，由 Layout 主栏滚动） */}
+        <div className="grid grid-cols-12 gap-2 w-full">
+          <div className="col-span-12 lg:col-span-3 flex flex-col bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
             <div className="px-3 py-2 bg-slate-900 text-white">
               <div className="text-sm font-semibold">Step 4 · 结果维度</div>
               <div className="text-[11px] text-slate-300">直连/Join 路径回填后在此呈现</div>
             </div>
-            <div className="flex-1 min-h-0 overflow-y-auto p-2 space-y-2">
+            <div className="p-2 space-y-2">
               {mappingPreview.map((m) => {
                 const isActive = m.standardKey === activeFieldKey;
                 const token = String(m.physicalColumn || '');
-                const has = Boolean(token);
+                const has = mappingEntryIsPublishable(m);
                 const isJoin = token.startsWith('CHAIN|');
+                const isConcat = m.operator === 'CONCAT' || token.startsWith('CONCAT|');
                 return (
                   <button
                     key={m.standardKey}
@@ -1071,7 +1373,7 @@ export default function SchemaMapping() {
                     className={cn(
                       "w-full text-left rounded-xl border px-3 py-2 transition-all",
                       isActive ? "border-indigo-500 ring-2 ring-indigo-100" : "border-slate-200 hover:bg-slate-50",
-                      !has ? "bg-slate-50" : isJoin ? "bg-amber-50/40" : "bg-emerald-50/40"
+                      !has ? "bg-slate-50" : isConcat ? "bg-violet-50/50" : isJoin ? "bg-amber-50/40" : "bg-emerald-50/40"
                     )}
                   >
                     <div className="flex items-center justify-between gap-2">
@@ -1083,6 +1385,8 @@ export default function SchemaMapping() {
                     <div className="mt-1 text-[11px]">
                       {!has ? (
                         <span className="text-slate-400">未回填</span>
+                      ) : isConcat ? (
+                        <span className="text-violet-900 font-medium">拼接 CONCAT</span>
                       ) : isJoin ? (
                         <span className="text-amber-800 font-medium">Join 路径</span>
                       ) : (
@@ -1091,7 +1395,11 @@ export default function SchemaMapping() {
                     </div>
                     {has && (
                       <div className="mt-1 text-[10px] font-mono text-slate-600 break-all">
-                        {isJoin ? chainPreviewForStandardKey(m.standardKey) : token}
+                        {isConcat
+                          ? (m.parts || []).map((p) => p.sourceField || p.physicalColumn).join(' + ')
+                          : isJoin
+                            ? chainPreviewForStandardKey(m.standardKey)
+                            : token}
                       </div>
                     )}
                   </button>
@@ -1100,7 +1408,7 @@ export default function SchemaMapping() {
             </div>
           </div>
 
-          <div className="col-span-12 lg:col-span-9 min-h-0 flex flex-col bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+          <div className="col-span-12 lg:col-span-9 flex flex-col bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
             <div className="px-3 py-2 border-b border-slate-200 bg-slate-50/50 flex flex-wrap items-center justify-between gap-2">
               <div className="min-w-0">
                 <div className="text-sm font-semibold text-slate-900">预览校验与纠偏</div>
@@ -1110,7 +1418,21 @@ export default function SchemaMapping() {
                   预览来源：<span className="font-mono">{resolvedMeta?.latestDir || latestDir || '-'}</span>
                 </div>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setConcatPickNext((v) => !v)}
+                  disabled={busy}
+                  className={cn(
+                    'px-3 py-1.5 text-[11px] font-semibold rounded-lg border disabled:opacity-50',
+                    concatPickNext
+                      ? 'bg-amber-100 border-amber-300 text-amber-950'
+                      : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
+                  )}
+                  title="开启后，下一次在下方点击物理列将追加为当前维度的拼接段（CONCAT），而非覆盖"
+                >
+                  {concatPickNext ? '拼接选列：开' : '拼接选列：关'}
+                </button>
                 <button
                   type="button"
                   onClick={() => void handleAuthAndSync()}
@@ -1137,7 +1459,7 @@ export default function SchemaMapping() {
               </div>
             )}
 
-            <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-3">
+            <div className="p-3 space-y-3">
               {/* 1) 当前维度的链路/直连信息 */}
               <div className="border border-slate-200 rounded-xl overflow-hidden">
                 <div className="px-3 py-2 bg-slate-900 text-white text-xs font-semibold flex items-center justify-between">
@@ -1147,7 +1469,9 @@ export default function SchemaMapping() {
                 <div className="p-3 bg-white space-y-2">
                   <div className="text-[11px] text-slate-600">
                     类型：{' '}
-                    {activeToken.startsWith('CHAIN|') ? (
+                    {activeMapping?.operator === 'CONCAT' || activeToken.startsWith('CONCAT|') ? (
+                      <span className="font-semibold text-violet-900">多段拼接 CONCAT</span>
+                    ) : activeToken.startsWith('CHAIN|') ? (
                       <span className="font-semibold text-amber-800">Join 路径</span>
                     ) : activeToken ? (
                       <span className="font-semibold text-emerald-800">直连</span>
@@ -1155,7 +1479,15 @@ export default function SchemaMapping() {
                       <span className="font-semibold text-slate-500">未回填</span>
                     )}
                   </div>
-                  {activeToken.startsWith('CHAIN|') ? (
+                  {activeMapping?.operator === 'CONCAT' && activeMapping.parts?.length ? (
+                    <div className="text-[12px] font-mono text-slate-900 space-y-1">
+                      {activeMapping.parts.map((p, i) => (
+                        <div key={`${p.sourceField}_${i}`}>
+                          {i + 1}. {p.joinPath?.length ? `CHAIN(${p.joinPath.join(' → ')})` : `${p.sourceField}@${p.sourceTable}`}
+                        </div>
+                      ))}
+                    </div>
+                  ) : activeToken.startsWith('CHAIN|') ? (
                     <div className="text-[12px] text-slate-800">{chainPreviewForStandardKey(activeFieldKey)}</div>
                   ) : activeToken ? (
                     <div className="text-[12px] font-mono text-slate-900">{activeToken}</div>

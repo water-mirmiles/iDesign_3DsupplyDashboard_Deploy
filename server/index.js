@@ -76,6 +76,31 @@ function setAIStatus(patch) {
   };
 }
 
+/** Step2 黄金样本：支持按标准维度 + 多段拼接（兼容旧版单行 table/field/value） */
+function normalizeGoldenSamplesForAi(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const x of raw) {
+    if (x && Array.isArray(x.segments) && x.segments.length) {
+      const standardKey = typeof x.standardKey === 'string' ? x.standardKey.trim() : '';
+      const segments = x.segments
+        .map((s) => ({
+          tableName: typeof s?.tableName === 'string' ? s.tableName.trim() : '',
+          fieldName: typeof s?.fieldName === 'string' ? s.fieldName.trim() : '',
+          value: typeof s?.value === 'string' ? String(s.value) : String(s?.value ?? ''),
+        }))
+        .filter((s) => s.tableName && s.fieldName);
+      if (segments.length) out.push({ standardKey, segments });
+      continue;
+    }
+    const tableName = typeof x?.tableName === 'string' ? x.tableName.trim() : '';
+    const fieldName = typeof x?.fieldName === 'string' ? x.fieldName.trim() : '';
+    const value = typeof x?.value === 'string' ? String(x.value) : String(x?.value ?? '');
+    if (tableName && fieldName) out.push({ standardKey: '', segments: [{ tableName, fieldName, value }] });
+  }
+  return out;
+}
+
 function isModelNotFoundError(e) {
   const status = getHttpStatusFromGeminiError(e);
   if (status === 404) return true;
@@ -750,8 +775,13 @@ app.post('/api/parse-ddl-schema', async (req, res) => {
   const sqlText = String(req.body?.sqlText || '');
   if (!sqlText.trim()) return res.status(400).json({ ok: false, error: 'sqlText is required' });
   try {
+    // 快速预处理：先用正则切出 CREATE TABLE 片段，再本地解析字段（不依赖 AI）
     const ddls = splitCreateTableStatements(sqlText);
-    if (!ddls.length) return res.json({ ok: true, tables: [] });
+    if (!ddls.length) {
+      // eslint-disable-next-line no-console
+      console.warn('[Parser] 警告：未匹配到 CREATE TABLE 语句（可能 SQL 格式不规范）');
+      return res.json({ ok: true, tableMap: {}, tables: [] });
+    }
     const tables = ddls
       .map((ddl, idx) => {
         const parsed = parseSingleTableLocal(ddl);
@@ -759,7 +789,28 @@ app.post('/api/parse-ddl-schema', async (req, res) => {
         return parsed;
       })
       .filter((t) => t?.tableName);
-    return res.json({ ok: true, tables });
+    if (tables.length < ddls.length) {
+      // eslint-disable-next-line no-console
+      console.warn('[Parser] 警告：部分表结构不规范（表名未解析或语句异常）', { total: ddls.length, parsed: tables.length });
+    }
+    const tableMap = {};
+    for (const t of tables) {
+      const tn = String(t?.tableName || '').trim();
+      if (!tn) continue;
+      tableMap[tn] = Array.isArray(t?.columns)
+        ? t.columns
+            .map((c) => ({
+              name: typeof c?.name === 'string' ? c.name.trim() : '',
+              comment: typeof c?.comment === 'string' ? c.comment.trim() : '',
+            }))
+            .filter((c) => c.name)
+        : [];
+      if (tableMap[tn].length === 0) {
+        // eslint-disable-next-line no-console
+        console.warn('[Parser] 警告：表字段为空或不规范', { table: tn });
+      }
+    }
+    return res.json({ ok: true, tableMap, tables });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e instanceof Error ? e.message : 'parse failed' });
   }
@@ -927,15 +978,7 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
   const sqlText = String(req.body?.sqlText || '');
   const reference = req.body?.reference || null;
   const masterTable = typeof req.body?.masterTable === 'string' ? String(req.body.masterTable).trim() : '';
-  const goldenSamples = Array.isArray(req.body?.goldenSamples)
-    ? req.body.goldenSamples
-        .map((x) => ({
-          tableName: typeof x?.tableName === 'string' ? String(x.tableName).trim() : '',
-          fieldName: typeof x?.fieldName === 'string' ? String(x.fieldName).trim() : '',
-          value: typeof x?.value === 'string' ? String(x.value) : '',
-        }))
-        .filter((x) => x.tableName && x.fieldName)
-    : [];
+  const goldenSamples = normalizeGoldenSamplesForAi(req.body?.goldenSamples);
   const sampleRow =
     req.body?.sampleRow && typeof req.body.sampleRow === 'object' && !Array.isArray(req.body.sampleRow)
       ? req.body.sampleRow
@@ -1045,6 +1088,7 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
     // 4) 第二阶段：侦探式 join 链路推理（解决“AI 发现报告为空”）
     let smartSuggestions = [];
     let joinPathSuggestions = [];
+    let concatMappingSuggestions = [];
     try {
       setAIStatus({ status: 'running', model: modelList[0] || '', message: '开始推理 Join 链路与智能建议...' });
       const schemaCompact = parsedTables.map((t) => ({
@@ -1065,11 +1109,21 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
           goldenSamples.length
             ? [
                 '',
-                '用户提供了“动态黄金样本（Dynamic Golden Sample）”—— 每条样本是 (table.field = value)。',
-                '你的任务之一：推断【主表】如何通过 Join 到达这些样本字段，并保证该字段在正确链路下能得到该 value（用于你推理外键/关联字段）。',
+                '用户提供了“动态黄金样本”：每条绑定一个 standardKey（标准维度），内含一个或多个 (table.field = value) 分段。',
+                '【复合维度 / 拼接 CONCAT】若同一条样本含多个分段，通常表示该标准维度的真实取值 = 各分段 value 按顺序直接连接（默认无分隔符），例如 "LT"+"04" -> "LT04"。',
+                '若合成值（如 LT04）在任意单表的单一列中都不存在完全相等的单元格，请主动尝试：是否存在两列或多行（经 Join 可达）使得其值拼接后等于该合成值。',
+                '【parent_id 父子编码】若某分段值所在行的 parent_id 指向另一行的 id，而另一分段值出现在父行（或祖先行）的 category_code 等字段上，这是典型的“父子层级编码拼接”。请识别该关系并输出可达的 Join 路径（可含自关联/多跳）。',
+                '你的任务：推断【主表】如何通过 Join 到达每一个分段；对需要拼接的标准维度，在 concatMappingSuggestions 中输出多个 parts（每段可有独立 joinPath）。',
                 '样本清单：',
-                ...goldenSamples.slice(0, 50).map((s) => `- ${s.tableName}.${s.fieldName} = ${JSON.stringify(String(s.value ?? ''))}`),
-                goldenSamples.length > 50 ? `- ... 省略 ${goldenSamples.length - 50} 条` : '',
+                ...goldenSamples.slice(0, 40).map((g) => {
+                  const sk = g.standardKey || '(legacy 未标注)';
+                  const joined = g.segments.map((s) => String(s.value ?? '')).join('');
+                  const detail = g.segments
+                    .map((s) => `${s.tableName}.${s.fieldName}=${JSON.stringify(String(s.value ?? ''))}`)
+                    .join(' + ');
+                  return `- [${sk}] 合成≈ ${JSON.stringify(joined)} ｜ 分段：${detail}`;
+                }),
+                goldenSamples.length > 40 ? `- ... 省略 ${goldenSamples.length - 40} 条样本组` : '',
               ].filter(Boolean).join('\n')
             : '',
           '已知存在“黄金样本 (Golden Record)”用于验证最终链路是否正确。',
@@ -1086,8 +1140,15 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
           '  ],',
           '  "joinPathSuggestions": [',
           '    { "targetStandardKey": "lastCode|soleCode|colorCode|materialCode", "path": ["table.field", "table.id", "table.code"] }',
+          '  ],',
+          '  "concatMappingSuggestions": [',
+          '    { "standardKey": "materialCode", "parts": [',
+          '      { "sourceTable": "与DDL一致的逻辑表名", "sourceField": "列名", "joinPath": ["master.col","lookup.parent_id","lookup.category_code"] }',
+          '    ] }',
           '  ]',
           '}',
+          '',
+          'concatMappingSuggestions 规则：仅当某 standardKey 需要多字段拼接时才输出；parts 至少 2 项；每项 sourceTable/sourceField 必填；需要跨表或自关联时用 joinPath（格式同 joinPathSuggestions.path，偶数段为 lookup.key / lookup.value 交替）。',
           '',
           '侦探式推理步骤（必须按这个思路找链路并给出 path）：',
           '1) 哪张表能找到款号（通常是 product_info 的 style_wms 或类似字段）？',
@@ -1117,6 +1178,7 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
       const schemaBatches = total > 20 ? chunkArray(schemaCompact, 5) : [schemaCompact];
       const smartByKey = new Map();
       const joinByKey = new Map();
+      const concatByKey = new Map();
 
       for (let bi = 0; bi < schemaBatches.length; bi++) {
         setAIStatus({
@@ -1145,10 +1207,26 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
           if (!targetStandardKey || pathArr.length < 2) continue;
           if (!joinByKey.has(targetStandardKey)) joinByKey.set(targetStandardKey, { targetStandardKey, path: pathArr });
         }
+
+        const cc = Array.isArray(obj2?.concatMappingSuggestions) ? obj2.concatMappingSuggestions : [];
+        for (const c of cc) {
+          const standardKey = typeof c?.standardKey === 'string' ? c.standardKey.trim() : '';
+          const partsRaw = Array.isArray(c?.parts) ? c.parts : [];
+          const parts = partsRaw
+            .map((p) => ({
+              sourceField: typeof p?.sourceField === 'string' ? p.sourceField.trim() : '',
+              sourceTable: typeof p?.sourceTable === 'string' ? p.sourceTable.trim() : '',
+              joinPath: Array.isArray(p?.joinPath) ? p.joinPath.map((x) => String(x).trim()).filter(Boolean) : undefined,
+            }))
+            .filter((p) => p.sourceField && p.sourceTable);
+          if (!standardKey || parts.length < 2) continue;
+          if (!concatByKey.has(standardKey)) concatByKey.set(standardKey, { standardKey, parts });
+        }
       }
 
       smartSuggestions = Array.from(smartByKey.values());
       joinPathSuggestions = Array.from(joinByKey.values());
+      concatMappingSuggestions = Array.from(concatByKey.values());
     } catch (e2) {
       // eslint-disable-next-line no-console
       console.warn('[ai-parse-multi-sql] join inference failed, return empty suggestions', e2?.message);
@@ -1156,7 +1234,11 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
 
     // 若 AI 推理为空，则本地启发式兜底（至少给出基础链路，避免“发现报告空”）
     const heuristic = heuristicInferSuggestions({ tables: parsedTables });
-    if ((!smartSuggestions || smartSuggestions.length === 0) && (!joinPathSuggestions || joinPathSuggestions.length === 0)) {
+    if (
+      (!smartSuggestions || smartSuggestions.length === 0) &&
+      (!joinPathSuggestions || joinPathSuggestions.length === 0) &&
+      (!concatMappingSuggestions || concatMappingSuggestions.length === 0)
+    ) {
       smartSuggestions = heuristic.smartSuggestions || [];
       joinPathSuggestions = heuristic.joinPathSuggestions || [];
     }
@@ -1167,6 +1249,7 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
       tables: parsedTables,
       smartSuggestions,
       joinPathSuggestions,
+      concatMappingSuggestions,
       _debug: { parsedCount: parsedNames.length, totalCount: total, heuristic },
     });
   } catch (e) {
@@ -1251,12 +1334,27 @@ app.post('/api/save-schema-draft', async (req, res) => {
     const goldenSamplesRaw = body.goldenSamples;
     const goldenSamples = Array.isArray(goldenSamplesRaw)
       ? goldenSamplesRaw
-          .map((x) => ({
-            tableName: typeof x?.tableName === 'string' ? x.tableName : '',
-            fieldName: typeof x?.fieldName === 'string' ? x.fieldName : '',
-            value: typeof x?.value === 'string' ? x.value : '',
-          }))
-          .filter((x) => x.tableName || x.fieldName || x.value)
+          .map((x) => {
+            if (x && Array.isArray(x.segments) && x.segments.length) {
+              return {
+                standardKey: typeof x.standardKey === 'string' ? x.standardKey : '',
+                segments: x.segments.map((s) => ({
+                  tableName: typeof s?.tableName === 'string' ? s.tableName : '',
+                  fieldName: typeof s?.fieldName === 'string' ? s.fieldName : '',
+                  value: typeof s?.value === 'string' ? s.value : '',
+                })),
+              };
+            }
+            return {
+              tableName: typeof x?.tableName === 'string' ? x.tableName : '',
+              fieldName: typeof x?.fieldName === 'string' ? x.fieldName : '',
+              value: typeof x?.value === 'string' ? x.value : '',
+            };
+          })
+          .filter((x) => {
+            if (x.segments) return x.segments.some((s) => s.tableName || s.fieldName || s.value);
+            return x.tableName || x.fieldName || x.value;
+          })
       : [];
 
     const out = {

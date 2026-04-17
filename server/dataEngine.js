@@ -43,16 +43,77 @@ function pickMappingArray(mappingConfig) {
   return null;
 }
 
+function parseConcatPipeToken(physicalColumn) {
+  const raw = String(physicalColumn || '');
+  if (!raw.startsWith('CONCAT|')) return null;
+  const rest = raw.slice('CONCAT|'.length);
+  const parts = rest.split('||').map((s) => s.trim()).filter(Boolean);
+  return parts.length >= 2 ? parts : null;
+}
+
+function partDescriptorFromToken(token) {
+  const t = normalize(token);
+  if (!t) return null;
+  if (t.startsWith('CHAIN|')) {
+    const joinPath = t.slice('CHAIN|'.length).split('->').map((x) => normalize(x)).filter(Boolean);
+    const head = joinPath[0] || '';
+    const dot = head.indexOf('.');
+    const tbl = dot > 0 ? head.slice(0, dot) : '';
+    const fld = dot > 0 ? head.slice(dot + 1) : head;
+    return { physicalColumn: t, sourceField: fld, sourceTable: tbl, joinPath };
+  }
+  if (t.includes('@')) {
+    const at = t.lastIndexOf('@');
+    const col = t.slice(0, at);
+    const file = t.slice(at + 1);
+    return { physicalColumn: col, sourceField: col, sourceTable: file, joinPath: null };
+  }
+  return { physicalColumn: t, sourceField: t, sourceTable: '', joinPath: null };
+}
+
+function normalizeMappingPart(p) {
+  if (!p || typeof p !== 'object') return null;
+  const joinPath = Array.isArray(p.joinPath) ? p.joinPath.map((x) => normalize(x)).filter(Boolean) : null;
+  let physicalColumn = normalize(p.physicalColumn);
+  const sourceField = normalize(p.sourceField);
+  const sourceTable = normalize(p.sourceTable);
+  if (joinPath && joinPath.length >= 2) {
+    physicalColumn = `CHAIN|${joinPath.join('->')}`;
+  }
+  if (!physicalColumn && sourceField) physicalColumn = sourceField;
+  if (!physicalColumn) return null;
+  return { physicalColumn, sourceField: sourceField || physicalColumn, sourceTable, joinPath };
+}
+
 export function buildStandardMap(mappingArr) {
-  // Each entry: { standardKey, physicalColumn, sourceTable, joinPath?: string[] }
   const out = new Map();
   for (const it of mappingArr || []) {
     const standardKey = normalize(it?.standardKey);
+    if (!standardKey) continue;
+
+    const op = normalizeLower(it?.operator);
+    if (op === 'concat' && Array.isArray(it?.parts) && it.parts.length >= 2) {
+      const parts = it.parts.map(normalizeMappingPart).filter(Boolean);
+      if (parts.length >= 2) {
+        out.set(standardKey, { mode: 'concat', parts });
+        continue;
+      }
+    }
+
     let physicalColumn = normalize(it?.physicalColumn);
+    const pipeParts = parseConcatPipeToken(physicalColumn);
+    if (pipeParts) {
+      const parts = pipeParts.map((tok) => partDescriptorFromToken(tok)).filter(Boolean);
+      if (parts.length >= 2) {
+        out.set(standardKey, { mode: 'concat', parts });
+        continue;
+      }
+    }
+
     const joinPath = Array.isArray(it?.joinPath) ? it.joinPath.map((p) => normalize(p)).filter(Boolean) : null;
     if (joinPath && joinPath.length >= 2) {
       physicalColumn = `CHAIN|${joinPath.join('->')}`;
-    } else if (physicalColumn.startsWith('CHAIN|')) {
+    } else if (physicalColumn && physicalColumn.startsWith('CHAIN|')) {
       // keep CHAIN token from saved config
     }
     const sourceField = normalize(it?.sourceField);
@@ -60,10 +121,39 @@ export function buildStandardMap(mappingArr) {
       physicalColumn = sourceField;
     }
     const sourceTable = normalize(it?.sourceTable);
-    if (!standardKey || !physicalColumn) continue;
-    out.set(standardKey, { physicalColumn, sourceTable });
+    if (!physicalColumn) continue;
+    out.set(standardKey, { mode: 'simple', physicalColumn, sourceTable, sourceField: sourceField || physicalColumn, joinPath });
   }
   return out;
+}
+
+function resolvePartValue(part, mainRow, mainTableName, tablesMap) {
+  if (!part) return '';
+  const token = normalize(part.physicalColumn);
+  const chain = parseChainToken(token);
+  if (chain) return resolveChainValue({ mainRow, mainTableName, chainNodes: chain, tablesMap });
+  const col = normalize(part.sourceField) || token;
+  return normalize(mainRow?.[col]);
+}
+
+function resolveStandardMappedValue(entry, mainRow, mainTableName, tablesMap, fallbackCol) {
+  if (!entry) {
+    return fallbackCol ? normalize(mainRow?.[fallbackCol]) : '';
+  }
+  if (entry.mode === 'concat' && Array.isArray(entry.parts)) {
+    return entry.parts.map((p) => resolvePartValue(p, mainRow, mainTableName, tablesMap)).join('');
+  }
+  return resolvePartValue(entry, mainRow, mainTableName, tablesMap);
+}
+
+/** 主表行上用于 guess / 直连读取的列名（CHAIN 取首段字段） */
+function columnNameForMainRow(entry) {
+  if (!entry || entry.mode === 'concat') return '';
+  const pc = entry.physicalColumn || '';
+  const chain = parseChainToken(pc);
+  if (chain && chain.length) return normalize(chain[0].field);
+  if (pc.startsWith('CHAIN|')) return '';
+  return normalize(entry.sourceField) || normalize(entry.physicalColumn);
 }
 
 function readSheetRows(fullPath) {
@@ -211,13 +301,14 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap }) {
   });
   const tablesMap = buildTablesMap(xlsxTables);
 
-  const styleCol = standardMap.get('styleCode')?.physicalColumn;
-  const brandCol = standardMap.get('brand')?.physicalColumn;
-  const statusCol = (standardMap.get('status')?.physicalColumn) || (standardMap.get('data_status')?.physicalColumn);
-  const lastCol = standardMap.get('lastCode')?.physicalColumn;
-  const soleCol = standardMap.get('soleCode')?.physicalColumn;
-  const colorCol = standardMap.get('colorCode')?.physicalColumn;
-  const materialCol = standardMap.get('materialCode')?.physicalColumn;
+  const styleCol = columnNameForMainRow(standardMap.get('styleCode'));
+  const brandCol = columnNameForMainRow(standardMap.get('brand'));
+  const statusCol =
+    columnNameForMainRow(standardMap.get('status')) || columnNameForMainRow(standardMap.get('data_status'));
+  const lastCol = columnNameForMainRow(standardMap.get('lastCode'));
+  const soleCol = columnNameForMainRow(standardMap.get('soleCode'));
+  const colorCol = columnNameForMainRow(standardMap.get('colorCode'));
+  const materialCol = columnNameForMainRow(standardMap.get('materialCode'));
 
   const required = [styleCol, brandCol, statusCol].filter(Boolean);
   const main = required.length ? guessStyleMainTable(xlsxTables, required) : null;
@@ -241,6 +332,7 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap }) {
   const lastsSet = await loadAssetsBaseNames(path.join(storageRoot, 'assets', 'lasts'));
   const solesSet = await loadAssetsBaseNames(path.join(storageRoot, 'assets', 'soles'));
 
+  const mainTableName = buildTableNameIndex(main.fileName);
   const inventory = [];
   for (let i = 0; i < main.rows.length; i++) {
     const row = main.rows[i] || {};
@@ -248,32 +340,16 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap }) {
     const isActive = isTruthyActiveStatus(statusVal);
     if (!isActive) continue;
 
-    // Dimensions can be direct mapping or chain mapping token stored in mapping_config
-    const lastToken = standardMap.get('lastCode')?.physicalColumn || '';
-    const soleToken = standardMap.get('soleCode')?.physicalColumn || '';
-    const colorToken = standardMap.get('colorCode')?.physicalColumn || '';
-    const materialToken = standardMap.get('materialCode')?.physicalColumn || '';
-
-    let lastCodeVal = '';
-    let soleCodeVal = '';
-    let colorCodeVal = '';
-    let materialCodeVal = '';
-
-    const lastChain = parseChainToken(lastToken);
-    if (lastChain) lastCodeVal = resolveChainValue({ mainRow: row, mainTableName: buildTableNameIndex(main.fileName), chainNodes: lastChain, tablesMap });
-    else lastCodeVal = lastCol ? normalize(row?.[lastCol]) : (lastToken && !lastToken.startsWith('CHAIN|') ? normalize(row?.[lastToken]) : '');
-
-    const soleChain = parseChainToken(soleToken);
-    if (soleChain) soleCodeVal = resolveChainValue({ mainRow: row, mainTableName: buildTableNameIndex(main.fileName), chainNodes: soleChain, tablesMap });
-    else soleCodeVal = soleCol ? normalize(row?.[soleCol]) : (soleToken && !soleToken.startsWith('CHAIN|') ? normalize(row?.[soleToken]) : '');
-
-    const colorChain = parseChainToken(colorToken);
-    if (colorChain) colorCodeVal = resolveChainValue({ mainRow: row, mainTableName: buildTableNameIndex(main.fileName), chainNodes: colorChain, tablesMap });
-    else colorCodeVal = colorCol ? normalize(row?.[colorCol]) : (colorToken && !colorToken.startsWith('CHAIN|') ? normalize(row?.[colorToken]) : '');
-
-    const materialChain = parseChainToken(materialToken);
-    if (materialChain) materialCodeVal = resolveChainValue({ mainRow: row, mainTableName: buildTableNameIndex(main.fileName), chainNodes: materialChain, tablesMap });
-    else materialCodeVal = materialCol ? normalize(row?.[materialCol]) : (materialToken && !materialToken.startsWith('CHAIN|') ? normalize(row?.[materialToken]) : '');
+    const lastCodeVal = resolveStandardMappedValue(standardMap.get('lastCode'), row, mainTableName, tablesMap, lastCol);
+    const soleCodeVal = resolveStandardMappedValue(standardMap.get('soleCode'), row, mainTableName, tablesMap, soleCol);
+    const colorCodeVal = resolveStandardMappedValue(standardMap.get('colorCode'), row, mainTableName, tablesMap, colorCol);
+    const materialCodeVal = resolveStandardMappedValue(
+      standardMap.get('materialCode'),
+      row,
+      mainTableName,
+      tablesMap,
+      materialCol
+    );
 
     const has3DLast = lastCodeVal ? lastsSet.has(stripExt(lastCodeVal)) || lastsSet.has(lastCodeVal) : false;
     const has3DSole = soleCodeVal ? solesSet.has(stripExt(soleCodeVal)) || solesSet.has(soleCodeVal) : false;
@@ -334,13 +410,14 @@ export async function resolveFirstActiveRowFromFolder({ folderPath, standardMap 
   });
   const tablesMap = buildTablesMap(xlsxTables);
 
-  const styleCol = standardMap.get('styleCode')?.physicalColumn;
-  const brandCol = standardMap.get('brand')?.physicalColumn;
-  const statusCol = (standardMap.get('status')?.physicalColumn) || (standardMap.get('data_status')?.physicalColumn);
-  const lastCol = standardMap.get('lastCode')?.physicalColumn;
-  const soleCol = standardMap.get('soleCode')?.physicalColumn;
-  const colorCol = standardMap.get('colorCode')?.physicalColumn;
-  const materialCol = standardMap.get('materialCode')?.physicalColumn;
+  const styleCol = columnNameForMainRow(standardMap.get('styleCode'));
+  const brandCol = columnNameForMainRow(standardMap.get('brand'));
+  const statusCol =
+    columnNameForMainRow(standardMap.get('status')) || columnNameForMainRow(standardMap.get('data_status'));
+  const lastCol = columnNameForMainRow(standardMap.get('lastCode'));
+  const soleCol = columnNameForMainRow(standardMap.get('soleCode'));
+  const colorCol = columnNameForMainRow(standardMap.get('colorCode'));
+  const materialCol = columnNameForMainRow(standardMap.get('materialCode'));
 
   const required = [styleCol, brandCol, statusCol].filter(Boolean);
   const main = required.length ? guessStyleMainTable(xlsxTables, required) : null;
@@ -348,32 +425,18 @@ export async function resolveFirstActiveRowFromFolder({ folderPath, standardMap 
     return { ok: false, error: '无法识别主表（需映射款号/品牌/状态且沙盒表头匹配）', row: null, mainTable: null };
   }
 
+  const mainTableName = buildTableNameIndex(main.fileName);
   const tryRow = (row) => {
-    const lastToken = standardMap.get('lastCode')?.physicalColumn || '';
-    const soleToken = standardMap.get('soleCode')?.physicalColumn || '';
-    const colorToken = standardMap.get('colorCode')?.physicalColumn || '';
-    const materialToken = standardMap.get('materialCode')?.physicalColumn || '';
-
-    let lastCodeVal = '';
-    let soleCodeVal = '';
-    let colorCodeVal = '';
-    let materialCodeVal = '';
-
-    const lastChain = parseChainToken(lastToken);
-    if (lastChain) lastCodeVal = resolveChainValue({ mainRow: row, mainTableName: buildTableNameIndex(main.fileName), chainNodes: lastChain, tablesMap });
-    else lastCodeVal = lastCol ? normalize(row?.[lastCol]) : (lastToken && !lastToken.startsWith('CHAIN|') ? normalize(row?.[lastToken]) : '');
-
-    const soleChain = parseChainToken(soleToken);
-    if (soleChain) soleCodeVal = resolveChainValue({ mainRow: row, mainTableName: buildTableNameIndex(main.fileName), chainNodes: soleChain, tablesMap });
-    else soleCodeVal = soleCol ? normalize(row?.[soleCol]) : (soleToken && !soleToken.startsWith('CHAIN|') ? normalize(row?.[soleToken]) : '');
-
-    const colorChain = parseChainToken(colorToken);
-    if (colorChain) colorCodeVal = resolveChainValue({ mainRow: row, mainTableName: buildTableNameIndex(main.fileName), chainNodes: colorChain, tablesMap });
-    else colorCodeVal = colorCol ? normalize(row?.[colorCol]) : (colorToken && !colorToken.startsWith('CHAIN|') ? normalize(row?.[colorToken]) : '');
-
-    const materialChain = parseChainToken(materialToken);
-    if (materialChain) materialCodeVal = resolveChainValue({ mainRow: row, mainTableName: buildTableNameIndex(main.fileName), chainNodes: materialChain, tablesMap });
-    else materialCodeVal = materialCol ? normalize(row?.[materialCol]) : (materialToken && !materialToken.startsWith('CHAIN|') ? normalize(row?.[materialToken]) : '');
+    const lastCodeVal = resolveStandardMappedValue(standardMap.get('lastCode'), row, mainTableName, tablesMap, lastCol);
+    const soleCodeVal = resolveStandardMappedValue(standardMap.get('soleCode'), row, mainTableName, tablesMap, soleCol);
+    const colorCodeVal = resolveStandardMappedValue(standardMap.get('colorCode'), row, mainTableName, tablesMap, colorCol);
+    const materialCodeVal = resolveStandardMappedValue(
+      standardMap.get('materialCode'),
+      row,
+      mainTableName,
+      tablesMap,
+      materialCol
+    );
 
     return {
       style_wms: styleCol ? normalize(row?.[styleCol]) : '',
