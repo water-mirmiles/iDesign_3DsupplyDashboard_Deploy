@@ -1048,7 +1048,7 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
   const sqlText = String(req.body?.sqlText || '');
   const reference = req.body?.reference || null;
   const masterTable = typeof req.body?.masterTable === 'string' ? String(req.body.masterTable).trim() : '';
-  const goldenByDimRaw = req.body?.goldenByDimension;
+  const goldenByDimRaw = req.body?.dimensionSamples ?? req.body?.goldenByDimension;
   let goldenBlocks = null;
   let goldenSamples = [];
   if (goldenByDimRaw && typeof goldenByDimRaw === 'object' && !Array.isArray(goldenByDimRaw)) {
@@ -1481,13 +1481,38 @@ app.get('/api/load-schema-draft', async (_req, res) => {
   }
 });
 
+/** Step2 持久化：dimensionSamples / goldenByDimension 同源结构 */
+function normalizeDimensionSamplesPayload(raw) {
+  const out = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const [key, grp] of Object.entries(raw)) {
+    const standardKey = String(key || '').trim();
+    if (!standardKey) continue;
+    const targetGoal = typeof grp?.targetGoal === 'string' ? String(grp.targetGoal) : '';
+    const rowsRaw = Array.isArray(grp?.rows) ? grp.rows : [];
+    const rows = rowsRaw.map((r) => {
+      const notes = typeof r?.notes === 'string' ? String(r.notes) : '';
+      const id = typeof r?.id === 'string' && r.id.trim() ? r.id.trim() : '';
+      const segments = Array.isArray(r?.segments)
+        ? r.segments.map((s) => ({
+            tableName: typeof s?.tableName === 'string' ? s.tableName : '',
+            fieldName: typeof s?.fieldName === 'string' ? s.fieldName : '',
+            value: typeof s?.value === 'string' ? s.value : String(s?.value ?? ''),
+          }))
+        : [];
+      return { id, notes, segments };
+    });
+    out[standardKey] = { targetGoal, rows };
+  }
+  return out;
+}
+
 app.post('/api/save-schema-draft', async (req, res) => {
   try {
-    const draftDir = path.dirname(SCHEMA_DRAFT_PATH);
-    if (!fs.existsSync(draftDir)) {
-      fs.mkdirSync(draftDir, { recursive: true });
-    }
     await ensureStorageDirs();
+    const draftDir = path.dirname(SCHEMA_DRAFT_PATH);
+    fse.ensureDirSync(draftDir);
+
     let prevDraft = null;
     try {
       if (await fse.pathExists(SCHEMA_DRAFT_PATH)) {
@@ -1528,39 +1553,24 @@ app.post('/api/save-schema-draft', async (req, res) => {
           })
       : [];
 
-    const gbdRaw = body.goldenByDimension;
-    let goldenByDimensionOut = {};
-    if (gbdRaw && typeof gbdRaw === 'object' && !Array.isArray(gbdRaw)) {
-      for (const [key, grp] of Object.entries(gbdRaw)) {
-        const standardKey = String(key || '').trim();
-        if (!standardKey) continue;
-        const targetGoal = typeof grp?.targetGoal === 'string' ? String(grp.targetGoal) : '';
-        const rowsRaw = Array.isArray(grp?.rows) ? grp.rows : [];
-        const rows = rowsRaw.map((r) => {
-          const notes = typeof r?.notes === 'string' ? String(r.notes) : '';
-          const id = typeof r?.id === 'string' && r.id.trim() ? r.id.trim() : '';
-          const segments = Array.isArray(r?.segments)
-            ? r.segments.map((s) => ({
-                tableName: typeof s?.tableName === 'string' ? s.tableName : '',
-                fieldName: typeof s?.fieldName === 'string' ? s.fieldName : '',
-                value: typeof s?.value === 'string' ? s.value : '',
-              }))
-            : [];
-          return { id, notes, segments };
-        });
-        goldenByDimensionOut[standardKey] = { targetGoal, rows };
-      }
+    const dimRaw = body.dimensionSamples ?? body.goldenByDimension;
+    let dimensionSamplesOut = {};
+    if (dimRaw && typeof dimRaw === 'object' && !Array.isArray(dimRaw)) {
+      dimensionSamplesOut = normalizeDimensionSamplesPayload(dimRaw);
+    } else if (prevDraft?.dimensionSamples && typeof prevDraft.dimensionSamples === 'object') {
+      dimensionSamplesOut = normalizeDimensionSamplesPayload(prevDraft.dimensionSamples);
     } else if (prevDraft?.goldenByDimension && typeof prevDraft.goldenByDimension === 'object') {
-      goldenByDimensionOut = prevDraft.goldenByDimension;
+      dimensionSamplesOut = normalizeDimensionSamplesPayload(prevDraft.goldenByDimension);
     }
 
     const out = {
       savedAt: new Date().toISOString(),
       ddlText,
+      masterTable,
       goldenRecord,
       goldenSamples,
-      goldenByDimension: goldenByDimensionOut,
-      masterTable,
+      dimensionSamples: dimensionSamplesOut,
+      goldenByDimension: dimensionSamplesOut,
     };
 
     if (body.sandboxMergedRow && typeof body.sandboxMergedRow === 'object' && !Array.isArray(body.sandboxMergedRow)) {
@@ -1573,6 +1583,7 @@ app.post('/api/save-schema-draft', async (req, res) => {
       out.standardFields = body.standardFields;
     }
 
+    fse.ensureDirSync(path.dirname(SCHEMA_DRAFT_PATH));
     await fse.writeJson(SCHEMA_DRAFT_PATH, out, { spaces: 2 });
     return res.json({ ok: true });
   } catch (error) {

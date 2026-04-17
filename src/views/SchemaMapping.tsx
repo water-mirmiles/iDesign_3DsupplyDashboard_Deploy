@@ -233,10 +233,11 @@ type GoldenDimensionRow = {
   segments: GoldenSampleSegment[];
 };
 
-type GoldenByDimensionState = Record<string, { targetGoal: string; rows: GoldenDimensionRow[] }>;
+/** Step2 AI 学习区：按标准维度分组的样本（持久化字段名 dimensionSamples） */
+type DimensionSamplesState = Record<string, { targetGoal: string; rows: GoldenDimensionRow[] }>;
 
-function createEmptyGoldenByDimension(): GoldenByDimensionState {
-  const o: GoldenByDimensionState = {};
+function createEmptyDimensionSamples(): DimensionSamplesState {
+  const o: DimensionSamplesState = {};
   for (const f of initialStandardFields) {
     o[f.standardKey] = { targetGoal: '', rows: [] };
   }
@@ -251,8 +252,8 @@ function emptyGoldenDimensionRow(): GoldenDimensionRow {
   return { id: newGoldenRowId(), notes: '', segments: [{ tableName: '', fieldName: '', value: '' }] };
 }
 
-function normalizeDraftGoldenByDimension(raw: unknown): GoldenByDimensionState {
-  const base = createEmptyGoldenByDimension();
+function normalizeDraftDimensionSamples(raw: unknown): DimensionSamplesState {
+  const base = createEmptyDimensionSamples();
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return base;
   const rec = raw as Record<string, unknown>;
   for (const f of initialStandardFields) {
@@ -289,8 +290,8 @@ function normalizeDraftGoldenByDimension(raw: unknown): GoldenByDimensionState {
   return base;
 }
 
-function migrateLegacyGoldenSamplesToByDimension(gs: unknown[]): GoldenByDimensionState {
-  const next = createEmptyGoldenByDimension();
+function migrateLegacyGoldenSamplesToByDimension(gs: unknown[]): DimensionSamplesState {
+  const next = createEmptyDimensionSamples();
   gs.forEach((x: unknown, idx: number) => {
     if (!x || typeof x !== 'object' || Array.isArray(x)) return;
     const o = x as { standardKey?: unknown; segments?: unknown; tableName?: unknown; fieldName?: unknown; value?: unknown; id?: unknown };
@@ -328,7 +329,7 @@ function migrateLegacyGoldenSamplesToByDimension(gs: unknown[]): GoldenByDimensi
   return next;
 }
 
-function flattenGoldenByDimensionForLegacySave(g: GoldenByDimensionState) {
+function flattenDimensionSamplesForLegacySave(g: DimensionSamplesState) {
   const out: { standardKey: string; segments: GoldenSampleSegment[] }[] = [];
   for (const f of initialStandardFields) {
     const block = g[f.standardKey];
@@ -342,13 +343,17 @@ function flattenGoldenByDimensionForLegacySave(g: GoldenByDimensionState) {
   return out;
 }
 
-function serializeGoldenByDimensionForApi(g: GoldenByDimensionState) {
-  const o: Record<string, { targetGoal: string; rows: { notes: string; segments: GoldenSampleSegment[] }[] }> = {};
+function serializeDimensionSamplesForApi(g: DimensionSamplesState) {
+  const o: Record<
+    string,
+    { targetGoal: string; rows: { id: string; notes: string; segments: GoldenSampleSegment[] }[] }
+  > = {};
   for (const f of initialStandardFields) {
     const b = g[f.standardKey] || { targetGoal: '', rows: [] };
     o[f.standardKey] = {
       targetGoal: b.targetGoal,
       rows: b.rows.map((r) => ({
+        id: r.id,
         notes: r.notes,
         segments: r.segments.map((s) => ({
           tableName: s.tableName,
@@ -397,7 +402,11 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
   const [activeAiField, setActiveAiField] = useState<{ tableName: string; fieldName: string } | null>(null);
   const [isAiModeling, setIsAiModeling] = useState(false);
   const [masterTable, setMasterTable] = useState('');
-  const [goldenByDimension, setGoldenByDimension] = useState<GoldenByDimensionState>(() => createEmptyGoldenByDimension());
+  const [dimensionSamples, setDimensionSamples] = useState<DimensionSamplesState>(() => createEmptyDimensionSamples());
+  /** 避免草稿尚未从服务器恢复前用户编辑被后续 setState 覆盖 */
+  const [schemaDraftLoadState, setSchemaDraftLoadState] = useState<'loading' | 'ready'>('loading');
+  const [draftSaveFeedback, setDraftSaveFeedback] = useState(false);
+  const draftSaveFeedbackTimerRef = useRef<number | null>(null);
   const step2DimGroupRef = useRef<Record<string, HTMLDivElement | null>>({});
   const [concatPickNext, setConcatPickNext] = useState(false);
   const [ddlRefOpen, setDdlRefOpen] = useState(false);
@@ -541,11 +550,13 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
 
   const saveSchemaDraft = useCallback(async () => {
     try {
+      const serialized = serializeDimensionSamplesForApi(dimensionSamples);
       const data = {
         ddlText,
         masterTable,
-        goldenByDimension: serializeGoldenByDimensionForApi(goldenByDimension),
-        goldenSamples: flattenGoldenByDimensionForLegacySave(goldenByDimension),
+        dimensionSamples: serialized,
+        goldenByDimension: serialized,
+        goldenSamples: flattenDimensionSamplesForLegacySave(dimensionSamples),
       };
       // eslint-disable-next-line no-console
       console.log('🚀 准备发送草稿:', data);
@@ -578,30 +589,36 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
       console.error('[save-schema-draft] 保存异常', msg, e);
       return { ok: false as const, error: msg };
     }
-  }, [ddlText, goldenByDimension, masterTable]);
+  }, [ddlText, dimensionSamples, masterTable]);
 
   useEffect(() => {
     let alive = true;
     (async () => {
       try {
         const resp = await fetch(`${API_BASE}/api/load-schema-draft`);
-        if (!resp.ok) return;
+        if (!alive) return;
         const json = (await resp.json()) as { ok?: boolean; draft?: Record<string, unknown> };
         if (!alive) return;
         const d = json.draft && typeof json.draft === 'object' && !Array.isArray(json.draft) ? json.draft : {};
         if (typeof d.ddlText === 'string') setDdlText(d.ddlText);
         if (typeof (d as any).masterTable === 'string') setMasterTable((d as any).masterTable);
+
+        const ds = (d as any).dimensionSamples;
         const gbd = (d as any).goldenByDimension;
-        if (gbd != null && typeof gbd === 'object' && !Array.isArray(gbd)) {
-          setGoldenByDimension(normalizeDraftGoldenByDimension(gbd));
+        if (ds != null && typeof ds === 'object' && !Array.isArray(ds)) {
+          setDimensionSamples(normalizeDraftDimensionSamples(ds));
+        } else if (gbd != null && typeof gbd === 'object' && !Array.isArray(gbd)) {
+          setDimensionSamples(normalizeDraftDimensionSamples(gbd));
         } else {
           const gs = (d as any).goldenSamples;
           if (Array.isArray(gs) && gs.length) {
-            setGoldenByDimension(migrateLegacyGoldenSamplesToByDimension(gs));
+            setDimensionSamples(migrateLegacyGoldenSamplesToByDimension(gs));
           }
         }
       } catch {
         // ignore load errors — 草稿可选
+      } finally {
+        if (alive) setSchemaDraftLoadState('ready');
       }
     })();
     return () => {
@@ -612,6 +629,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
   useEffect(() => {
     return () => {
       if (authSyncHintTimerRef.current) window.clearTimeout(authSyncHintTimerRef.current);
+      if (draftSaveFeedbackTimerRef.current) window.clearTimeout(draftSaveFeedbackTimerRef.current);
     };
   }, []);
 
@@ -868,7 +886,8 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
         body: JSON.stringify({
           sqlText: ddlText,
           masterTable: masterTable || undefined,
-          goldenByDimension: serializeGoldenByDimensionForApi(goldenByDimension),
+          dimensionSamples: serializeDimensionSamplesForApi(dimensionSamples),
+          goldenByDimension: serializeDimensionSamplesForApi(dimensionSamples),
         }),
       });
       window.clearTimeout(t);
@@ -1068,6 +1087,8 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
   // 并发保护：仅在“AI 建模 / 发布 / 真实值预览抓取 / 样本 XLSX 解析”期间禁止用户修改配置
   // DDL 的即时解析（isParsingDdl）不应阻塞用户继续编辑
   const busy = isAiModeling || authSyncing || certifyEngineRunning || isUploadingDataTables || resolvingRow;
+  const draftHydrating = schemaDraftLoadState === 'loading';
+  const step12Disabled = busy || draftHydrating;
   const activeMapping = mappingPreview.find((m) => m.standardKey === activeFieldKey);
   const activeToken = String(activeMapping?.physicalColumn || '');
   const resolvedValueForActive = useMemo(() => {
@@ -1100,6 +1121,18 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
       )}
 
       <div className="w-full px-2 lg:px-4 min-h-full flex flex-col gap-4 pb-8">
+        <div className="relative flex flex-col gap-4">
+          {draftHydrating && (
+            <div
+              className="absolute inset-0 z-30 flex items-start justify-center pt-[min(28vh,12rem)] rounded-xl bg-white/75 backdrop-blur-[1px] pointer-events-auto"
+              aria-busy
+              aria-label="加载草稿"
+            >
+              <div className="rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm font-medium text-slate-800 shadow-md">
+                正在从服务器加载草稿，请稍候…
+              </div>
+            </div>
+          )}
         {/* Step 1: 提供原材料（SQL & 样本文件） */}
         <div className="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
           <div className="px-3 py-2 bg-slate-900 text-white flex flex-wrap items-center justify-between gap-2">
@@ -1131,7 +1164,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                     accept=".xlsx,.xls"
                     multiple
                     className="hidden"
-                    disabled={busy}
+                    disabled={step12Disabled}
                     onChange={(e) => void handleDataTablesUpload(e)}
                   />
                   {isUploadingDataTables ? '上传中…' : '上传样本 XLSX'}
@@ -1150,7 +1183,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                         <button
                           key={fileName}
                           type="button"
-                          disabled={busy}
+                          disabled={step12Disabled}
                           onClick={() => {
                             setSelectedFile(fileName);
                             void loadSamples(fileName);
@@ -1208,7 +1241,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                   }}
                   placeholder="粘贴多表 DDL（含 COMMENT 更佳）。粘贴后系统会即时解析表名与字段列表…"
                   className="w-full min-h-[240px] max-h-[360px] p-3 text-xs border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent resize-y font-mono text-slate-700 bg-slate-50/30"
-                  disabled={busy}
+                  disabled={step12Disabled}
                 />
                 {isParsingDdl && <div className="text-[11px] text-slate-500">正在解析 DDL…</div>}
               </div>
@@ -1229,7 +1262,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                 <select
                   value={masterTable}
                   onChange={(e) => setMasterTable(e.target.value)}
-                  disabled={ddlTableNames.length === 0 || busy}
+                  disabled={ddlTableNames.length === 0 || step12Disabled}
                   className="w-full text-[11px] px-2 py-2 rounded-lg bg-white border border-slate-200 text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:bg-slate-50"
                 >
                   <option value="">
@@ -1245,16 +1278,23 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
               <div className="col-span-12 lg:col-span-6 flex flex-wrap gap-2 justify-end">
                 <button
                   type="button"
-                  onClick={() => void saveSchemaDraft()}
-                  disabled={busy}
+                  onClick={async () => {
+                    const r = await saveSchemaDraft();
+                    if (r.ok) {
+                      setDraftSaveFeedback(true);
+                      if (draftSaveFeedbackTimerRef.current) window.clearTimeout(draftSaveFeedbackTimerRef.current);
+                      draftSaveFeedbackTimerRef.current = window.setTimeout(() => setDraftSaveFeedback(false), 2000);
+                    }
+                  }}
+                  disabled={step12Disabled}
                   className="px-3 py-2 text-[11px] font-semibold rounded-lg bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-50"
                   title="写入 server/storage/schema_draft.json"
                 >
-                  保存当前配置草稿
+                  {draftSaveFeedback ? '✅ 已存至服务器' : '保存当前配置草稿'}
                 </button>
                 <button
                   type="button"
-                  disabled={busy}
+                  disabled={step12Disabled}
                   onClick={() => {
                     setError(null);
                     setHasAttemptedAuth(false);
@@ -1263,7 +1303,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                     setDdlText('');
                     setParsedTables([]);
                     setMasterTable('');
-                    setGoldenByDimension(createEmptyGoldenByDimension());
+                    setDimensionSamples(createEmptyDimensionSamples());
                     setConcatPickNext(false);
                     setStandardFields(initialStandardFields);
                     setAiUnfilledAfterRun({});
@@ -1296,7 +1336,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                 ) : (
                   <div className="space-y-4">
                     {initialStandardFields.map((dim) => {
-                      const block = goldenByDimension[dim.standardKey] || { targetGoal: '', rows: [] };
+                      const block = dimensionSamples[dim.standardKey] || { targetGoal: '', rows: [] };
                       const dimActive = activeFieldKey === dim.standardKey;
                       return (
                         <div
@@ -1321,10 +1361,10 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                               <div className="text-[10px] font-medium text-slate-600 mb-1">该维度最终期望值 (Target Value)</div>
                               <input
                                 value={block.targetGoal}
-                                disabled={busy}
+                                disabled={step12Disabled}
                                 onChange={(e) => {
                                   const v = e.target.value;
-                                  setGoldenByDimension((prev) => {
+                                  setDimensionSamples((prev) => {
                                     const b = prev[dim.standardKey] || { targetGoal: '', rows: [] };
                                     return { ...prev, [dim.standardKey]: { ...b, targetGoal: v } };
                                   });
@@ -1335,9 +1375,9 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                             </div>
                             <button
                               type="button"
-                              disabled={Object.keys(parsedTableMap || {}).length === 0 || busy}
+                              disabled={Object.keys(parsedTableMap || {}).length === 0 || step12Disabled}
                               onClick={() =>
-                                setGoldenByDimension((prev) => {
+                                setDimensionSamples((prev) => {
                                   const b = prev[dim.standardKey] || { targetGoal: '', rows: [] };
                                   return {
                                     ...prev,
@@ -1367,9 +1407,9 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                                   </span>
                                   <button
                                     type="button"
-                                    disabled={busy}
+                                    disabled={step12Disabled}
                                     onClick={() =>
-                                      setGoldenByDimension((prev) => {
+                                      setDimensionSamples((prev) => {
                                         const b = prev[dim.standardKey] || { targetGoal: '', rows: [] };
                                         return {
                                           ...prev,
@@ -1394,10 +1434,10 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                                         <div key={`${row.id}_seg_${segIdx}`} className="grid grid-cols-12 gap-2 items-center">
                                           <select
                                             value={seg.tableName}
-                                            disabled={busy}
+                                            disabled={step12Disabled}
                                             onChange={(e) => {
                                               const nextTable = e.target.value;
-                                              setGoldenByDimension((prev) => {
+                                              setDimensionSamples((prev) => {
                                                 const b = prev[dim.standardKey] || { targetGoal: '', rows: [] };
                                                 return {
                                                   ...prev,
@@ -1425,10 +1465,10 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                                           </select>
                                           <select
                                             value={seg.fieldName}
-                                            disabled={!seg.tableName || busy}
+                                            disabled={!seg.tableName || step12Disabled}
                                             onChange={(e) => {
                                               const nextField = e.target.value;
-                                              setGoldenByDimension((prev) => {
+                                              setDimensionSamples((prev) => {
                                                 const b = prev[dim.standardKey] || { targetGoal: '', rows: [] };
                                                 return {
                                                   ...prev,
@@ -1473,10 +1513,10 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                                           </select>
                                           <input
                                             value={seg.value}
-                                            disabled={busy}
+                                            disabled={step12Disabled}
                                             onChange={(e) => {
                                               const v = e.target.value;
-                                              setGoldenByDimension((prev) => {
+                                              setDimensionSamples((prev) => {
                                                 const b = prev[dim.standardKey] || { targetGoal: '', rows: [] };
                                                 return {
                                                   ...prev,
@@ -1498,9 +1538,9 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                                           />
                                           <button
                                             type="button"
-                                            disabled={busy}
+                                            disabled={step12Disabled}
                                             onClick={() =>
-                                              setGoldenByDimension((prev) => {
+                                              setDimensionSamples((prev) => {
                                                 const b = prev[dim.standardKey] || { targetGoal: '', rows: [] };
                                                 return {
                                                   ...prev,
@@ -1528,9 +1568,9 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                                           </button>
                                           <button
                                             type="button"
-                                            disabled={busy || row.segments.length <= 1}
+                                            disabled={step12Disabled || row.segments.length <= 1}
                                             onClick={() =>
-                                              setGoldenByDimension((prev) => {
+                                              setDimensionSamples((prev) => {
                                                 const b = prev[dim.standardKey] || { targetGoal: '', rows: [] };
                                                 return {
                                                   ...prev,
@@ -1558,10 +1598,10 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                                     <div className="text-[10px] font-medium text-slate-600 mb-1">逻辑备注/线索</div>
                                     <textarea
                                       value={row.notes}
-                                      disabled={busy}
+                                      disabled={step12Disabled}
                                       onChange={(e) => {
                                         const v = e.target.value;
-                                        setGoldenByDimension((prev) => {
+                                        setDimensionSamples((prev) => {
                                           const b = prev[dim.standardKey] || { targetGoal: '', rows: [] };
                                           return {
                                             ...prev,
@@ -1589,6 +1629,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
               </div>
             </div>
           </div>
+        </div>
         </div>
 
         {/* Step 3: AI 逻辑建模 */}
