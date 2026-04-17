@@ -119,6 +119,14 @@ function normalizeGoldenSamplesForAi(raw) {
   return out;
 }
 
+/** joinPath 最后一节的字段名（小写），用于拒绝楦/底以 .id 结尾的错误路径 */
+function joinPathLastFieldLower(pathArr) {
+  const last = pathArr && pathArr.length ? pathArr[pathArr.length - 1] : '';
+  const s = String(last);
+  const dot = s.lastIndexOf('.');
+  return dot > 0 ? s.slice(dot + 1).trim().toLowerCase() : '';
+}
+
 function isModelNotFoundError(e) {
   const status = getHttpStatusFromGeminiError(e);
   if (status === 404) return true;
@@ -1119,19 +1127,43 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
         return out;
       };
 
+      const allDdlTableNames = parsedTables.map((t) => String(t.tableName || '').trim()).filter(Boolean);
+      const goldenKeyCounts = new Map();
+      for (const g of goldenSamples) {
+        const k = String(g.standardKey || '').trim();
+        if (!k) continue;
+        goldenKeyCounts.set(k, (goldenKeyCounts.get(k) || 0) + 1);
+      }
+      const goldenKeysWithMultiRows = [...goldenKeyCounts.entries()].filter(([, n]) => n > 1).map(([k]) => k);
+
       const buildDetectivePrompt = ({ schemaPart, partIndex, partTotal }) => {
         return [
           `你现在是一个数据专家/数据侦探。请解析以下提供的所有 SQL DDL 表结构信息。用户共提供了 ${total} 张表。`,
           partTotal > 1 ? `为性能考虑，本次是第 ${partIndex + 1}/${partTotal} 批（每批最多 5 张表）。请在本批次内尽可能推断 Join 关系与映射。` : '',
           masterTable ? `用户已手动指定 ${masterTable} 为业务主表（Master Table）。请以该表为起点寻找到其它表的 Join Path。` : '',
+          '',
+          '【硬性约束 — 必须遵守，否则视为错误输出】',
+          '1) 终点必须匹配「值」：joinPathSuggestions.path 与 concatMappingSuggestions.parts[].joinPath 的最后一个节点，其字段必须语义上存放与用户黄金样本相同形态的取值（例如样本为 L-B26097M 时，终点必须是 LastTable.code、LastTable.last_code、*.number 等业务编码列）。严禁以路径终点落在 *.id / *_id 作为主结果（除非用户样本本身明确是 ID 字符串）。楦号/底号/可打印编码类维度：最后一跳必须是 code、number、name、category_code、asset_code、last_code、sole_code 等「值列」之一，且该列在 COMMENT/列名上应对应资产编号。',
+          '2) 路径完整性：从主表到目标值列的每一跳关联都必须写入 path（不得跳步）。例如 Master 上外键列 -> 维表主键/唯一键 -> 维表业务编码列，应完整输出三步：["master_table.fk_col","dim_table.id","dim_table.code"]（表名用 DDL 原名）。',
+          '3) 表名严格对齐：smartSuggestions.sourceTable、path 与 joinPath 中出现的所有 table 名称必须与「DDL 表名清单」中的字符串 100% 一致（大小写、下划线、前缀如 ods_ 均不得改写或缩写）。若不确定表名，只能从清单中择一，禁止臆造缩写表名。',
+          '',
+          '【DDL 表名清单（唯一合法表名来源）】',
+          allDdlTableNames.join(', '),
+          '',
           goldenSamples.length
             ? [
                 '',
                 '用户提供了“动态黄金样本”：每条绑定一个 standardKey（标准维度），内含一个或多个 (table.field = value) 分段。',
-                '【复合维度 / 拼接 CONCAT】若同一条样本含多个分段，通常表示该标准维度的真实取值 = 各分段 value 按顺序直接连接（默认无分隔符），例如 "LT"+"04" -> "LT04"。',
-                '若合成值（如 LT04）在任意单表的单一列中都不存在完全相等的单元格，请主动尝试：是否存在两列或多行（经 Join 可达）使得其值拼接后等于该合成值。',
-                '【parent_id 父子编码】若某分段值所在行的 parent_id 指向另一行的 id，而另一分段值出现在父行（或祖先行）的 category_code 等字段上，这是典型的“父子层级编码拼接”。请识别该关系并输出可达的 Join 路径（可含自关联/多跳）。',
-                '你的任务：推断【主表】如何通过 Join 到达每一个分段；对需要拼接的标准维度，在 concatMappingSuggestions 中输出多个 parts（每段可有独立 joinPath）。',
+                '【复合维度 / 拼接 CONCAT — 同组多分段】若同一条样本组含多个 segments，真实取值 = 各分段 value 按顺序直接连接（无分隔符），例如 "LT"+"04" -> "LT04"。请为每个分段分别推导 Join Path，在 concatMappingSuggestions 中输出 operator: "CONCAT" 与 parts[]，每一段对应 parts 中一项且含独立 joinPath（若该段在主表上直连则可仅用 sourceTable+sourceField）。',
+                goldenKeysWithMultiRows.length
+                  ? [
+                      '',
+                      `【复合维度 — Step2 多行样本组】以下 standardKey 在用户界面中出现了多组黄金样本（每组可含一个或多个分段），表示 CONCAT 的多段来源：${goldenKeysWithMultiRows.join('、')}。`,
+                      '你必须：① 为每一「样本组」分别寻找从主表可达、且终点为「值列」的 Join Path；② 在 concatMappingSuggestions 中为该 standardKey 返回 operator: "CONCAT"，parts 数组长度等于该维度的样本组数量，顺序与下方清单中该 standardKey 各组出现顺序一致；③ 最终业务上 path1 末端取值 + path2 末端取值 + … = 用户期望的合成编码（如 LT+04）。',
+                    ].join('\n')
+                  : '',
+                '若合成值在单表单列中不存在，请用多段路径 + CONCAT 解释。',
+                '【parent_id 父子编码】若分段值所在行 parent_id 指向另一行 id，另一分段在父行 category_code 等字段，请输出完整多跳路径（可自关联）。',
                 '样本清单：',
                 ...goldenSamples.slice(0, 40).map((g) => {
                   const sk = g.standardKey || '(legacy 未标注)';
@@ -1160,13 +1192,14 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
           '    { "targetStandardKey": "lastCode|soleCode|colorCode|materialCode", "path": ["table.field", "table.id", "table.code"] }',
           '  ],',
           '  "concatMappingSuggestions": [',
-          '    { "standardKey": "materialCode", "parts": [',
-          '      { "sourceTable": "与DDL一致的逻辑表名", "sourceField": "列名", "joinPath": ["master.col","lookup.parent_id","lookup.category_code"] }',
+          '    { "standardKey": "materialCode", "operator": "CONCAT", "parts": [',
+          '      { "sourceTable": "DDL完整表名", "sourceField": "终点值列名", "joinPath": ["master.fk","dim.id","dim.code"] },',
+          '      { "sourceTable": "DDL完整表名", "sourceField": "category_code", "joinPath": ["master.ref","self.parent_id","self.category_code"] }',
           '    ] }',
           '  ]',
           '}',
           '',
-          'concatMappingSuggestions 规则：仅当某 standardKey 需要多字段拼接时才输出；parts 至少 2 项；每项 sourceTable/sourceField 必填；需要跨表或自关联时用 joinPath（格式同 joinPathSuggestions.path，偶数段为 lookup.key / lookup.value 交替）。',
+          'concatMappingSuggestions：需要拼接时 operator 恒为 "CONCAT"；parts≥2；每 part 的 joinPath 最后一节必须是值列（见硬性约束）；sourceTable 必须来自 DDL 表名清单；若全路径已由 joinPath 表达，sourceField 填路径终点字段名。',
           '',
           '侦探式推理步骤（必须按这个思路找链路并给出 path）：',
           '1) 哪张表能找到款号（通常是 product_info 的 style_wms 或类似字段）？',
@@ -1223,6 +1256,12 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
           const targetStandardKey = typeof j?.targetStandardKey === 'string' ? j.targetStandardKey.trim() : '';
           const pathArr = Array.isArray(j?.path) ? j.path.map((p) => String(p).trim()).filter(Boolean) : [];
           if (!targetStandardKey || pathArr.length < 2) continue;
+          if (
+            (targetStandardKey === 'lastCode' || targetStandardKey === 'soleCode') &&
+            joinPathLastFieldLower(pathArr) === 'id'
+          ) {
+            continue;
+          }
           if (!joinByKey.has(targetStandardKey)) joinByKey.set(targetStandardKey, { targetStandardKey, path: pathArr });
         }
 
@@ -1236,7 +1275,19 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
               sourceTable: typeof p?.sourceTable === 'string' ? p.sourceTable.trim() : '',
               joinPath: Array.isArray(p?.joinPath) ? p.joinPath.map((x) => String(x).trim()).filter(Boolean) : undefined,
             }))
-            .filter((p) => p.sourceField && p.sourceTable);
+            .filter((p) => {
+              if (!p.sourceField || !p.sourceTable) return false;
+              const jpArr = p.joinPath;
+              if (
+                Array.isArray(jpArr) &&
+                jpArr.length >= 2 &&
+                (standardKey === 'lastCode' || standardKey === 'soleCode') &&
+                joinPathLastFieldLower(jpArr) === 'id'
+              ) {
+                return false;
+              }
+              return true;
+            });
           if (!standardKey || parts.length < 2) continue;
           if (!concatByKey.has(standardKey)) concatByKey.set(standardKey, { standardKey, parts });
         }

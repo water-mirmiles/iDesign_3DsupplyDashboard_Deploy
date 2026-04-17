@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { flushSync } from 'react-dom';
 import {
   AlertCircle,
   CheckCircle2,
@@ -163,7 +164,43 @@ type AiTable = { tableName: string; columns: Array<{ name: string; comment?: str
 type AiSuggestion = { standardKey: string; sourceField: string; sourceTable: string };
 type AiJoinPath = { targetStandardKey: string; path: string[] };
 type AiConcatPart = { sourceField: string; sourceTable: string; joinPath?: string[] };
-type AiConcatSuggestion = { standardKey: string; parts: AiConcatPart[] };
+type AiConcatSuggestion = { standardKey: string; parts: AiConcatPart[]; operator?: string };
+
+/** 将 AI 返回的直连 / Join / CONCAT 合并进标准字段（纯函数，便于 flushSync 后立即预览） */
+function mergeAiSuggestionsIntoStandardFields(
+  prev: GlobalSchemaField[],
+  sug: AiSuggestion[],
+  jp: AiJoinPath[],
+  concatSuggestions: AiConcatSuggestion[]
+): GlobalSchemaField[] {
+  const next = prev.map((f) => ({ ...f, mappedSources: [...(f.mappedSources || [])] }));
+  for (const s of sug) {
+    const target = next.find((f) => f.standardKey === s.standardKey);
+    if (!target) continue;
+    target.mappedSources = [`${s.sourceField}@${s.sourceTable}`];
+  }
+  for (const j of jp) {
+    const target = next.find((f) => f.standardKey === j.targetStandardKey);
+    if (!target) continue;
+    target.mappedSources = [`CHAIN|${j.path.join('->')}`];
+  }
+  for (const c of concatSuggestions) {
+    const target = next.find((f) => f.standardKey === c.standardKey);
+    if (!target || !Array.isArray(c.parts) || c.parts.length < 2) continue;
+    const tokens = c.parts
+      .map((p) => {
+        const jpArr = Array.isArray(p.joinPath) ? p.joinPath.map((x) => String(x).trim()).filter(Boolean) : [];
+        if (jpArr.length >= 2) return `CHAIN|${jpArr.join('->')}`;
+        const sf = String(p.sourceField || '').trim();
+        const st = String(p.sourceTable || '').trim();
+        if (sf && st) return `${sf}@${st}`;
+        return '';
+      })
+      .filter(Boolean);
+    if (tokens.length >= 2) target.mappedSources = tokens;
+  }
+  return next;
+}
 
 function normalize(s: string) {
   return (s || '').trim().toLowerCase();
@@ -707,40 +744,6 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
     };
   }, [mappingPreview]);
 
-  /** 将 AI 返回的直连字段 + Join 链路 + 复合拼接映射一次性写入标准字段（concat 最后覆盖同 key） */
-  const applyAiResultsToFields = (sug: AiSuggestion[], jp: AiJoinPath[], concatSuggestions: AiConcatSuggestion[] = []) => {
-    setStandardFields((prev) => {
-      const next = prev.map((f) => ({ ...f, mappedSources: [...(f.mappedSources || [])] }));
-      for (const s of sug) {
-        const target = next.find((f) => f.standardKey === s.standardKey);
-        if (!target) continue;
-        target.mappedSources = [`${s.sourceField}@${s.sourceTable}`];
-      }
-      for (const j of jp) {
-        const target = next.find((f) => f.standardKey === j.targetStandardKey);
-        if (!target) continue;
-        target.mappedSources = [`CHAIN|${j.path.join('->')}`];
-      }
-      for (const c of concatSuggestions) {
-        const target = next.find((f) => f.standardKey === c.standardKey);
-        if (!target || !Array.isArray(c.parts) || c.parts.length < 2) continue;
-        const tokens = c.parts
-          .map((p) => {
-            const jpArr = Array.isArray(p.joinPath) ? p.joinPath.map((x) => String(x).trim()).filter(Boolean) : [];
-            if (jpArr.length >= 2) return `CHAIN|${jpArr.join('->')}`;
-            const sf = String(p.sourceField || '').trim();
-            const st = String(p.sourceTable || '').trim();
-            if (sf && st) return `${sf}@${st}`;
-            return '';
-          })
-          .filter(Boolean);
-        if (tokens.length >= 2) target.mappedSources = tokens;
-      }
-      return next;
-    });
-    setIsSuccess(true);
-  };
-
   const handleAiLogicModeling = async (): Promise<{ ok: true } | { ok: false; error: string }> => {
     setError(null);
     setAiBusy503(false);
@@ -808,7 +811,20 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
       }
       setDdlParsed(flattened);
       setAiQueueHint(false);
-      applyAiResultsToFields(sug, jp, concatSug);
+
+      let mergedFields: GlobalSchemaField[] = [];
+      flushSync(() => {
+        setStandardFields((prev) => {
+          mergedFields = mergeAiSuggestionsIntoStandardFields(prev, sug, jp, concatSug);
+          return mergedFields;
+        });
+      });
+      setIsSuccess(true);
+
+      const mappingAfterAi = buildCertifiedMapping(mergedFields);
+      const firstHit = mappingAfterAi.find((m) => mappingEntryIsPublishable(m));
+      if (firstHit) setActiveFieldKey(firstHit.standardKey);
+
       return { ok: true };
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'AI 多表解析失败';
