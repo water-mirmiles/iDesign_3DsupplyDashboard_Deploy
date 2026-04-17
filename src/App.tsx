@@ -36,7 +36,14 @@ export default function App() {
       case 'data-center':
         return <DataCenter />;
       case 'schema-mapping':
-        return <SchemaMapping />;
+        return (
+          <SchemaMapping
+            onAfterCertify={() => {
+              setCurrentView('dashboard');
+              localStorage.setItem('currentView', 'dashboard');
+            }}
+          />
+        );
       default:
         return <Dashboard />;
     }

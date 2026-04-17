@@ -9,6 +9,8 @@ import { AssetTrendStats } from '@/types';
 
 type DashboardStatsResponse = {
   ok: boolean;
+  source?: 'final_dashboard_data' | 'live';
+  generatedAt?: string;
   dates: { latest: string; prev: string };
   mapping: { hasConfig: boolean; configPath: string };
   meta: { mainTable: string | null; requiredCols?: string[]; reason?: string };
@@ -18,6 +20,10 @@ type DashboardStatsResponse = {
     matched3DSoles: number;
     lastCoverage: number;
     soleCoverage: number;
+    /** 生效款中至少命中楦或底之一 */
+    stylesWithAny3D?: number;
+    /** (生效款且 has3D) / 生效款总数 · 百分比 */
+    any3DCoveragePercent?: number;
     deltaActiveStyles: number;
     deltaMatched3DLasts: number;
     deltaMatched3DSoles: number;
@@ -103,6 +109,11 @@ export default function Dashboard() {
       <div>
         <h1 className="text-2xl font-semibold text-slate-900">概览看板</h1>
         <p className="text-sm text-slate-500 mt-1">全局 3D 资产覆盖率与新增趋势</p>
+        {stats?.source === 'final_dashboard_data' && stats.generatedAt && (
+          <p className="text-xs text-emerald-700 mt-1">
+            数据来自认证快照 · {new Date(stats.generatedAt).toLocaleString('zh-CN')}
+          </p>
+        )}
       </div>
 
       {!isLoading && stats && (!stats.mapping?.hasConfig || !stats.meta?.mainTable) && (
@@ -196,7 +207,7 @@ export default function Dashboard() {
         {/* Card 5: Overall Coverage */}
         <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm flex flex-col justify-between">
           <div className="flex justify-between items-start">
-            <h3 className="text-sm font-medium text-slate-500">整体覆盖率</h3>
+            <h3 className="text-sm font-medium text-slate-500">整体 3D 覆盖</h3>
             <div className="p-2 rounded-lg bg-emerald-50">
               <Activity className="w-4 h-4 text-emerald-600" />
             </div>
@@ -204,14 +215,35 @@ export default function Dashboard() {
           <div className="mt-4">
             <div className="flex items-end gap-2">
               <span className="text-3xl font-bold text-slate-900">
-                {Math.round((((stats?.kpis?.lastCoverage ?? 0) + (stats?.kpis?.soleCoverage ?? 0)) / 2))}%
+                {stats?.kpis?.any3DCoveragePercent != null
+                  ? stats.kpis.any3DCoveragePercent
+                  : Math.round((((stats?.kpis?.lastCoverage ?? 0) + (stats?.kpis?.soleCoverage ?? 0)) / 2))}
+                %
               </span>
               {getTrendBadge(0, true)}
             </div>
+            <div className="mt-1 text-xs text-slate-500">
+              {stats?.kpis?.stylesWithAny3D != null
+                ? `生效款中任一 3D 命中：${stats.kpis.stylesWithAny3D} / ${stats?.kpis?.activeStyles ?? 0}`
+                : '楦/底覆盖率均值（无快照细分时）'}
+            </div>
             <div className="mt-2 h-1.5 w-full bg-slate-100 rounded-full overflow-hidden">
-              <div 
-                className={cn("h-full rounded-full transition-all duration-1000", getProgressColor(Math.round((((stats?.kpis?.lastCoverage ?? 0) + (stats?.kpis?.soleCoverage ?? 0)) / 2))))} 
-                style={{ width: `${Math.round((((stats?.kpis?.lastCoverage ?? 0) + (stats?.kpis?.soleCoverage ?? 0)) / 2))}%` }}
+              <div
+                className={cn(
+                  'h-full rounded-full transition-all duration-1000',
+                  getProgressColor(
+                    stats?.kpis?.any3DCoveragePercent != null
+                      ? stats.kpis.any3DCoveragePercent
+                      : Math.round((((stats?.kpis?.lastCoverage ?? 0) + (stats?.kpis?.soleCoverage ?? 0)) / 2))
+                  )
+                )}
+                style={{
+                  width: `${
+                    stats?.kpis?.any3DCoveragePercent != null
+                      ? stats.kpis.any3DCoveragePercent
+                      : Math.round((((stats?.kpis?.lastCoverage ?? 0) + (stats?.kpis?.soleCoverage ?? 0)) / 2))
+                  }%`,
+                }}
               />
             </div>
           </div>

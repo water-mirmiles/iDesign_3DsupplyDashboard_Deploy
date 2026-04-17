@@ -1,5 +1,14 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AlertCircle, CheckCircle2, ChevronDown, ChevronUp, Database, Link as LinkIcon, Sparkles } from 'lucide-react';
+import {
+  AlertCircle,
+  CheckCircle2,
+  ChevronDown,
+  ChevronUp,
+  Database,
+  Link as LinkIcon,
+  Loader2,
+  Sparkles,
+} from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { GlobalSchemaField } from '@/types';
 
@@ -196,7 +205,12 @@ type DdlSchemaResponse = {
 
 type Column = { name: string; comment?: string };
 
-export default function SchemaMapping() {
+export type SchemaMappingProps = {
+  /** 认证并引擎同步成功后跳转看板 */
+  onAfterCertify?: () => void;
+};
+
+export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {}) {
   const [standardFields, setStandardFields] = useState<GlobalSchemaField[]>(initialStandardFields);
   const [activeFieldKey, setActiveFieldKey] = useState<string>(initialStandardFields[0].standardKey);
 
@@ -242,6 +256,7 @@ export default function SchemaMapping() {
   const [isUploadingDataTables, setIsUploadingDataTables] = useState(false);
 
   const [authSyncing, setAuthSyncing] = useState(false);
+  const [certifyEngineRunning, setCertifyEngineRunning] = useState(false);
   const [authSyncHint, setAuthSyncHint] = useState<string>('');
   const authSyncHintTimerRef = useRef<number | null>(null);
 
@@ -873,7 +888,7 @@ export default function SchemaMapping() {
   // NOTE: 旧版“沙盒 7 维校验/沙盒上传”已从主流程移除（改为 data_tables 文件列表 + 真实数据预览 + 手工纠偏）
 
   const handleAuthAndSync = async () => {
-    if (authSyncing) return;
+    if (authSyncing || certifyEngineRunning) return;
     setHasAttemptedAuth(true);
     setError(null);
     setAuthSyncHint('');
@@ -889,19 +904,29 @@ export default function SchemaMapping() {
       const draft = await saveSchemaDraft();
       if (draft.ok === false) throw new Error(draft.error);
 
-      setAuthSyncHint('逻辑已认证！看板数据已根据最新映射完成重算。');
+      setCertifyEngineRunning(true);
+      setAuthSyncHint('');
+      const syncResp = await fetch('/api/certify-and-sync', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+      const syncJson = (await syncResp.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+      if (!syncResp.ok || !syncJson.ok) {
+        throw new Error(syncJson.error || `引擎同步失败（HTTP ${syncResp.status}）`);
+      }
+
+      setAuthSyncHint('逻辑已认证！全量数据已写入看板快照。');
       if (authSyncHintTimerRef.current) window.clearTimeout(authSyncHintTimerRef.current);
       authSyncHintTimerRef.current = window.setTimeout(() => setAuthSyncHint(''), 6000);
+      onAfterCertify?.();
     } catch (e) {
       setError(e instanceof Error ? e.message : '一键认证失败');
     } finally {
+      setCertifyEngineRunning(false);
       setAuthSyncing(false);
     }
   };
 
   // 并发保护：仅在“AI 建模 / 发布 / 真实值预览抓取 / 样本 XLSX 解析”期间禁止用户修改配置
   // DDL 的即时解析（isParsingDdl）不应阻塞用户继续编辑
-  const busy = isAiModeling || authSyncing || isUploadingDataTables || resolvingRow;
+  const busy = isAiModeling || authSyncing || certifyEngineRunning || isUploadingDataTables || resolvingRow;
   const activeMapping = mappingPreview.find((m) => m.standardKey === activeFieldKey);
   const activeToken = String(activeMapping?.physicalColumn || '');
   const resolvedValueForActive = useMemo(() => {
@@ -912,7 +937,18 @@ export default function SchemaMapping() {
 
   return (
     <>
-      {busy && (
+      {certifyEngineRunning && (
+        <div className="fixed inset-0 z-[100] flex flex-col items-center justify-center gap-6 bg-slate-950/90 px-6 text-center">
+          <Loader2 className="h-10 w-10 text-indigo-400 animate-spin shrink-0" aria-hidden />
+          <p className="text-sm font-medium text-white max-w-md leading-relaxed">
+            正在执行全量数据透视与 3D 资产对齐，请稍候…
+          </p>
+          <div className="w-full max-w-md h-2 rounded-full bg-slate-800 overflow-hidden">
+            <div className="h-full w-full bg-gradient-to-r from-indigo-600 via-sky-400 to-indigo-600 opacity-90 animate-pulse" />
+          </div>
+        </div>
+      )}
+      {busy && !certifyEngineRunning && (
         <div className="fixed inset-0 z-40 bg-black/20 backdrop-blur-[1px]">
           <div className="absolute inset-x-0 top-0">
             <div className="mx-auto w-full px-3 py-2 text-[11px] text-white bg-slate-900/90 border-b border-white/10">

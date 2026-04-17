@@ -322,6 +322,8 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap }) {
         matchedSoles: 0,
         lastCoverage: 0,
         soleCoverage: 0,
+        stylesWithAny3D: 0,
+        any3DCoveragePercent: 0,
       },
       brandCoverage: [],
       inventory: [],
@@ -378,8 +380,10 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap }) {
   const activeStyles = inventory.length;
   const matchedLasts = inventory.filter((x) => x.__has3DLast).length;
   const matchedSoles = inventory.filter((x) => x.__has3DSole).length;
+  const stylesWithAny3D = inventory.filter((x) => x.__has3DAny).length;
   const lastCoverage = activeStyles > 0 ? Math.round((matchedLasts / activeStyles) * 100) : 0;
   const soleCoverage = activeStyles > 0 ? Math.round((matchedSoles / activeStyles) * 100) : 0;
+  const any3DCoveragePercent = activeStyles > 0 ? Math.round((stylesWithAny3D / activeStyles) * 100) : 0;
 
   const brandCoverage = computeBrandCoverage(inventory, 'brand', '__has3DAny');
 
@@ -388,11 +392,65 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap }) {
 
   return {
     dateDirName,
-    kpis: { activeStyles, matchedLasts, matchedSoles, lastCoverage, soleCoverage },
+    kpis: {
+      activeStyles,
+      matchedLasts,
+      matchedSoles,
+      lastCoverage,
+      soleCoverage,
+      stylesWithAny3D,
+      any3DCoveragePercent,
+    },
     brandCoverage,
     inventory: inventoryOut,
     meta: { mainTable: main.fileName, requiredCols: required },
   };
+}
+
+/**
+ * 全量聚合：读取 mapping_config、最新快照目录下全部 XLSX（多表 Join/CHAIN/CONCAT）、对齐 3D 资产文件名。
+ * 供「认证并应用到看板」触发；结果由调用方写入 final_dashboard_data.json。
+ */
+export async function processAllData({ storageRoot }) {
+  // eslint-disable-next-line no-console
+  console.log('[Engine] 正在合成款号数据...');
+  const t0 = Date.now();
+  const agg = await aggregateProjectData({ storageRoot });
+  const latest = agg.latest;
+  const kpis = latest.kpis;
+
+  const payload = {
+    generatedAt: new Date().toISOString(),
+    dates: agg.dates,
+    mapping: agg.mapping,
+    meta: latest.meta,
+    kpis: {
+      activeStyles: kpis.activeStyles,
+      matched3DLasts: kpis.matchedLasts,
+      matched3DSoles: kpis.matchedSoles,
+      lastCoverage: kpis.lastCoverage,
+      soleCoverage: kpis.soleCoverage,
+      stylesWithAny3D: kpis.stylesWithAny3D,
+      any3DCoveragePercent: kpis.any3DCoveragePercent,
+      deltaActiveStyles: agg.deltas.activeStyles.delta,
+      deltaMatched3DLasts: agg.deltas.matchedLasts.delta,
+      deltaMatched3DSoles: agg.deltas.matchedSoles.delta,
+    },
+    brandCoverage: latest.brandCoverage,
+    inventory: latest.inventory,
+  };
+
+  // eslint-disable-next-line no-console
+  console.log(
+    `[Engine] 合成完成，耗时 ${Date.now() - t0}ms；生效款 ${kpis.activeStyles}，任一3D命中 ${kpis.stylesWithAny3D}（${kpis.any3DCoveragePercent}%）`
+  );
+  return payload;
+}
+
+export async function persistFinalDashboardData(storageRoot, payload) {
+  const outPath = path.join(storageRoot, 'final_dashboard_data.json');
+  await fse.writeJson(outPath, payload, { spaces: 2 });
+  return outPath;
 }
 
 /**

@@ -8,7 +8,13 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import XLSX from 'xlsx';
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import { aggregateProjectData, buildStandardMap, resolveFirstActiveRowFromFolder } from './dataEngine.js';
+import {
+  aggregateProjectData,
+  buildStandardMap,
+  persistFinalDashboardData,
+  processAllData,
+  resolveFirstActiveRowFromFolder,
+} from './dataEngine.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -55,6 +61,18 @@ const DIRS = {
   sandbox: path.join(STORAGE_ROOT, 'sandbox'),
 };
 const MAPPING_CONFIG_PATH = path.join(STORAGE_ROOT, 'mapping_config.json');
+const FINAL_DASHBOARD_PATH = path.join(STORAGE_ROOT, 'final_dashboard_data.json');
+
+async function readFinalDashboardSnapshot() {
+  try {
+    if (!(await fse.pathExists(FINAL_DASHBOARD_PATH))) return null;
+    const data = await fse.readJson(FINAL_DASHBOARD_PATH);
+    if (!data || typeof data !== 'object' || !data.kpis) return null;
+    return data;
+  } catch {
+    return null;
+  }
+}
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const genAI = GEMINI_API_KEY ? new GoogleGenerativeAI(GEMINI_API_KEY) : null;
@@ -1545,14 +1563,29 @@ app.get('/api/history', async (_req, res) => {
   res.json({ ok: true, items });
 });
 
-// 真实看板统计（基于 mapping_config + 最新日期 XLSX + assets）
+// 真实看板统计：优先读认证落盘的 final_dashboard_data.json，否则实时聚合
 app.get('/api/dashboard-stats', async (_req, res) => {
   try {
+    const snap = await readFinalDashboardSnapshot();
+    if (snap) {
+      return res.json({
+        ok: true,
+        source: 'final_dashboard_data',
+        generatedAt: snap.generatedAt,
+        dates: snap.dates,
+        mapping: snap.mapping,
+        meta: snap.meta,
+        kpis: snap.kpis,
+        brandCoverage: snap.brandCoverage || [],
+      });
+    }
+
     const agg = await aggregateProjectData({ storageRoot: STORAGE_ROOT });
     const latest = agg.latest;
 
     return res.json({
       ok: true,
+      source: 'live',
       dates: agg.dates,
       mapping: agg.mapping,
       meta: latest.meta,
@@ -1562,6 +1595,8 @@ app.get('/api/dashboard-stats', async (_req, res) => {
         matched3DSoles: latest.kpis.matchedSoles,
         lastCoverage: latest.kpis.lastCoverage,
         soleCoverage: latest.kpis.soleCoverage,
+        stylesWithAny3D: latest.kpis.stylesWithAny3D,
+        any3DCoveragePercent: latest.kpis.any3DCoveragePercent,
         deltaActiveStyles: agg.deltas.activeStyles.delta,
         deltaMatched3DLasts: agg.deltas.matchedLasts.delta,
         deltaMatched3DSoles: agg.deltas.matchedSoles.delta,
@@ -1575,12 +1610,46 @@ app.get('/api/dashboard-stats', async (_req, res) => {
   }
 });
 
-// 真实款号清单（基于 mapping_config + 最新日期 XLSX + assets）
+// 认证并应用到看板：全量聚合 + 写入 final_dashboard_data.json
+app.post('/api/certify-and-sync', async (_req, res) => {
+  try {
+    await ensureStorageDirs();
+    const payload = await processAllData({ storageRoot: STORAGE_ROOT });
+    const outPath = await persistFinalDashboardData(STORAGE_ROOT, payload);
+    // eslint-disable-next-line no-console
+    console.log('[Engine] 已写入', outPath);
+    return res.json({
+      ok: true,
+      path: outPath,
+      generatedAt: payload.generatedAt,
+      kpis: payload.kpis,
+    });
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.error('[Engine] certify-and-sync failed', e);
+    return res.status(500).json({ ok: false, error: e instanceof Error ? e.message : 'certify-and-sync failed' });
+  }
+});
+
+// 真实款号清单：与看板一致，优先 final_dashboard_data.json
 app.get('/api/inventory-real', async (_req, res) => {
   try {
+    const snap = await readFinalDashboardSnapshot();
+    if (snap?.inventory) {
+      return res.json({
+        ok: true,
+        source: 'final_dashboard_data',
+        generatedAt: snap.generatedAt,
+        dates: snap.dates,
+        mapping: snap.mapping,
+        meta: snap.meta,
+        items: snap.inventory,
+      });
+    }
     const agg = await aggregateProjectData({ storageRoot: STORAGE_ROOT });
     return res.json({
       ok: true,
+      source: 'live',
       dates: agg.dates,
       mapping: agg.mapping,
       meta: agg.latest.meta,
