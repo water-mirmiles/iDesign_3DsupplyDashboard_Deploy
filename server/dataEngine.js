@@ -442,10 +442,11 @@ function normalizeMappingPart(p, mainTableHint = '') {
   if (!p || typeof p !== 'object') return null;
   const structured =
     parseJoinPathFromConfig({ joinPath: p.joinPath, physicalColumn: p.physicalColumn }) || undefined;
-  let physicalColumn = normalize(p.physicalColumn);
+  // 防御：[object Object] —— physicalColumn/sourceField/sourceTable 必须是字符串
+  let physicalColumn = typeof p.physicalColumn === 'string' ? normalize(p.physicalColumn) : '';
   if (physicalColumn.startsWith('CHAIN|')) physicalColumn = '';
-  const sourceField = normalize(p.sourceField);
-  const sourceTable = normalize(p.sourceTable);
+  const sourceField = typeof p.sourceField === 'string' ? normalize(p.sourceField) : '';
+  const sourceTable = typeof p.sourceTable === 'string' ? normalize(p.sourceTable) : '';
   const firstHopField = structured?.[0] && typeof structured[0] === 'object' ? normalize(structured[0].sourceField) : '';
   if (!physicalColumn && sourceField) physicalColumn = sourceField;
   if (!physicalColumn && firstHopField) physicalColumn = firstHopField;
@@ -520,13 +521,13 @@ function resolveScalarMappingPart(part, mainRow, mainTableName, tablesMap, stand
     const pathObj = parseJoinPathFromConfig({ joinPath: part.joinPath });
     if (pathObj?.length) return resolveRecursiveValue({ mainRow, mainTableName, joinPath: pathObj, tablesMap, ...recOpts });
   }
-  const token = normalize(part.physicalColumn);
+  const token = typeof part.physicalColumn === 'string' ? normalize(part.physicalColumn) : '';
   if (token.startsWith('CHAIN|')) {
     const path = parseJoinPathFromConfig({ joinPath: null, physicalColumn: token });
     if (path) return resolveRecursiveValue({ mainRow, mainTableName, joinPath: path, tablesMap, ...recOpts });
   }
-  const col = normalize(part.sourceField) || token;
-  const fileRef = normalize(part.sourceTable);
+  const col = (typeof part.sourceField === 'string' ? normalize(part.sourceField) : '') || token;
+  const fileRef = typeof part.sourceTable === 'string' ? normalize(part.sourceTable) : '';
   if (col && fileRef && isSpreadsheetFileRef(fileRef) && tablesMap?.size) {
     const dimLogical = buildTableNameIndex(fileRef);
     if (normalize(dimLogical) !== normalize(mainTableName)) {

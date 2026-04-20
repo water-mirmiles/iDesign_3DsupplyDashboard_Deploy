@@ -1750,6 +1750,7 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
   const goldenByDimRaw = req.body?.dimensionSamples ?? req.body?.goldenByDimension;
   let goldenBlocks = null;
   let goldenSamples = [];
+  let dimensionSamplesSeed = null;
   if (goldenByDimRaw && typeof goldenByDimRaw === 'object' && !Array.isArray(goldenByDimRaw)) {
     goldenBlocks = normalizeGoldenByDimensionForAi(goldenByDimRaw);
     goldenSamples = expandGoldenBlocksToFlatSamples(goldenBlocks);
@@ -1760,7 +1761,7 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
     req.body?.sampleRow && typeof req.body.sampleRow === 'object' && !Array.isArray(req.body.sampleRow)
       ? req.body.sampleRow
       : null;
-  const goldenExpectedMap = buildGoldenExpectedMap({ goldenBlocks, goldenSamples, reference });
+  let goldenExpectedMap = buildGoldenExpectedMap({ goldenBlocks, goldenSamples, reference });
   if (!sqlText.trim()) return res.status(400).json({ ok: false, error: 'sqlText is required' });
   if (!vertexAI) return res.status(500).json({ ok: false, error: 'Vertex AI is not initialized' });
 
@@ -1793,12 +1794,7 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
     if (conversationalInput) {
       aiTraceLineSync('[Step 1] conversationalInput detected; parsing chat-to-samples');
       try {
-        // 对话即最高指令：主表是 XXX 直接覆盖 masterTable（优先级最高）
-        const mm = String(conversationalInput).match(/主表是\s*([A-Za-z_][\w.]*)/);
-        if (mm && mm[1]) {
-          masterTable = String(mm[1]).trim();
-          aiTraceLineSync(`[Step 1] masterTable overridden by chat: ${masterTable}`);
-        }
+        // 合并逻辑：内部“确定性对话解析” -> goldenBlocks/goldenSamples/expectedMap 的唯一来源
         const emptyDim = () => ({ targetGoal: '', rows: [] });
         const makeSegmentsRow = (value, notes = '') => ({
           id: `chat_${Date.now()}_${Math.random().toString(16).slice(2)}`,
@@ -1816,11 +1812,38 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
           status: emptyDim(),
         };
 
+        // 1) 主表是 XXX（最高优先级）
+        const mm = s.match(/主表是\s*([A-Za-z_][\w.]*)/);
+        if (mm && mm[1]) {
+          masterTable = String(mm[1]).trim();
+          aiTraceLineSync(`[Step 1] masterTable overridden by chat: ${masterTable}`);
+        }
+
+        // 2) 款号在 表.字段 字段，值为 XXX（最高优先级坐标）
+        const mStyle =
+          s.match(/款号在\s*([A-Za-z_][\w.]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*字段[，,]?\s*值为\s*([A-Za-z0-9_-]+)/) ||
+          s.match(/styleCode\s*在\s*([A-Za-z_][\w.]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*(?:字段|列)?[，,]?\s*值为\s*([A-Za-z0-9_-]+)/i);
+        if (mStyle && mStyle[1] && mStyle[2] && mStyle[3]) {
+          const tn = String(mStyle[1]).trim();
+          const fn = String(mStyle[2]).trim();
+          const v = String(mStyle[3]).trim();
+          dimensionSamples.styleCode.rows = [
+            {
+              id: `hard_style_${Date.now()}`,
+              notes: '硬规则：款号在指定字段，值为指定值（对话即最高指令）',
+              segments: [{ tableName: tn, fieldName: fn, value: v }],
+            },
+          ];
+          dimensionSamples.styleCode.targetGoal = v;
+        }
+
         // styleCode: SBOX26008M / 任意大写字母+数字+字母（保守）
         const style = s.match(/\b[A-Z]{2,10}\d{3,10}[A-Z]?\b/);
         if (style) {
-          dimensionSamples.styleCode.rows.push(makeSegmentsRow(style[0], '从描述中提取：款号/StyleCode'));
-          dimensionSamples.styleCode.targetGoal = style[0];
+          if (!dimensionSamples.styleCode.targetGoal) {
+            dimensionSamples.styleCode.rows.push(makeSegmentsRow(style[0], '从描述中提取：款号/StyleCode'));
+            dimensionSamples.styleCode.targetGoal = style[0];
+          }
         }
 
         // lastCode: L-xxxx（示例：L-B26097M）
@@ -1879,9 +1902,11 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
           dimensionSamples.colorCode.targetGoal = v;
         }
 
+        dimensionSamplesSeed = dimensionSamples;
         goldenBlocks = normalizeGoldenByDimensionForAi(dimensionSamples);
         goldenSamples = expandGoldenBlocksToFlatSamples(goldenBlocks);
-        aiTraceLineSync('[Step 1] chat parsed (local fallback) and injected into modeling seed');
+        goldenExpectedMap = buildGoldenExpectedMap({ goldenBlocks, goldenSamples, reference });
+        aiTraceLineSync('[Step 1] chat parsed and injected into modeling seed (goldenSamples rebuilt)');
       } catch (e) {
         aiTraceLineSync(`[Step 1] chat-to-samples exception; continue: ${e instanceof Error ? e.message : String(e)}`);
       }
@@ -2033,6 +2058,8 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
         smartSuggestions,
         joinPathSuggestions: validated,
         concatMappingSuggestions,
+        dimensionSamplesSeed,
+        masterTableUsed: masterTable,
         _debug: { modelTried: modelList, mode: 'one-shot' },
       });
     }

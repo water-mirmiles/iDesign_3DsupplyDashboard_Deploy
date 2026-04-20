@@ -1206,6 +1206,8 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
         smartSuggestions?: AiSuggestion[];
         joinPathSuggestions?: AiJoinPath[];
         concatMappingSuggestions?: AiConcatSuggestion[];
+        dimensionSamplesSeed?: any;
+        masterTableUsed?: string;
         error?: string;
         _debug?: any;
       };
@@ -1217,6 +1219,37 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
       const sug = json.smartSuggestions || [];
       const jp = json.joinPathSuggestions || [];
       const concatSug = json.concatMappingSuggestions || [];
+      // 联动刷新：后端若返回了对话解析种子坐标，则立即回填到 Step2 的 dimensionSamples
+      if (json.dimensionSamplesSeed && typeof json.dimensionSamplesSeed === 'object') {
+        const ds = json.dimensionSamplesSeed as any;
+        setDimensionSamples((prev) => {
+          const next: DimensionSamplesState = { ...(prev || createEmptyDimensionSamples()) };
+          for (const f of initialStandardFields) {
+            const k = f.standardKey;
+            const blk = ds[k] && typeof ds[k] === 'object' ? ds[k] : null;
+            const targetGoal = typeof blk?.targetGoal === 'string' ? String(blk.targetGoal || '') : '';
+            const rowsRaw = Array.isArray(blk?.rows) ? blk.rows : [];
+            const rows = rowsRaw
+              .map((r: any) => {
+                const notes = String(r?.notes || '');
+                const id = String(r?.id || '') || newGoldenRowId();
+                const segs = Array.isArray(r?.segments) ? r.segments : [];
+                const segments = segs.map((s: any) => ({
+                  tableName: String(s?.tableName || '').trim(),
+                  fieldName: String(s?.fieldName || '').trim(),
+                  value: String(s?.value ?? ''),
+                }));
+                return { id, notes, segments };
+              })
+              .filter((r: any) => Array.isArray(r.segments) && r.segments.some((s: any) => String(s?.value || '').trim() !== ''));
+            if (rows.length || String(targetGoal || '').trim()) next[k] = { targetGoal, rows };
+          }
+          return next;
+        });
+      }
+      if (typeof json.masterTableUsed === 'string' && String(json.masterTableUsed).trim()) {
+        flushSync(() => setMasterTable(String(json.masterTableUsed).trim()));
+      }
       setAiSuggestions(sug);
       setAiJoinPaths(jp);
       setAiTables(parsedTables);
