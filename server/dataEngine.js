@@ -859,6 +859,7 @@ export async function validateJoinPathSuggestionsWithGoldenXlsx({
   folderPath,
   smartSuggestions,
   targetStyle = '',
+  masterTableLogicalName = '',
 }) {
   const list = Array.isArray(joinPathSuggestions) ? joinPathSuggestions : [];
   const goldMap =
@@ -866,7 +867,12 @@ export async function validateJoinPathSuggestionsWithGoldenXlsx({
   const { xlsxTables, tablesMap } = await loadExcelFolderAsTablesMap(folderPath);
   if (!list.length) return [];
 
-  const main = inferMainTableFromSmartSuggestions(xlsxTables, smartSuggestions || []);
+  const wantMain = normalize(masterTableLogicalName);
+  const mainByAnchor =
+    wantMain && xlsxTables?.length
+      ? xlsxTables.find((t) => normalize(getLogicalTableName(t?.fileName || '')) === wantMain) || null
+      : null;
+  const main = mainByAnchor || inferMainTableFromSmartSuggestions(xlsxTables, smartSuggestions || []);
   if (!main || !tablesMap.size) {
     // eslint-disable-next-line no-console
     console.warn(
@@ -1165,6 +1171,7 @@ export async function resolveFirstActiveRowFromFolder({
   preload = null,
   previewStrict = false,
   targetStyle = '',
+  masterTableLogicalName = '',
 }) {
   const { xlsxTables, tablesMap } = preload ?? (await readAllFilesFromFolder(folderPath));
   if (!xlsxTables?.length) {
@@ -1191,6 +1198,11 @@ export async function resolveFirstActiveRowFromFolder({
   const materialCol = columnNameForMainRow(standardMap.get('materialCode'));
 
   const required = [styleCol, brandCol, statusCol].filter(Boolean);
+  const wantMain = normalize(masterTableLogicalName);
+  const mainByAnchor =
+    wantMain && xlsxTables?.length
+      ? xlsxTables.find((t) => normalize(getLogicalTableName(t?.fileName || '')) === wantMain) || null
+      : null;
   // 全表搜索：优先用 targetStyle 在所有表全列暴力定位“样本行所在表”（不信任 fieldName）
   const pickMainByTargetStyle = () => {
     if (!targetStyleNorm) return null;
@@ -1220,7 +1232,8 @@ export async function resolveFirstActiveRowFromFolder({
     return candidates[0]?.table || null;
   };
 
-  const main = (required.length ? guessStyleMainTable(xlsxTables, required) : null) || pickMainByTargetStyle();
+  const main =
+    mainByAnchor || (required.length ? guessStyleMainTable(xlsxTables, required) : null) || pickMainByTargetStyle();
   if (!main) {
     return { ok: false, error: '无法识别主表（未能通过表头或全表搜索定位样本行）', row: null, mainTable: null };
   }

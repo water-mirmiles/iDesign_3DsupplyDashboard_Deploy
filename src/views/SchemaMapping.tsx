@@ -672,6 +672,14 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
     return out;
   }, [resolvedRow]);
 
+  const canCertifyByGreen = useMemo(() => {
+    const required = ['styleCode', 'brand', 'lastCode', 'soleCode'];
+    const keys = ['styleCode', 'brand', 'lastCode', 'soleCode', 'colorCode', 'materialCode', 'status'];
+    const greenKeys = keys.filter((k) => String(actualByStandardKey?.[k] || '').trim());
+    const hasRequired = required.every((k) => String(actualByStandardKey?.[k] || '').trim());
+    return hasRequired && greenKeys.length >= 5;
+  }, [actualByStandardKey]);
+
   const previewMatchByStandardKey = useMemo(() => {
     const out: Record<string, { expected: string; actual: string; ok: boolean; hasExpectation: boolean }> = {};
     for (const f of initialStandardFields) {
@@ -2292,8 +2300,11 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                 <button
                   type="button"
                   onClick={() => void handleAuthAndSync()}
-                  disabled={busy}
-                  className="px-3 py-1.5 text-[11px] font-semibold rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
+                  disabled={busy || !canCertifyByGreen}
+                  className={cn(
+                    'px-3 py-1.5 text-[11px] font-semibold rounded-lg text-white disabled:opacity-50',
+                    canCertifyByGreen ? 'bg-indigo-600 hover:bg-indigo-700' : 'bg-indigo-300'
+                  )}
                   title="认证并应用到看板（写入 mapping_config 并触发看板重算）"
                 >
                   {authSyncing ? '发布中…' : '认证并应用到看板'}

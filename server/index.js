@@ -1002,6 +1002,7 @@ app.post('/api/preview-mapping-row', async (req, res) => {
       traceJoins: true,
       preload,
       previewStrict: true,
+      masterTableLogicalName: typeof req.body?.masterTable === 'string' ? String(req.body.masterTable).trim() : '',
       ...(targetStyle ? { targetStyle } : {}),
     });
     if (!resolved.ok) {
@@ -1940,6 +1941,7 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
         folderPath: latestDirForBacktest,
         smartSuggestions,
         targetStyle: targetStyleForBacktest,
+        masterTableLogicalName: masterTable,
       });
 
       auditLineSync('[Audit][D] Validation result (one-shot)');
