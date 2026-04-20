@@ -93,13 +93,34 @@ export function isTruthyActiveStatus(v) {
   );
 }
 
+/**
+ * 将主表 data_status 规范为 inventory 三态：active | draft | obsolete
+ * 注意顺序：先识别作废码，避免 "9"、invalid 等被误判为草稿。
+ */
 function normalizeInventoryStatus(v) {
-  const s = normalizeLower(v);
+  const raw = normalize(v);
+  const s = raw.toLowerCase();
   if (!s) return 'draft';
+
+  // 作废（显式编码 + 关键字）
+  if (s === '9' || s === '99' || s === '-1') return 'obsolete';
+  if (
+    s.includes('obsolete') ||
+    s.includes('invalid') ||
+    s.includes('作废') ||
+    s.includes('失效') ||
+    s.includes('废弃')
+  ) {
+    return 'obsolete';
+  }
+
+  // 生效：与 isTruthyActiveStatus 对齐（含 生效/ effective / active / 1 等）
   if (isTruthyActiveStatus(v)) return 'active';
-  if (s.includes('draft') || s.includes('草稿')) return 'draft';
-  if (s.includes('obsolete') || s.includes('作废') || s.includes('失效') || s.includes('废弃')) return 'obsolete';
-  // 未知状态默认视为草稿，避免把非生效误算为 active
+
+  // 草稿
+  if (s === '0' || s.includes('draft') || s.includes('草稿')) return 'draft';
+
+  // 未知默认草稿（避免误算为生效）
   return 'draft';
 }
 
@@ -1898,7 +1919,18 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
 
   const totalStyles = inventory.length;
 
-  // 分桶：effective(active) / draft / obsolete / total
+  const allRows = inventory;
+  // eslint-disable-next-line no-console
+  console.log('Unique Statuses Found:', [...new Set(allRows.map((r) => r.data_status))]);
+  const rawStatusUniq = new Set();
+  for (const row of main.rows) {
+    if (styleCol && !normalize(row?.[styleCol])) continue;
+    rawStatusUniq.add(String(statusCol ? row?.[statusCol] ?? '' : '').trim());
+  }
+  // eslint-disable-next-line no-console
+  console.log('Unique Raw Status Values:', [...rawStatusUniq]);
+
+  // 分桶：effective(active) / draft / obsolete / total（total = 全量，不按状态过滤）
   const allBrands = uniqBrandsFromInventoryRows(inventory);
   const bucketTotal = inventory;
   const bucketEffective = inventory.filter((x) => x.data_status === 'active');
@@ -2052,6 +2084,20 @@ export async function processAllData({ storageRoot }) {
   console.log(
     `[Engine] 合成完成，耗时 ${Date.now() - t0}ms；生效款 ${kpis.activeStyles}，任一3D命中 ${kpis.stylesWithAny3D}（${kpis.any3DCoveragePercent}%）`
   );
+  const sd = payload.statusBuckets?.total?.kpis?.statusDist;
+  if (sd) {
+    const a = Number(sd.active || 0);
+    const d = Number(sd.draft || 0);
+    const o = Number(sd.obsolete || 0);
+    const sum = a + d + o;
+    const invN = Array.isArray(payload.inventory) ? payload.inventory.length : 0;
+    // eslint-disable-next-line no-console
+    console.log(`[Engine] 统计结果：生效(${a}) + 草稿(${d}) + 作废(${o}) = 总数(${sum})`);
+    if (sum !== invN) {
+      // eslint-disable-next-line no-console
+      console.warn(`[Engine] 状态合计 ${sum} 与 inventory 行数 ${invN} 不一致`);
+    }
+  }
   const engineSummary = {
     generatedAt: payload.generatedAt,
     dates: payload.dates,

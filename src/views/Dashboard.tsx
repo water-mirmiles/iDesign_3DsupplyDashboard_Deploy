@@ -190,7 +190,18 @@ export default function Dashboard() {
     if (!sb) return fallback;
     if (statusScope === 'effective') return eff || fallback;
     if (statusScope === 'includeDraft') return merge(eff, dra);
-    return tot || fallback;
+    // 全量池：必须用 total 分桶（含作废），避免回落到仅生效的顶层 kpis
+    const t = tot;
+    if (t && typeof t.totalStyles === 'number') {
+      return {
+        ...t,
+        styles: {
+          totalAll: t.totalStyles,
+          totalEffective: stats?.kpis?.styles?.totalEffective ?? stats?.kpis?.activeStyles ?? 0,
+        },
+      };
+    }
+    return fallback;
   }, [stats, statusScope]);
 
   const digitizationStats = useCallback(
@@ -498,8 +509,13 @@ export default function Dashboard() {
               {getTrendBadge(stats?.kpis?.deltaActiveStyles || 0)}
             </div>
             <div className="mt-1 text-xs text-slate-500">
-              当前口径：<span className="font-medium text-slate-700">
-                {statusScope === 'effective' ? '仅生效' : statusScope === 'includeDraft' ? '生效+草稿' : '全量池'}
+              当前口径：
+              <span className="font-medium text-slate-700">
+                {statusScope === 'effective'
+                  ? '仅生效'
+                  : statusScope === 'includeDraft'
+                    ? '生效+草稿'
+                    : '所有状态（含作废）'}
               </span>
             </div>
           </div>
