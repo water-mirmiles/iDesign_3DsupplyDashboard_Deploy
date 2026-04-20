@@ -22,7 +22,16 @@ function stripExt(fileName) {
 
 export function isTruthyActiveStatus(v) {
   const s = normalizeLower(v);
-  return s === '生效' || s === 'active' || s === '有效' || s === 'enabled' || s === 'true' || s === '1';
+  return (
+    s === '生效' ||
+    s === '有效' ||
+    s === '启用' ||
+    s === 'active' ||
+    s === 'enabled' ||
+    s === 'effective' ||
+    s === 'true' ||
+    s === '1'
+  );
 }
 
 function safeJsonRead(filePath) {
@@ -571,12 +580,7 @@ function resolveStandardMappedValue(entry, mainRow, mainTableName, tablesMap, fa
       const partVals = entry.parts.map((p, idx) => {
         const v = resolveScalarMappingPart(p, mainRow, mainTableName, tablesMap, sk, ro);
         traceLine(
-          `[Trace][materialCode CONCAT / LT04] part[${idx}] => ${JSON.stringify({
-            physicalColumn: p.physicalColumn,
-            sourceField: p.sourceField,
-            sourceTable: p.sourceTable,
-            joinPathLen: Array.isArray(p.joinPath) ? p.joinPath.length : 0,
-          })} | resolved="${v}"`
+          `[Trace][materialCode CONCAT / LT04] part[${idx}] => ${JSON.stringify(p)} | resolved="${v}"`
         );
         return v;
       });
