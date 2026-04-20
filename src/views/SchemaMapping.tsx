@@ -1070,11 +1070,12 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
     }
     setResolvingRow(true);
     try {
+      const targetStyle = String(expectedByStandardKey?.styleCode || '').trim();
       const resp = await fetch(`${API_BASE}/api/preview-mapping-row`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         signal,
-        body: JSON.stringify({ mapping }),
+        body: JSON.stringify({ mapping, targetStyle }),
       });
       const json = (await resp.json().catch(() => null)) as any;
       if (signal?.aborted) return;
@@ -1100,7 +1101,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
     } finally {
       if (!signal?.aborted) setResolvingRow(false);
     }
-  }, []);
+  }, [expectedByStandardKey]);
 
   // Step 4：mapping 变化时拉取真实预览行（含 AI 回填后）
   useEffect(() => {

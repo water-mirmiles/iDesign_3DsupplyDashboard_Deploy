@@ -2,6 +2,7 @@ import fse from 'fs-extra';
 import path from 'path';
 import XLSX from 'xlsx';
 import { fileURLToPath } from 'url';
+import { getLogicalTableName } from './utils.js';
 
 function isDateDirName(name) {
   return /^\d{4}-\d{2}-\d{2}$/.test(name);
@@ -383,7 +384,7 @@ export function resolveRecursiveValue({
     const rawKey = getRowFieldLoose(currentRow, sf, srcHeaders);
     if (rawKey == null || normalize(rawKey) === '') {
       setJoinDiag(diagnosticsMap, sk, `Join Source Empty: ${i === 0 ? mainKey : st}.${sf}`);
-      traceJoin(trace, `匹配结果: 失败 (源字段无值)`);
+      traceJoin(trace, `匹配结果: 失败 (源字段无值: ${sf}=${rawKey == null ? 'undefined/null' : JSON.stringify(String(rawKey))})`);
       return '';
     }
 
@@ -686,9 +687,7 @@ function computeDelta(current, previous) {
 }
 
 function buildTableNameIndex(fileName) {
-  const base = path.basename(fileName);
-  const noExt = base.replace(/\.(xlsx|xls)$/i, '');
-  return noExt.replace(/^\d{8}_/, '');
+  return normalize(getLogicalTableName(fileName));
 }
 
 function isSpreadsheetFileRef(s) {
@@ -702,7 +701,7 @@ function getXlsxTableByLogicalName(logicalName, tablesMap) {
   if (tablesMap.has(want)) return tablesMap.get(want);
   for (const [k, t] of tablesMap) {
     if (normalize(k) === want) return t;
-    if (t?.fileName && buildTableNameIndex(t.fileName) === want) return t;
+    if (t?.fileName && normalize(getLogicalTableName(t.fileName)) === want) return t;
   }
   return null;
 }
@@ -807,8 +806,9 @@ function resolveHeuristicDimLookup({
 function buildTablesMap(xlsxTables) {
   const map = new Map();
   for (const t of xlsxTables) {
-    const tableName = buildTableNameIndex(t.fileName);
-    map.set(tableName, t);
+    const logical = normalize(getLogicalTableName(t.fileName));
+    if (!logical) continue;
+    map.set(logical, t);
   }
   return map;
 }
@@ -1148,11 +1148,22 @@ export async function resolveFirstActiveRowFromFolder({
   traceJoins = false,
   preload = null,
   previewStrict = false,
+  targetStyle = '',
 }) {
   const { xlsxTables, tablesMap } = preload ?? (await readAllFilesFromFolder(folderPath));
   if (!xlsxTables?.length) {
     return { ok: false, error: 'sandbox 目录下没有 XLSX 文件', row: null, mainTable: null };
   }
+
+  const targetStyleNorm = String(targetStyle || '').trim().toUpperCase();
+  const eqLoose = (a, b) => String(a ?? '').trim().toUpperCase() === String(b ?? '').trim().toUpperCase();
+  const rowContainsTarget = (row, target) => {
+    if (!row || !target) return false;
+    for (const v of Object.values(row)) {
+      if (eqLoose(v, target)) return true;
+    }
+    return false;
+  };
 
   const styleCol = columnNameForMainRow(standardMap.get('styleCode'));
   const brandCol = columnNameForMainRow(standardMap.get('brand'));
@@ -1170,6 +1181,9 @@ export async function resolveFirstActiveRowFromFolder({
   }
 
   const mainTableName = buildTableNameIndex(main.fileName);
+  // 强制对账：逻辑表名 -> 物理文件路径
+  // eslint-disable-next-line no-console
+  console.log('[Debug] 正在查找逻辑表:', mainTableName, '对应的物理文件是:', main.fullPath || main.fileName);
   const diagnosticsMap = previewStrict ? new Map() : null;
   const traceOpts = (label) => ({
     trace: traceJoins,
@@ -1285,6 +1299,53 @@ export async function resolveFirstActiveRowFromFolder({
     };
   };
 
+  // 物理寻行强化：若前端提供了 targetStyle（如 SBOX26008M），优先锁定该行；找不到则暴力遍历全表全列
+  if (targetStyleNorm) {
+    // 先尝试：生效行 + styleCol 精确命中
+    if (styleCol) {
+      for (let i = 0; i < main.rows.length; i++) {
+        const row = main.rows[i] || {};
+        const statusVal = statusCol ? row?.[statusCol] : '';
+        const isActive = isTruthyActiveStatus(statusVal);
+        if (!isActive) continue;
+        if (eqLoose(row?.[styleCol], targetStyleNorm)) return packOk(row, false);
+      }
+      // 再尝试：全行（含非生效）+ styleCol 命中
+      for (let i = 0; i < main.rows.length; i++) {
+        const row = main.rows[i] || {};
+        if (eqLoose(row?.[styleCol], targetStyleNorm)) {
+          traceLine(`[Trace] 主表未找到生效行匹配 ${targetStyleNorm}，已使用非生效命中行（styleCol=${styleCol}）`);
+          return packOk(row, false, '未找到生效行；但已按款号命中非生效行做预览（生产仍以生效行为准）');
+        }
+      }
+    }
+
+    // 暴力：生效行全列搜索
+    for (let i = 0; i < main.rows.length; i++) {
+      const row = main.rows[i] || {};
+      const statusVal = statusCol ? row?.[statusCol] : '';
+      const isActive = isTruthyActiveStatus(statusVal);
+      if (!isActive) continue;
+      if (rowContainsTarget(row, targetStyleNorm)) {
+        traceLine(`[Trace] styleCol 未命中 ${targetStyleNorm}，已在生效行全列暴力命中（rowIndex=${i}）`);
+        return packOk(row, false);
+      }
+    }
+
+    // 暴力：全表全列搜索
+    for (let i = 0; i < main.rows.length; i++) {
+      const row = main.rows[i] || {};
+      if (rowContainsTarget(row, targetStyleNorm)) {
+        traceLine(`[Trace] 生效行未命中 ${targetStyleNorm}，已在全表全列暴力命中（rowIndex=${i}）`);
+        return packOk(row, false, '未找到生效行；已在全表暴力命中样本值做预览（生产仍以生效行为准）');
+      }
+    }
+
+    // 全表找不到：明确告警写入 ai_trace.log（traceLine 会同步写入）
+    traceLine(`[Trace] 物理 Excel 文件中不存在样本值：${targetStyleNorm}，请检查文件内容`);
+    return { ok: false, error: `物理 Excel 文件中不存在样本值：${targetStyleNorm}，请检查文件内容`, row: null, mainTable: main?.fileName || null };
+  }
+
   for (let i = 0; i < main.rows.length; i++) {
     const row = main.rows[i] || {};
     const statusVal = statusCol ? row?.[statusCol] : '';
@@ -1294,12 +1355,8 @@ export async function resolveFirstActiveRowFromFolder({
     return packOk(row, false);
   }
 
-  if (main.rows.length > 0) {
-    const row = main.rows[0] || {};
-    return packOk(row, true, '未找到生效行，已使用首行做沙盒校验（生产仍以生效行为准）');
-  }
-
-  return { ok: false, error: '沙盒主表无数据行', row: null, mainTable: main?.fileName || null };
+  // 不再使用“首行兜底”，避免逻辑崩盘/误导
+  return { ok: false, error: '未找到生效行', row: null, mainTable: main?.fileName || null };
 }
 
 export async function aggregateProjectData({ storageRoot }) {

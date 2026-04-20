@@ -8,6 +8,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import XLSX from 'xlsx';
 import { VertexAI } from '@google-cloud/vertexai';
+import { getLogicalTableName } from './utils.js';
 import {
   aggregateProjectData,
   buildStandardMap,
@@ -91,7 +92,8 @@ async function readFinalDashboardSnapshot() {
 const VERTEX_PROJECT_ID = 'idesign-3dsupplydashboard';
 const VERTEX_LOCATION = 'us-central1';
 const VERTEX_MODEL = 'gemini-1.5-flash';
-const MODEL_PRIORITY = [VERTEX_MODEL];
+// 优先使用“别名”模型；若项目无权限/404，则自动降级到可用版本（仍会打印完整资源路径便于核对）
+const MODEL_PRIORITY = [VERTEX_MODEL, 'gemini-1.5-flash-002', 'gemini-1.5-pro'];
 
 function ensureVertexCredentialsEnv() {
   const keyPath = path.join(__dirname, 'gcp-key.json');
@@ -103,7 +105,9 @@ function ensureVertexCredentialsEnv() {
 
 const vertexKeyPath = ensureVertexCredentialsEnv();
 const vertexAI = new VertexAI({ project: VERTEX_PROJECT_ID, location: VERTEX_LOCATION });
-const vertexModel = vertexAI.getGenerativeModel({ model: VERTEX_MODEL });
+function getVertexModel(modelName) {
+  return vertexAI.getGenerativeModel({ model: String(modelName || '').trim() });
+}
 
 let currentAIStatus = {
   status: 'idle',
@@ -318,10 +322,11 @@ function buildPriorityFromAvailable(available) {
   return dedup([best, f20, flashLatest, f15, proLatest]);
 }
 
-async function generateContentVertex({ prompt }) {
+async function generateContentVertex({ prompt, modelName }) {
   const p = String(prompt || '');
-  const resourcePublisherPath = `projects/${VERTEX_PROJECT_ID}/locations/${VERTEX_LOCATION}/publishers/google/models/${VERTEX_MODEL}`;
-  const resourceModelsPath = `projects/${VERTEX_PROJECT_ID}/locations/${VERTEX_LOCATION}/models/${VERTEX_MODEL}`;
+  const m = String(modelName || VERTEX_MODEL).trim();
+  const resourcePublisherPath = `projects/${VERTEX_PROJECT_ID}/locations/${VERTEX_LOCATION}/publishers/google/models/${m}`;
+  const resourceModelsPath = `projects/${VERTEX_PROJECT_ID}/locations/${VERTEX_LOCATION}/models/${m}`;
   if (!generateContentVertex._printedVertexModelPath) {
     generateContentVertex._printedVertexModelPath = true;
     // eslint-disable-next-line no-console
@@ -330,7 +335,8 @@ async function generateContentVertex({ prompt }) {
     console.log('[vertex] alt resource path (for verification):', resourceModelsPath);
   }
   try {
-    const result = await vertexModel.generateContent({
+    const model = getVertexModel(m);
+    const result = await model.generateContent({
       contents: [{ role: 'user', parts: [{ text: p }] }],
     });
     const text =
@@ -343,7 +349,7 @@ async function generateContentVertex({ prompt }) {
     if (status === 404 || String(e?.message || '').includes('404')) {
       // eslint-disable-next-line no-console
       console.error('[vertex][404] model not found', {
-        model: VERTEX_MODEL,
+        model: m,
         project: VERTEX_PROJECT_ID,
         location: VERTEX_LOCATION,
         resourcePublisherPath,
@@ -546,18 +552,23 @@ function heuristicInferSuggestions({ tables }) {
 }
 
 async function generateWithModelList({ modelNames, prompt, retries = 3 }) {
-  // Vertex AI 企业版：取消“呼吸延迟/退避”；默认直接使用锁定模型
-  const modelName = normalizeModelName((modelNames && modelNames[0]) || VERTEX_MODEL);
+  // Vertex AI：取消“呼吸延迟/退避”；按模型列表依次尝试（用于自动规避 404/权限问题）
+  const models = Array.isArray(modelNames) && modelNames.length ? modelNames : MODEL_PRIORITY;
   let lastErr = null;
-  for (let attempt = 1; attempt <= Math.max(1, retries); attempt++) {
-    try {
-      const out = await generateContentVertex({ prompt });
-      return { ok: true, text: out.text, modelName };
-    } catch (e) {
-      lastErr = e;
+  for (const name of models) {
+    const modelName = normalizeModelName(name);
+    for (let attempt = 1; attempt <= Math.max(1, retries); attempt++) {
+      try {
+        const out = await generateContentVertex({ prompt, modelName });
+        return { ok: true, text: out.text, modelName };
+      } catch (e) {
+        lastErr = e;
+        const status = getHttpStatusFromGeminiError(e);
+        if (status === 404) break; // 404 直接换下一个模型
+      }
     }
   }
-  return { ok: false, error: lastErr, modelName };
+  return { ok: false, error: lastErr, modelName: normalizeModelName(models[0] || VERTEX_MODEL) };
 }
 
 function getHttpStatusFromGeminiError(error) {
@@ -575,8 +586,8 @@ function getHttpStatusFromGeminiError(error) {
 
 async function generateContentWithFallback({ prompt }) {
   // 兼容旧调用点：现在统一走 Vertex AI
-  const out = await generateContentVertex({ prompt });
-  return { text: out.text, modelName: VERTEX_MODEL };
+  const out = await generateContentVertex({ prompt, modelName: MODEL_PRIORITY[0] || VERTEX_MODEL });
+  return { text: out.text, modelName: MODEL_PRIORITY[0] || VERTEX_MODEL };
 }
 
 async function listAvailableModels() {
@@ -926,6 +937,7 @@ app.post('/api/preview-mapping-row', async (req, res) => {
   await ensureStorageDirs();
   try {
     const mappingArr = Array.isArray(req.body?.mapping) ? req.body.mapping : null;
+    const targetStyle = String(req.body?.targetStyle || '').trim();
     if (!mappingArr?.length) return res.status(400).json({ ok: false, error: 'mapping array required' });
     const latestDir = await getLatestDataTablesDir();
     if (!(await fse.pathExists(latestDir))) {
@@ -950,6 +962,7 @@ app.post('/api/preview-mapping-row', async (req, res) => {
       traceJoins: true,
       preload,
       previewStrict: true,
+      ...(targetStyle ? { targetStyle } : {}),
     });
     if (!resolved.ok) {
       return res.status(404).json({
@@ -977,7 +990,7 @@ app.post('/api/preview-mapping-row', async (req, res) => {
 app.post('/api/ai-parse-ddl', async (req, res) => {
   const sqlText = String(req.body?.sqlText || '');
   if (!sqlText.trim()) return res.status(400).json({ ok: false, error: 'sqlText is required' });
-  if (!vertexModel) return res.status(500).json({ ok: false, error: 'Vertex AI is not initialized' });
+  if (!vertexAI) return res.status(500).json({ ok: false, error: 'Vertex AI is not initialized' });
 
   try {
     clearEngineLogSync();
@@ -1045,6 +1058,26 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
   if (!text) return res.status(400).json({ ok: false, error: 'text is required' });
   // Vertex 不可用时也不失败：沿用 localFallback（never fail）
 
+  function modelingDebugLogPath() {
+    return path.join(__dirname, 'storage', 'modeling_debug.log');
+  }
+
+  function appendModelingDebugSync(line) {
+    try {
+      const p = modelingDebugLogPath();
+      fse.ensureDirSync(path.dirname(p));
+      fse.appendFileSync(p, `${String(line ?? '')}\n`, { encoding: 'utf8' });
+    } catch {
+      // ignore
+    }
+  }
+
+  function modelingDebugLineSync(line) {
+    const out = String(line ?? '');
+    if (!out) return;
+    appendModelingDebugSync(out);
+  }
+
   const emptyDim = () => ({ targetGoal: '', rows: [] });
   const makeSegmentsRow = (value, notes = '') => ({
     id: `chat_${Date.now()}_${Math.random().toString(16).slice(2)}`,
@@ -1063,29 +1096,174 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
       status: emptyDim(),
     };
 
+    const lev = (a, b) => {
+      const nk = (v) => String(v || '').trim().toLowerCase().replace(/[`"'’\s]/g, '');
+      const s1 = nk(a);
+      const s2 = nk(b);
+      if (!s1) return s2.length;
+      if (!s2) return s1.length;
+      const dp = Array.from({ length: s1.length + 1 }, () => new Array(s2.length + 1).fill(0));
+      for (let i = 0; i <= s1.length; i++) dp[i][0] = i;
+      for (let j = 0; j <= s2.length; j++) dp[0][j] = j;
+      for (let i = 1; i <= s1.length; i++) {
+        for (let j = 1; j <= s2.length; j++) {
+          const cost = s1[i - 1] === s2[j - 1] ? 0 : 1;
+          dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
+        }
+      }
+      return dp[s1.length][s2.length];
+    };
+
+    // RegEx Power-up：优先抓取“描述即坐标”三元组，锁定 tableName.fieldName（若 DDL 可匹配则严格锁定）
+    const explicitTriples = [];
+    const pushTriple = (standardKey, tableName, fieldName, value, notes) => {
+      const tn = String(tableName || '').trim();
+      const fn = String(fieldName || '').trim();
+      if (!tn || !fn) return;
+      explicitTriples.push({
+        standardKey: String(standardKey || '').trim(),
+        tableName: tn,
+        fieldName: fn,
+        value: String(value ?? '').trim(),
+        notes: String(notes || ''),
+      });
+    };
+
+    const inferKeyFromCtx = (ctx) => {
+      const t = String(ctx || '');
+      if (/(款号|style)/i.test(t)) return 'styleCode';
+      if (/(品牌|brand)/i.test(t)) return 'brand';
+      if (/(楦|last)/i.test(t)) return 'lastCode';
+      if (/(底|sole|heel)/i.test(t)) return 'soleCode';
+      if (/(颜色|color|colour)/i.test(t)) return 'colorCode';
+      if (/(材质|material)/i.test(t)) return 'materialCode';
+      if (/(状态|status|生效|有效|active)/i.test(t)) return 'status';
+      return '';
+    };
+
+    // a) table.field (=|:|为) value
+    const reDot = /([A-Za-z_][\w.]*)\.([A-Za-z_][A-Za-z0-9_]*?)\s*(?:=|:|：|为)\s*("?)([^"\n;；，,]+)\3/g;
+    let m;
+    while ((m = reDot.exec(s)) !== null) {
+      const ctx = s.slice(Math.max(0, m.index - 18), Math.min(s.length, m.index + 18));
+      pushTriple(inferKeyFromCtx(ctx), m[1], m[2], m[4], 'explicit: table.field=value');
+    }
+
+    // b) [表名] 的 [字段名] 字段 (=|为) value
+    const reCn1 = /([A-Za-z_][\w.]*)\s*的\s*([A-Za-z_][A-Za-z0-9_]*)\s*字段\s*(?:=|:|：|为)\s*("?)([^"\n;；，,]+)\3/g;
+    while ((m = reCn1.exec(s)) !== null) {
+      const ctx = s.slice(Math.max(0, m.index - 18), Math.min(s.length, m.index + 18));
+      pushTriple(inferKeyFromCtx(ctx), m[1], m[2], m[4], 'explicit: 表的字段=value');
+    }
+
+    // c) 映射到表 X 的 Y 列 (=|为) value
+    const reCn2 = /映射到表\s*([A-Za-z_][\w.]*)\s*的\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:列|字段)\s*(?:=|:|：|为)\s*("?)([^"\n;；，,]+)\3/g;
+    while ((m = reCn2.exec(s)) !== null) {
+      const ctx = s.slice(Math.max(0, m.index - 18), Math.min(s.length, m.index + 18));
+      pushTriple(inferKeyFromCtx(ctx), m[1], m[2], m[4], 'explicit: 映射到表的列=value');
+    }
+
+    if (explicitTriples.length) {
+      const explicitKeys = new Set();
+      for (const t of explicitTriples) {
+        const k =
+          t.standardKey ||
+          (() => {
+            const fn = String(t.fieldName || '').toLowerCase();
+            const tn = String(t.tableName || '').toLowerCase();
+            if (fn.includes('style') || fn.includes('style_wms') || fn.includes('style_no')) return 'styleCode';
+            if (fn.includes('brand') || fn.includes('brand_name') || tn.includes('brand')) return 'brand';
+            if (fn.includes('last') || tn.includes('last')) return 'lastCode';
+            if (fn.includes('sole') || fn.includes('heel') || tn.includes('sole') || tn.includes('heel')) return 'soleCode';
+            if (fn.includes('color') || fn.includes('colour') || tn.includes('color') || tn.includes('colour')) return 'colorCode';
+            if (fn.includes('material') || fn.includes('category') || tn.includes('material')) return 'materialCode';
+            if (fn.includes('status') || tn.includes('status')) return 'status';
+            return '';
+          })();
+        if (!out[k]) continue;
+        explicitKeys.add(k);
+
+        let tableName = String(t.tableName || '').trim();
+        let fieldName = String(t.fieldName || '').trim();
+        let notes = String(t.notes || '');
+
+        // 严格匹配 DDL：若表名/字段名在 DDL 中不存在，允许做“模糊纠错”，但绝不改成主表/其他表
+        if (ddlTableMap && ddlTableMap.size) {
+          if (tableName && !ddlTableMap.has(tableName)) {
+            const ddlTableNamesList = Array.from(ddlTableMap.keys());
+            let best = '';
+            let bestDist = Infinity;
+            for (const cand of ddlTableNamesList) {
+              const d = lev(tableName, cand);
+              if (d < bestDist) {
+                bestDist = d;
+                best = cand;
+              }
+            }
+            if (best && bestDist <= 6) {
+              notes = [notes, `[auto-fix] tableName ${JSON.stringify(tableName)} -> ${JSON.stringify(best)} (dist=${bestDist})`]
+                .filter(Boolean)
+                .join(' ｜ ');
+              tableName = best;
+            }
+          }
+          if (tableName && fieldName && ddlTableMap.has(tableName)) {
+            const cols = ddlTableMap.get(tableName) || [];
+            const names = cols.map((c) => String(c?.name || '').trim()).filter(Boolean);
+            const nk = (v) => String(v || '').trim().toLowerCase().replace(/[`"'’\s]/g, '');
+            const has = names.some((x) => nk(x) === nk(fieldName));
+            if (!has && names.length) {
+              let best = '';
+              let bestDist = Infinity;
+              for (const cand of names) {
+                const d = lev(fieldName, cand);
+                if (d < bestDist) {
+                  bestDist = d;
+                  best = cand;
+                }
+              }
+              if (best && bestDist <= 2) {
+                notes = [notes, `[auto-fix] fieldName ${JSON.stringify(fieldName)} -> ${JSON.stringify(best)} (dist=${bestDist})`]
+                  .filter(Boolean)
+                  .join(' ｜ ');
+                fieldName = best;
+              }
+            }
+          }
+        }
+
+        out[k].rows.push({
+          id: `chat_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+          notes,
+          segments: [{ tableName, fieldName, value: String(t.value ?? '') }],
+        });
+        if (!out[k].targetGoal && t.value) out[k].targetGoal = String(t.value);
+      }
+    }
+
     // styleCode: 常见形态 SBOX26008M / 任意大写字母+数字+字母
     const style = s.match(/\b[A-Z]{2,10}\d{3,10}[A-Z]?\b/);
-    if (style) {
+    if (style && out.styleCode.rows.length === 0) {
       out.styleCode.rows.push(makeSegmentsRow(style[0], '从描述中提取：款号/StyleCode'));
       out.styleCode.targetGoal = style[0];
     }
 
     // lastCode: L-xxxx（示例：L-B26097M）
     const last = s.match(/\bL-[A-Za-z0-9-]{3,30}\b/);
-    if (last) {
+    if (last && out.lastCode.rows.length === 0) {
       out.lastCode.rows.push(makeSegmentsRow(last[0], '从描述中提取：楦号/lastCode'));
       out.lastCode.targetGoal = last[0];
     }
 
     // soleCode: S-xxxx / SOLE- / H- (粗略)
     const sole = s.match(/\b(?:S-|SOLE-|H-)[A-Za-z0-9-]{3,30}\b/);
-    if (sole) {
+    if (sole && out.soleCode.rows.length === 0) {
       out.soleCode.rows.push(makeSegmentsRow(sole[0], '从描述中提取：底号/soleCode'));
       out.soleCode.targetGoal = sole[0];
     }
 
     // status: 生效/有效/active
-    if (/(生效|有效|active|enabled)/i.test(s)) {
+    if (/(生效|有效|active|enabled)/i.test(s) && out.status.rows.length === 0) {
       const v = /(生效|有效)/.test(s) ? '生效' : 'active';
       out.status.rows.push(makeSegmentsRow(v, '从描述中提取：状态'));
       out.status.targetGoal = v;
@@ -1093,13 +1271,13 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
 
     // materialCode: LT04 或 LT + 04 拼接
     const matDirect = s.match(/\bLT\d{2}\b/i);
-    if (matDirect) {
+    if (matDirect && out.materialCode.rows.length === 0) {
       const v = matDirect[0].toUpperCase();
       out.materialCode.rows.push(makeSegmentsRow(v, '从描述中提取：材质编码'));
       out.materialCode.targetGoal = v;
     } else {
       const matParts = s.match(/\b(LT)\b[\s\S]{0,12}\b(0?\d{1,2})\b/i);
-      if (matParts) {
+      if (matParts && out.materialCode.rows.length === 0) {
         const p1 = String(matParts[1]).toUpperCase();
         const p2 = String(matParts[2]).padStart(2, '0');
         out.materialCode.rows.push(makeSegmentsRow(p1, '拼接段1：父/前缀（例如 LT）'));
@@ -1112,7 +1290,7 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
     const brand =
       s.match(/品牌[:：\s]*([A-Za-z][A-Za-z\s]{1,40})/i) ||
       s.match(/\bbrand[:：\s]*([A-Za-z][A-Za-z\s]{1,40})/i);
-    if (brand && brand[1]) {
+    if (brand && brand[1] && out.brand.rows.length === 0) {
       const v = String(brand[1]).trim().replace(/\s+/g, ' ');
       out.brand.rows.push(makeSegmentsRow(v, '从描述中提取：品牌名称'));
       out.brand.targetGoal = v;
@@ -1122,7 +1300,7 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
     const color =
       s.match(/颜色[:：\s]*([A-Za-z0-9-]{2,20})/i) ||
       s.match(/\bcolor[:：\s]*([A-Za-z0-9-]{2,20})/i);
-    if (color && color[1]) {
+    if (color && color[1] && out.colorCode.rows.length === 0) {
       const v = String(color[1]).trim();
       out.colorCode.rows.push(makeSegmentsRow(v, '从描述中提取：颜色编码/名称'));
       out.colorCode.targetGoal = v;
@@ -1170,53 +1348,13 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
     return '';
   };
 
-  const suggestFieldInTable = (tableName, standardKey) => {
-    const tn = String(tableName || '').trim();
-    const cols = ddlTableMap.get(tn) || [];
-    const kw =
-      standardKey === 'styleCode'
-        ? ['style', 'style_wms', '款号', 'style_no']
-        : standardKey === 'brand'
-          ? ['brand_name', 'brand', '品牌', 'name']
-          : standardKey === 'lastCode'
-            ? ['last', '楦', 'code', 'last_code']
-            : standardKey === 'soleCode'
-              ? ['sole', '底', 'heel', 'code', 'sole_code']
-              : standardKey === 'colorCode'
-                ? ['color', '颜色', 'colour', 'code', 'color_code']
-                : standardKey === 'materialCode'
-                  ? ['material', '材质', 'category', 'code', 'name', 'material_code', 'category_code']
-                  : standardKey === 'status'
-                    ? ['status', '状态', 'data_status', '生效', '有效']
-                    : [];
-    let best = '';
-    let bestScore = 0;
-    for (const c of cols) {
-      const hay = `${c.name || ''} ${c.comment || ''}`.toLowerCase();
-      let score = 0;
-      for (const k of kw) if (hay.includes(String(k).toLowerCase())) score += 10;
-      if (standardKey.endsWith('Code') && String(c.name || '').toLowerCase() === 'code') score += 8;
-      if (standardKey === 'brand' && String(c.name || '').toLowerCase() === 'brand_name') score += 12;
-      if (score > bestScore) {
-        bestScore = score;
-        best = c.name;
-      }
-    }
-    return best || (cols[0]?.name || '');
-  };
+  // NOTE: 已废除“按维度猜坐标/相似字段补全”的启发式策略（避免覆盖用户显式坐标）
 
   const fillCoordinatesFromDdl = (dimensionSamples) => {
+    // 仅做“无副作用”的补全：
+    // - segment 已有 tableName.fieldName：若 DDL 中存在则锁定，不做任何覆盖/猜测
+    // - segment 仅有 fieldName：若 DDL 中唯一命中某表，则补 tableName
     const keys = ['styleCode', 'brand', 'lastCode', 'soleCode', 'colorCode', 'materialCode', 'status'];
-    const explicit = [];
-    const refRe = /\b([\w.]+)\.([A-Za-z_][A-Za-z0-9_]*)\b/g;
-    let m;
-    while ((m = refRe.exec(text)) !== null) {
-      const t = String(m[1] || '').trim();
-      const f = String(m[2] || '').trim();
-      if (t && f) explicit.push({ tableName: t, fieldName: f });
-    }
-    const explicitSet = new Set(explicit.map((x) => `${x.tableName}.${x.fieldName}`));
-
     for (const k of keys) {
       const blk = dimensionSamples[k];
       if (!blk || !Array.isArray(blk.rows)) continue;
@@ -1225,40 +1363,17 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
         for (const s of segs) {
           const curT = String(s.tableName || '').trim();
           const curF = String(s.fieldName || '').trim();
-          if (curT && curF) continue;
-
-          // 若用户明确写了 table.field，优先信任（按 DDL 验证存在则用）
-          const pick = explicit.find((x) => {
-            if (!x.tableName || !x.fieldName) return false;
-            if (!ddlTableMap.size) return true;
-            const cols = ddlTableMap.get(x.tableName);
-            return cols ? cols.some((c) => String(c.name).toLowerCase() === x.fieldName.toLowerCase()) : false;
-          });
-          if (pick && !explicitSet.has(`${pick.tableName}.${pick.fieldName}`)) {
-            // keep
-          }
-          if (pick) {
-            s.tableName = pick.tableName;
-            s.fieldName = pick.fieldName;
+          if (curT && curF) {
+            if (!ddlTableMap.size) continue;
+            const cols = ddlTableMap.get(curT) || [];
+            const ok = cols.some((c) => String(c?.name || '').trim().toLowerCase() === curF.toLowerCase());
+            if (ok) continue;
+            // 若 DDL 中不存在：也不做“相似字段”覆盖（保持用户输入原样）
             continue;
           }
-
-          // 若只知道 fieldName：在 DDL 中找表
           if (!curT && curF) {
             const tFound = findTableContainingField(curF);
-            if (tFound) {
-              s.tableName = tFound;
-              continue;
-            }
-          }
-
-          // 维度启发式：优先 masterTable，否则扫全库选最可能字段
-          if (!curT) {
-            const tPref = masterTable && ddlTableMap.has(masterTable) ? masterTable : (ddlTables[0]?.tableName || '');
-            if (tPref) s.tableName = tPref;
-          }
-          if (s.tableName && !curF) {
-            s.fieldName = suggestFieldInTable(s.tableName, k);
+            if (tFound) s.tableName = tFound;
           }
         }
       }
@@ -1298,6 +1413,8 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
       '- status (状态)',
       '',
       '【强制匹配规则（必须遵守）】',
+      '【编号列表逐条解析（严禁漏项）】若用户用 1. 2. 3. 或 (1)(2)(3) 的序号逐条描述，你必须逐条解析并覆盖所有条目，严禁漏掉任何一条。',
+      '特别提醒：即便某表名在 DDL 清单靠后（例如 ods_wms_base_brand_df），只要用户明确写出，你必须提取并输出对应 tableName，禁止忽略。',
       '1) 若用户提到了具体表名（例如 ods_wms_base_brand_df），你必须优先使用该表名；若该表名与 DDL 清单不一致（例如漏字符 ods_pdm_product_info_df），你必须对比 DDL 清单做“模糊纠错”，自动修正为最接近且存在的表名（例如 ods_pdm_pdm_product_info_df）。',
       '2) 若用户提到了具体字段名（例如 brand_name），你必须优先使用该字段名；若字段名与该表 DDL 不一致，也必须对比该表字段清单做“模糊纠错”，修正为最接近且存在的字段名。',
       '3) 你严禁臆造不存在的表名/字段名：必须从 DDL 结构中选取（可做纠错），若无法确定则留空 ""，并在 notes 写明原因。',
@@ -1329,13 +1446,41 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
     auditLineSync('[Audit][A] Prompt: parse-chat-to-samples');
     auditLineSync(prompt);
 
-    const out = await generateWithModelList({ modelNames: modelList, prompt, retries: 3 });
+    // 真相审计：记录 AI 原生输出 + 最终坐标
+    modelingDebugLineSync(`[${new Date().toISOString()}] ===== parse-chat-to-samples START =====`);
+    modelingDebugLineSync(`[Input] ${text}`);
+    modelingDebugLineSync(`[DDL] chars=${ddlText.length}`);
+    modelingDebugLineSync('[AI][Prompt] parse-chat-to-samples');
+    modelingDebugLineSync(prompt);
+
+    const withTimeout = async (promise, ms) => {
+      let tid = null;
+      const timeout = new Promise((_, rej) => {
+        tid = setTimeout(() => rej(new Error(`Vertex AI timeout after ${ms}ms`)), ms);
+      });
+      try {
+        return await Promise.race([promise, timeout]);
+      } finally {
+        if (tid) clearTimeout(tid);
+      }
+    };
+
+    // AI-First：只要 DDL 非空，必须优先发起 Vertex；只有超时/异常才进入 regex fallback
+    const out =
+      ddlText.length > 0
+        ? await withTimeout(generateWithModelList({ modelNames: modelList, prompt, retries: 1 }), 25000)
+        : await generateWithModelList({ modelNames: modelList, prompt, retries: 1 });
     auditLineSync('[Audit][B] AI Raw Output: parse-chat-to-samples');
     auditLineSync(out.ok ? String(out.text || '') : `[Audit][B] FAILED: ${String(out.error?.message || '')}`);
+    modelingDebugLineSync('[AI][Raw]');
+    modelingDebugLineSync(out.ok ? String(out.text || '') : `[AI_CALL_FAILED] ${String(out.error?.message || '')}`);
     if (!out.ok) {
       auditLineSync('[Audit][Fallback] Gemini failed; use local regex fallback');
       let dimensionSamples = localFallback(text);
       if (ddlText) dimensionSamples = fillCoordinatesFromDdl(dimensionSamples);
+      modelingDebugLineSync('[Final][FallbackRegex]');
+      modelingDebugLineSync(JSON.stringify(dimensionSamples, null, 2));
+      modelingDebugLineSync(`[${new Date().toISOString()}] ===== parse-chat-to-samples END (fallback) =====`);
       auditLineSync(JSON.stringify({ fallback: true, dimensionSamples }, null, 2));
       auditLineSync(`[Audit] ===== Chat-to-Config 结束(本地兜底) ${new Date().toISOString()} =====`);
       return res.json({ ok: true, dimensionSamples, fallback: true });
@@ -1346,6 +1491,9 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
       auditLineSync('[Audit][Fallback] AI JSON invalid; use local regex fallback');
       let dimensionSamples = localFallback(text);
       if (ddlText) dimensionSamples = fillCoordinatesFromDdl(dimensionSamples);
+      modelingDebugLineSync('[Final][FallbackJsonInvalid]');
+      modelingDebugLineSync(JSON.stringify(dimensionSamples, null, 2));
+      modelingDebugLineSync(`[${new Date().toISOString()}] ===== parse-chat-to-samples END (fallback-json-invalid) =====`);
       auditLineSync(JSON.stringify({ fallback: true, dimensionSamples }, null, 2));
       auditLineSync(`[Audit] ===== Chat-to-Config 结束(本地兜底) ${new Date().toISOString()} =====`);
       return res.json({ ok: true, dimensionSamples, fallback: true });
@@ -1452,6 +1600,10 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
     }
     if (ddlText) fillCoordinatesFromDdl(normalized);
 
+    modelingDebugLineSync('[Final][AI]');
+    modelingDebugLineSync(JSON.stringify(normalized, null, 2));
+    modelingDebugLineSync(`[${new Date().toISOString()}] ===== parse-chat-to-samples END (ai) =====`);
+
     auditLineSync(`[Audit] ===== Chat-to-Config 结束 ${new Date().toISOString()} =====`);
     return res.json({ ok: true, dimensionSamples: normalized, fallback: false });
   } catch (e) {
@@ -1460,6 +1612,9 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
     // 兜底：任何异常都走本地解析，保证前端可用
     let dimensionSamples = localFallback(text);
     if (ddlText) dimensionSamples = fillCoordinatesFromDdl(dimensionSamples);
+    modelingDebugLineSync('[Final][ExceptionFallback]');
+    modelingDebugLineSync(JSON.stringify(dimensionSamples, null, 2));
+    modelingDebugLineSync(`[${new Date().toISOString()}] ===== parse-chat-to-samples END (exception-fallback) =====`);
     auditLineSync('[Audit][Fallback] Exception; use local regex fallback');
     auditLineSync(JSON.stringify({ fallback: true, error: e instanceof Error ? e.message : String(e), dimensionSamples }, null, 2));
     auditLineSync(`[Audit] ===== Chat-to-Config 结束(本地兜底) ${new Date().toISOString()} =====`);
@@ -1488,7 +1643,7 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
       : null;
   const goldenExpectedMap = buildGoldenExpectedMap({ goldenBlocks, goldenSamples, reference });
   if (!sqlText.trim()) return res.status(400).json({ ok: false, error: 'sqlText is required' });
-  if (!vertexModel) return res.status(500).json({ ok: false, error: 'Vertex AI is not initialized' });
+  if (!vertexAI) return res.status(500).json({ ok: false, error: 'Vertex AI is not initialized' });
 
   try {
     // 新一轮 AI 建模开始：清空上一轮引擎 Trace 日志，便于用户直接看 engine.log
@@ -1748,17 +1903,12 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
         partial: { smartSuggestions: [], joinPathSuggestions: [], concatMappingSuggestions: [], dims: {} },
       });
 
-      const latestDirForBacktest = await getLatestDataTablesDir();
+      // 回测数据源：必须使用 Sandbox（用户刚上传的样本）
+      const latestDirForBacktest = DIRS.sandbox;
       let smartSuggestions = [];
       let joinPathSuggestions = [];
       let concatMappingSuggestions = [];
       const dims = {};
-
-      const buildTableNameIndexLike = (fileName) => {
-        const base = path.basename(String(fileName || ''));
-        const noExt = base.replace(/\.(xlsx|xls)$/i, '');
-        return noExt.replace(/^\d{8}_/, '');
-      };
 
       const traceJoinPathOnOneRow = async ({ dimKey, pathArr, expectedValue, smartSuggestionsForMain }) => {
         try {
@@ -1772,7 +1922,7 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
             aiTraceLineSync(`[${dimKey}] [现场 C] PATH_BROKEN: cannot infer main table from smartSuggestions`);
             return;
           }
-          const mainTableName = buildTableNameIndexLike(main.fileName);
+          const mainTableName = getLogicalTableName(main.fileName);
           const statusCol = (smartSuggestionsForMain || []).find((x) => String(x?.standardKey || '').trim() === 'status')?.sourceField || '';
           const rowsCandidate = main.rows || [];
           const rowsToScan = statusCol ? rowsCandidate.filter((r) => isTruthyActiveStatus(r?.[statusCol])) : rowsCandidate;
@@ -2276,7 +2426,8 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
       joinPathSuggestions = heuristic.joinPathSuggestions || [];
     }
 
-    const latestDirForBacktest = await getLatestDataTablesDir();
+    // 回测数据源：必须使用 Sandbox（用户刚上传的样本）
+    const latestDirForBacktest = DIRS.sandbox;
     auditLineSync('[Audit][C] Join Execution Trace: start backtest on latest XLSX');
     auditLineSync(JSON.stringify({ latestDirForBacktest, joinPathCount: joinPathSuggestions.length }, null, 2));
     const validatedFirst = await validateJoinPathSuggestionsWithGoldenXlsx({
