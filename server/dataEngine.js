@@ -792,16 +792,21 @@ function readSheetRows(fullPath) {
     return { headers, rows };
   }
 
-  // 非强制 DDL：仍采用“空行下探 + 字符总量最高”策略
-  let bestScore = -1;
-  const scanN = Math.min(Array.isArray(grid) ? grid.length : 0, 50);
-  for (let i = 0; i < scanN; i++) {
-    const r = grid[i];
-    if (rowAllEmpty(r)) continue;
-    const score = rowCharScore(r);
-    if (score > bestScore) {
-      bestScore = score;
-      headerRowIndex = i;
+  // 若第一行已被判定为表头：必须锁定为 header（禁止再用“字符总量最高”把数据行误判为 header）
+  if (firstLooksLikeHeader) {
+    headerRowIndex = 0;
+  } else {
+    // 非强制 DDL：采用“空行下探 + 字符总量最高”策略（仅在第一行不像 header 时启用）
+    let bestScore = -1;
+    const scanN = Math.min(Array.isArray(grid) ? grid.length : 0, 50);
+    for (let i = 0; i < scanN; i++) {
+      const r = grid[i];
+      if (rowAllEmpty(r)) continue;
+      const score = rowCharScore(r);
+      if (score > bestScore) {
+        bestScore = score;
+        headerRowIndex = i;
+      }
     }
   }
 
