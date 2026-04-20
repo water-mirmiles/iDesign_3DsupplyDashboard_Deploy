@@ -12,11 +12,17 @@ import {
   aggregateProjectData,
   buildStandardMap,
   auditLineSync,
+  aiTraceLineSync,
+  clearAiTraceLogSync,
   clearEngineAuditLogSync,
   clearEngineLogSync,
+  inferMainTableFromSmartSuggestions,
+  isTruthyActiveStatus,
+  parseJoinPathFromConfig,
   persistFinalDashboardData,
   processAllData,
   readAllFilesFromFolder,
+  resolveRecursiveValue,
   resolveFirstActiveRowFromFolder,
   validateJoinPathSuggestionsWithGoldenXlsx,
 } from './dataEngine.js';
@@ -1535,6 +1541,7 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
 // Gemini AI 解析多表 SQL：返回 tables + smartSuggestions
 app.post('/api/ai-parse-multi-sql', async (req, res) => {
   const sqlText = String(req.body?.sqlText || '');
+  const conversationalInput = String(req.body?.conversationalInput || req.body?.chat || '').trim();
   const reference = req.body?.reference || null;
   const masterTable = typeof req.body?.masterTable === 'string' ? String(req.body.masterTable).trim() : '';
   const goldenByDimRaw = req.body?.dimensionSamples ?? req.body?.goldenByDimension;
@@ -1558,6 +1565,8 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
     // 新一轮 AI 建模开始：清空上一轮引擎 Trace 日志，便于用户直接看 engine.log
     clearEngineLogSync();
     clearEngineAuditLogSync();
+    clearAiTraceLogSync();
+    aiTraceLineSync('[Step 1] 从对话中提取业务实体...');
     auditLineSync(`[Audit] ===== AI 逻辑建模开始 ${new Date().toISOString()} =====`);
     auditLineSync('[Audit][A] Input Audit: /api/ai-parse-multi-sql request body');
     try {
@@ -1577,6 +1586,100 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
     } catch {
       auditLineSync('[Audit][A] Input Audit JSON stringify failed');
     }
+    // 若用户传了对话文本：先解析对话为 dimensionSamples，并作为建模种子喂给后续推导
+    if (conversationalInput) {
+      aiTraceLineSync('[Step 1] conversationalInput detected; parsing chat-to-samples');
+      try {
+        const emptyDim = () => ({ targetGoal: '', rows: [] });
+        const makeSegmentsRow = (value, notes = '') => ({
+          id: `chat_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+          notes,
+          segments: [{ tableName: '', fieldName: '', value: String(value ?? '') }],
+        });
+        const s = String(conversationalInput || '');
+        const dimensionSamples = {
+          styleCode: emptyDim(),
+          brand: emptyDim(),
+          lastCode: emptyDim(),
+          soleCode: emptyDim(),
+          colorCode: emptyDim(),
+          materialCode: emptyDim(),
+          status: emptyDim(),
+        };
+
+        // styleCode: SBOX26008M / 任意大写字母+数字+字母（保守）
+        const style = s.match(/\b[A-Z]{2,10}\d{3,10}[A-Z]?\b/);
+        if (style) {
+          dimensionSamples.styleCode.rows.push(makeSegmentsRow(style[0], '从描述中提取：款号/StyleCode'));
+          dimensionSamples.styleCode.targetGoal = style[0];
+        }
+
+        // lastCode: L-xxxx（示例：L-B26097M）
+        const last = s.match(/\bL-[A-Za-z0-9-]{3,30}\b/);
+        if (last) {
+          dimensionSamples.lastCode.rows.push(makeSegmentsRow(last[0], '从描述中提取：楦号/lastCode'));
+          dimensionSamples.lastCode.targetGoal = last[0];
+        }
+
+        // soleCode: S-xxxx / SOLE- / H- (粗略)
+        const sole = s.match(/\b(?:S-|SOLE-|H-)[A-Za-z0-9-]{3,30}\b/);
+        if (sole) {
+          dimensionSamples.soleCode.rows.push(makeSegmentsRow(sole[0], '从描述中提取：底号/soleCode'));
+          dimensionSamples.soleCode.targetGoal = sole[0];
+        }
+
+        // status: 生效/有效/active
+        if (/(生效|有效|active|enabled)/i.test(s)) {
+          const v = /(生效|有效)/.test(s) ? '生效' : 'active';
+          dimensionSamples.status.rows.push(makeSegmentsRow(v, '从描述中提取：状态'));
+          dimensionSamples.status.targetGoal = v;
+        }
+
+        // materialCode: LT04 或 LT + 04 拼接
+        const matDirect = s.match(/\bLT\d{2}\b/i);
+        if (matDirect) {
+          const v = matDirect[0].toUpperCase();
+          dimensionSamples.materialCode.rows.push(makeSegmentsRow(v, '从描述中提取：材质编码'));
+          dimensionSamples.materialCode.targetGoal = v;
+        } else {
+          const matParts = s.match(/\b(LT)\b[\s\S]{0,12}\b(0?\d{1,2})\b/i);
+          if (matParts) {
+            const p1 = String(matParts[1]).toUpperCase();
+            const p2 = String(matParts[2]).padStart(2, '0');
+            dimensionSamples.materialCode.rows.push(makeSegmentsRow(p1, '拼接段1：父/前缀（例如 LT）'));
+            dimensionSamples.materialCode.rows.push(makeSegmentsRow(p2, '拼接段2：子/后缀（例如 04）'));
+            dimensionSamples.materialCode.targetGoal = `${p1}${p2}`;
+          }
+        }
+
+        // brand: “品牌 X/brand X”
+        const brand =
+          s.match(/品牌[:：\s]*([A-Za-z][A-Za-z\s]{1,40})/i) ||
+          s.match(/\bbrand[:：\s]*([A-Za-z][A-Za-z\s]{1,40})/i);
+        if (brand && brand[1]) {
+          const v = String(brand[1]).trim().replace(/\s+/g, ' ');
+          dimensionSamples.brand.rows.push(makeSegmentsRow(v, '从描述中提取：品牌名称'));
+          dimensionSamples.brand.targetGoal = v;
+        }
+
+        // colorCode: “颜色 X/color X”
+        const color = s.match(/颜色[:：\s]*([A-Za-z0-9-]{2,20})/i) || s.match(/\bcolor[:：\s]*([A-Za-z0-9-]{2,20})/i);
+        if (color && color[1]) {
+          const v = String(color[1]).trim();
+          dimensionSamples.colorCode.rows.push(makeSegmentsRow(v, '从描述中提取：颜色编码/名称'));
+          dimensionSamples.colorCode.targetGoal = v;
+        }
+
+        goldenBlocks = normalizeGoldenByDimensionForAi(dimensionSamples);
+        goldenSamples = expandGoldenBlocksToFlatSamples(goldenBlocks);
+        aiTraceLineSync('[Step 1] chat parsed (local fallback) and injected into modeling seed');
+      } catch (e) {
+        aiTraceLineSync(`[Step 1] chat-to-samples exception; continue: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+
+    aiTraceLineSync('[Step 2] 开始根据实体推导 SQL 关联路径...');
+
     // 1) 正则拆分每个 CREATE TABLE
     const ddls = splitCreateTableStatements(sqlText);
     if (!ddls.length) return res.status(400).json({ ok: false, error: 'No CREATE TABLE statements found' });
@@ -1722,6 +1825,60 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
       let concatMappingSuggestions = [];
       const dims = {};
 
+      const buildTableNameIndexLike = (fileName) => {
+        const base = path.basename(String(fileName || ''));
+        const noExt = base.replace(/\.(xlsx|xls)$/i, '');
+        return noExt.replace(/^\d{8}_/, '');
+      };
+
+      const traceJoinPathOnOneRow = async ({ dimKey, pathArr, expectedValue, smartSuggestionsForMain }) => {
+        try {
+          const { xlsxTables, tablesMap } = await readAllFilesFromFolder(latestDirForBacktest);
+          if (!tablesMap || !tablesMap.size) {
+            aiTraceLineSync(`[${dimKey}] [现场 C] PATH_BROKEN: tablesMap empty`);
+            return;
+          }
+          const main = inferMainTableFromSmartSuggestions(xlsxTables, smartSuggestionsForMain || []);
+          if (!main) {
+            aiTraceLineSync(`[${dimKey}] [现场 C] PATH_BROKEN: cannot infer main table from smartSuggestions`);
+            return;
+          }
+          const mainTableName = buildTableNameIndexLike(main.fileName);
+          const statusCol = (smartSuggestionsForMain || []).find((x) => String(x?.standardKey || '').trim() === 'status')?.sourceField || '';
+          const rowsCandidate = main.rows || [];
+          const rowsToScan = statusCol ? rowsCandidate.filter((r) => isTruthyActiveStatus(r?.[statusCol])) : rowsCandidate;
+          const row = rowsToScan[0] || rowsCandidate[0] || null;
+          if (!row) {
+            aiTraceLineSync(`[${dimKey}] [现场 C] PATH_BROKEN: main table has no rows`);
+            return;
+          }
+          const structured = parseJoinPathFromConfig({ joinPath: pathArr });
+          if (!structured?.length) {
+            aiTraceLineSync(`[${dimKey}] [现场 C] PATH_BROKEN: joinPath cannot be parsed`);
+            return;
+          }
+          aiTraceLineSync(`[现场 C] ===== ${dimKey} Step-by-Step Execution =====`);
+          const got = resolveRecursiveValue({
+            mainRow: row,
+            mainTableName,
+            joinPath: structured,
+            tablesMap,
+            trace: true,
+            traceLabel: dimKey,
+            standardKey: dimKey,
+          });
+          aiTraceLineSync(`[现场 D] ${dimKey} 真实抓取值 = ${JSON.stringify(String(got || ''))}`);
+          aiTraceLineSync(`[现场 D] ${dimKey} 用户期望值 = ${JSON.stringify(String(expectedValue || ''))}`);
+          if (String(expectedValue || '').trim() && String(got || '').trim() === String(expectedValue || '').trim()) {
+            aiTraceLineSync(`[现场 D] ${dimKey} Final Verdict: OK`);
+          } else {
+            aiTraceLineSync(`[现场 D] ${dimKey} Final Verdict: VALUE_MISMATCH`);
+          }
+        } catch (e) {
+          aiTraceLineSync(`[${dimKey}] [现场 C] EXCEPTION: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      };
+
       for (let di = 0; di < dimensionKeys.length; di++) {
         const dimKey = dimensionKeys[di];
         const expected = goldenExpectedMap.get(dimKey) || '';
@@ -1753,9 +1910,13 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
           const prompt = buildSingleDimensionPrompt({ dimKey, dimExpected: expected });
           auditLineSync(`[Audit][A] Prompt Snapshot (single-dim) dim=${dimKey} attempt=${attempt}`);
           auditLineSync(prompt);
+          aiTraceLineSync(`[现场 A] ===== dim=${dimKey} attempt=${attempt} Prompt Audit =====`);
+          aiTraceLineSync(prompt);
           const out = await generateWithModelList({ modelNames: modelList, prompt, retries: 2 });
           auditLineSync(`[Audit][B] AI Raw Output (single-dim) dim=${dimKey} attempt=${attempt}`);
           auditLineSync(out.ok ? String(out.text || '') : `[Audit][B] FAILED: ${String(out.error?.message || '')}`);
+          aiTraceLineSync(`[现场 B] ===== dim=${dimKey} attempt=${attempt} Raw AI Output =====`);
+          aiTraceLineSync(out.ok ? String(out.text || '') : `[AI_CALL_FAILED] ${String(out.error?.message || '')}`);
           if (!out.ok) {
             lastErr = String(out.error?.message || 'AI failed');
             continue;
@@ -1777,6 +1938,7 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
             })
             .filter(Boolean);
 
+          aiTraceLineSync('[Step 3] 物理回测验证...');
           const validated = await validateJoinPathSuggestionsWithGoldenXlsx({
             joinPathSuggestions: jpOne,
             goldenByStandardKey: goldenExpectedMap,
@@ -1785,6 +1947,12 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
           });
 
           if (validated && validated.length) {
+            // 现场 C/D：对通过的路径跑一次逐步 trace（只取第一条）
+            const v0 = validated[0];
+            const rawPathArr = Array.isArray(v0?.path) ? v0.path : [];
+            if (rawPathArr.length >= 2) {
+              await traceJoinPathOnOneRow({ dimKey, pathArr: rawPathArr, expectedValue: expected, smartSuggestionsForMain: ssRaw });
+            }
             const merged = new Map(joinPathSuggestions.map((x) => [x.targetStandardKey, x]));
             for (const v of validated) merged.set(v.targetStandardKey, v);
             joinPathSuggestions = Array.from(merged.values());
@@ -1807,6 +1975,7 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
 
           lastErr = `Join backtest failed (expected=${String(expected || '')})`;
           auditLineSync(`[Audit][D] FAIL dim=${dimKey} attempt=${attempt}: ${lastErr}`);
+          aiTraceLineSync(`[现场 D] ${dimKey} Final Verdict: PATH_BROKEN / VALUE_MISMATCH (backtest failed)`);
         }
 
         if (!success) {
@@ -2263,6 +2432,19 @@ app.get('/api/engine-audit-log', async (_req, res) => {
     return res.json({ ok: true, text });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e instanceof Error ? e.message : 'read audit log failed' });
+  }
+});
+
+// 深度审计：AI 建模全生命周期日志（Prompt/Raw/Step-by-step/Verdict）
+app.get('/api/ai-trace-log', async (_req, res) => {
+  await ensureStorageDirs();
+  try {
+    const p = path.join(__dirname, 'storage', 'ai_trace.log');
+    if (!(await fse.pathExists(p))) return res.status(404).json({ ok: false, error: 'ai_trace.log not found' });
+    const text = await fse.readFile(p, 'utf8');
+    return res.json({ ok: true, text });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e instanceof Error ? e.message : 'read ai trace log failed' });
   }
 });
 

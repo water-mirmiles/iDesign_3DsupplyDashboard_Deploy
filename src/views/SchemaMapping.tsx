@@ -1122,6 +1122,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
       const payload = {
         sqlText: ddlText,
         masterTable: masterTable || undefined,
+        conversationalInput: conversationalInput || undefined,
         // AI 仅消费 legacy 结构（targetGoal/rows/segments）；dimensionSamples 用于草稿持久化
         goldenByDimension: serializeDimensionSamplesForAiLegacy(dimensionSamples),
         // 兼容旧 Prompt：扁平化样本（每一行保留用户选定的 tableName/fieldName）
@@ -1601,9 +1602,9 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                       }
                     }}
                     className="px-4 py-2 text-[12px] font-semibold rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
-                    title="解析业务描述 → 自动预填配置 → 直接执行 AI 智能建模"
+                    title="一键：对话解析 → 建模推导 → 物理回测 → Step4 实时变绿"
                   >
-                    {chatToConfigBusy ? 'AI 智能建模中…' : 'AI 智能建模'}
+                    {chatToConfigBusy ? '一键全自动建模中…' : '一键全自动建模 (AI Auto-Modeling)'}
                   </button>
                   <button
                     type="button"
@@ -2015,54 +2016,6 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
         </div>
         </div>
 
-        {/* Step 3: AI 逻辑建模 */}
-        <div className="bg-slate-950 border border-slate-900 rounded-xl shadow-sm overflow-hidden">
-          <div className="p-3">
-            <button
-              type="button"
-              disabled={busy}
-              onClick={async () => {
-                setHasAttemptedAuth(true);
-                setError(null);
-                if (!ddlText.trim()) return setError('请先粘贴 SQL/DDL');
-                if (!masterTable.trim()) return setError('请先选择业务主表（Master Table）');
-                const ai = await handleAiLogicModeling();
-                if (ai.ok === false) return;
-                // 分析后：严禁清空输入；仅做一次草稿落盘（可选但强烈建议）
-                await saveSchemaDraft();
-              }}
-              className="w-full py-4 rounded-xl font-semibold tracking-wide shadow-sm bg-white text-slate-950 hover:bg-slate-100 disabled:opacity-60"
-              title="SQL + 动态样本配置 → Gemini 推导主表 Join 链路 → 回填 7 维结果"
-            >
-              <div className="flex items-center justify-center gap-3">
-                <Sparkles className="w-5 h-5" />
-                <span className="text-base lg:text-lg">Step 3 · 执行 AI 逻辑建模</span>
-              </div>
-              <div className="mt-1 text-[11px] text-slate-600">SQL → 动态样本配置 → AI 链路推导 → 下方检查与应用</div>
-            </button>
-
-            {(isAiModeling || aiStatusText || aiQueueHint || aiBusy503) && (
-              <div className="mt-2 text-[11px] text-slate-200">
-                {isAiModeling ? (aiStatusText || 'AI 正在解析并建模…') : null}
-                {aiProgress.total > 0 && isAiModeling && (
-                  <div className="mt-1 flex items-center gap-2">
-                    <div className="flex-1 h-2 rounded bg-slate-800 overflow-hidden">
-                      <div
-                        className="h-2 bg-indigo-500"
-                        style={{ width: `${Math.min(100, Math.round((aiProgress.done / Math.max(1, aiProgress.total)) * 100))}%` }}
-                      />
-                    </div>
-                    <div className="text-[10px] font-mono text-slate-300">
-                      {Math.min(aiProgress.done + 1, aiProgress.total)}/{aiProgress.total}
-                    </div>
-                  </div>
-                )}
-                {(aiBusy503 || aiQueueHint) && !isAiModeling && <div className="text-amber-200">AI 曾排队或繁忙；可再次点击重试。</div>}
-              </div>
-            )}
-          </div>
-        </div>
-
         {/* Step 4: 检查与应用（整页随内容增高，由 Layout 主栏滚动） */}
         <div className="grid grid-cols-12 gap-2 w-full">
           <div className="col-span-12 lg:col-span-3 flex flex-col bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
@@ -2167,6 +2120,36 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                 );
               })}
             </div>
+
+            <button
+              type="button"
+              disabled={busy}
+              onClick={async () => {
+                try {
+                  const resp = await fetch(`${API_BASE}/api/ai-trace-log`);
+                  const json = (await resp.json().catch(() => null)) as any;
+                  if (!resp.ok || !json?.ok) throw new Error(json?.error || `HTTP ${resp.status}`);
+                  const text = String(json.text || '');
+                  const w = window.open('', '_blank');
+                  if (!w) return;
+                  w.document.open();
+                  w.document.write(
+                    `<pre style="white-space:pre-wrap;word-break:break-word;font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;font-size:12px;margin:16px;">${text
+                      .replace(/&/g, '&amp;')
+                      .replace(/</g, '&lt;')
+                      .replace(/>/g, '&gt;')}</pre>`
+                  );
+                  w.document.close();
+                } catch (e) {
+                  // eslint-disable-next-line no-console
+                  console.warn('[ai-trace-log] open failed', e);
+                }
+              }}
+              className="w-full mt-1 px-3 py-2 text-[11px] font-semibold rounded-lg border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+              title="打开 server/storage/ai_trace.log（Prompt/Raw/Join Trace/Verdict）"
+            >
+              打开深度审计日志 (Debug Info)
+            </button>
           </div>
 
           <div className="col-span-12 lg:col-span-9 flex flex-col bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">

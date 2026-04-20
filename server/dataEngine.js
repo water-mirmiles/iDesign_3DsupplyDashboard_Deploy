@@ -67,6 +67,12 @@ function engineAuditLogPath() {
   return path.join(__dirname, 'storage', 'engine_audit.log');
 }
 
+function aiTraceLogPath() {
+  const __filename = fileURLToPath(import.meta.url);
+  const __dirname = path.dirname(__filename);
+  return path.join(__dirname, 'storage', 'ai_trace.log');
+}
+
 function appendEngineLogSync(line) {
   try {
     const p = engineLogPath();
@@ -80,6 +86,16 @@ function appendEngineLogSync(line) {
 function appendEngineAuditLogSync(line) {
   try {
     const p = engineAuditLogPath();
+    fse.ensureDirSync(path.dirname(p));
+    fse.appendFileSync(p, `${String(line ?? '')}\n`, { encoding: 'utf8' });
+  } catch {
+    // ignore
+  }
+}
+
+function appendAiTraceLogSync(line) {
+  try {
+    const p = aiTraceLogPath();
     fse.ensureDirSync(path.dirname(p));
     fse.appendFileSync(p, `${String(line ?? '')}\n`, { encoding: 'utf8' });
   } catch {
@@ -107,6 +123,22 @@ export function clearEngineAuditLogSync() {
   }
 }
 
+export function clearAiTraceLogSync() {
+  try {
+    const p = aiTraceLogPath();
+    fse.ensureDirSync(path.dirname(p));
+    fse.writeFileSync(p, '', { encoding: 'utf8' });
+  } catch {
+    // ignore
+  }
+}
+
+export function aiTraceLineSync(line) {
+  const out = String(line ?? '');
+  if (!out) return;
+  appendAiTraceLogSync(out);
+}
+
 export function auditLineSync(line) {
   const out = String(line ?? '');
   if (!out) return;
@@ -126,6 +158,7 @@ function traceJoin(enabled, message) {
   console.log(line);
   appendEngineLogSync(line);
   appendEngineAuditLogSync(line);
+  appendAiTraceLogSync(line);
 }
 
 function traceLine(line) {
@@ -136,6 +169,7 @@ function traceLine(line) {
   if (out.startsWith('[Trace]')) {
     appendEngineLogSync(out);
     appendEngineAuditLogSync(out);
+    appendAiTraceLogSync(out);
   }
 }
 
