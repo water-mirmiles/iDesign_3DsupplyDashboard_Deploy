@@ -2038,7 +2038,7 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
         '【重要线索：JSON 数组成员关联（专攻 soleCode）】',
         '请特别注意 ods_pdm_pdm_base_mold_df 表：它与主表的关联不是传统 ID 对应。',
         '关联方式：主表的款号 style_wms（例如 SBOX26008M）被包含在维表 ods_pdm_pdm_base_mold_df.link_product_number 的 JSON 数组字符串中。',
-        '因此 soleCode 的 joinPath 允许使用 targetField="link_product_number"（即“ARRAY_CONTAINS”语义匹配），然后在命中的那一行取 valueField="code" 作为最终底号。',
+        '因此 soleCode 必须输出一种“包含关系”路径：请在 joinPathSuggestions 的 soleCode 条目里额外输出 operator="ARRAY_CONTAINS"，并在 hop 中使用 targetField="link_product_number" 表达该包含匹配；命中后在终端段取 valueField="code" 作为最终底号。',
         '',
         goldenSection,
         '',
@@ -2975,51 +2975,80 @@ app.post('/api/save-schema-draft', async (req, res) => {
 
 async function handleSandboxUploadXlsx(req, res) {
   await ensureStorageDirs();
-  // 物理级日志：请求入口
-  // eslint-disable-next-line no-console
-  console.log('--- 收到上传请求 ---');
-  const files = req.files;
-  if (!files || !Array.isArray(files) || files.length === 0) {
-    // eslint-disable-next-line no-console
-    console.log('文件名:', '未检测到文件');
-    return res.status(400).json({ ok: false, error: 'No files uploaded' });
-  }
-  // eslint-disable-next-line no-console
-  console.log('文件名:', files?.[0]?.originalname || '未检测到文件');
-  const out = [];
-  for (const f of files) {
-    if (!isExcelFileName(f.originalname)) continue;
-    const fullPath = path.join(f.destination, f.filename);
-    try {
-      const checkFile = fs.existsSync(fullPath);
-      // eslint-disable-next-line no-console
-      console.log('物理写入结果:', checkFile ? '✅ 成功' : '❌ 失败', '=>', fullPath);
-      const wb = XLSX.readFile(fullPath, { cellText: false, cellDates: true });
-      const sheet = readFirstSheet(wb);
-      if (!sheet) {
-        out.push({ storedName: f.filename, originalName: f.originalname, headers: [], firstRow: {} });
-        continue;
-      }
-      const headers = getSheetHeaders(sheet);
-      const rows = XLSX.utils.sheet_to_json(sheet, { header: headers, raw: false, defval: '', range: 1 });
-      const firstRow = rows[0] && typeof rows[0] === 'object' ? rows[0] : {};
-      out.push({ storedName: f.filename, originalName: f.originalname, headers, firstRow });
-    } catch (e) {
-      out.push({ storedName: f.filename, originalName: f.originalname, error: e instanceof Error ? e.message : 'read failed' });
-    }
-  }
-  // 强制写入检查：保存后立刻物理扫描一次，确认当前真实文件数
   try {
-    const sandboxDir = path.join(__dirname, 'storage', 'sandbox');
-    const entries = fs.readdirSync(sandboxDir, { withFileTypes: true });
-    const excel = entries.filter((e) => e.isFile()).map((e) => e.name).filter((n) => isExcelFileName(n));
+    // 物理级日志：请求入口
     // eslint-disable-next-line no-console
-    console.log(`[Storage] upload-sandbox write-check: sandbox now has ${excel.length} excel files`);
+    console.log('--- [Sandbox] 物理层收到文件流 ---');
+
+    const files = req.files;
+    if (!files || !Array.isArray(files) || files.length === 0) {
+      // eslint-disable-next-line no-console
+      console.log('[Sandbox] 文件名: 未检测到文件');
+      return res.status(400).json({ ok: false, error: 'No files uploaded' });
+    }
+
+    const out = [];
+    for (const f of files) {
+      const originalName = String(f?.originalname || '');
+      if (!isExcelFileName(originalName)) continue;
+
+      // 重命名保护：用逻辑表名落盘（避免被用户随意命名导致读表失败）
+      const ext = path.extname(originalName) || '.xlsx';
+      const logical = getLogicalTableName(originalName);
+      const safeLogical = String(logical || 'sample').replace(/[^\w.\-]+/g, '_');
+      const targetName = `${safeLogical}${ext.toLowerCase()}`;
+
+      const srcPath = path.join(f.destination, f.filename);
+      const dstPath = path.join(DIRS.sandbox, targetName);
+
+      // eslint-disable-next-line no-console
+      console.log('[Sandbox] 文件名:', originalName, '=>', targetName);
+
+      try {
+        const checkFile = fs.existsSync(srcPath);
+        // eslint-disable-next-line no-console
+        console.log('[Sandbox] 物理写入结果:', checkFile ? '✅ 成功' : '❌ 失败', '=>', srcPath);
+        if (!checkFile) {
+          out.push({ storedName: targetName, originalName, ok: false, error: 'file not written' });
+          continue;
+        }
+
+        if (srcPath !== dstPath) {
+          await fse.move(srcPath, dstPath, { overwrite: true });
+        }
+
+        const wb = XLSX.readFile(dstPath, { cellText: false, cellDates: true });
+        const sheet = readFirstSheet(wb);
+        if (!sheet) {
+          out.push({ storedName: targetName, originalName, ok: true, headers: [], firstRow: {} });
+          continue;
+        }
+        const headers = getSheetHeaders(sheet);
+        const rows = XLSX.utils.sheet_to_json(sheet, { header: headers, raw: false, defval: '', range: 1 });
+        const firstRow = rows[0] && typeof rows[0] === 'object' ? rows[0] : {};
+        out.push({ storedName: targetName, originalName, ok: true, headers, firstRow });
+      } catch (e) {
+        out.push({ storedName: targetName, originalName, ok: false, error: e instanceof Error ? e.message : 'write/read failed' });
+      }
+    }
+
+    // 强制写入检查：保存后立刻物理扫描一次，确认当前真实文件数
+    try {
+      const entries = fs.readdirSync(DIRS.sandbox, { withFileTypes: true });
+      const excel = entries.filter((e) => e.isFile()).map((e) => e.name).filter((n) => isExcelFileName(n));
+      // eslint-disable-next-line no-console
+      console.log(`[Storage] upload-sandbox write-check: sandbox now has ${excel.length} excel files`);
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.warn('[Storage] upload-sandbox write-check failed', e instanceof Error ? e.message : String(e));
+    }
+
+    return res.json({ ok: true, sandboxDir: 'storage/sandbox', files: out });
   } catch (e) {
     // eslint-disable-next-line no-console
-    console.warn('[Storage] upload-sandbox write-check failed', e instanceof Error ? e.message : String(e));
+    console.error('[Sandbox] upload handler crashed', e);
+    return res.status(500).json({ ok: false, error: e instanceof Error ? e.message : 'upload crashed' });
   }
-  return res.json({ ok: true, sandboxDir: 'storage/sandbox', files: out });
 }
 
 // 上传逻辑沙盒样本 XLSX（专用接口；强制存入 storage/sandbox；保留原文件名便于物理对账）
@@ -3317,7 +3346,7 @@ async function start() {
   } catch {
     // ignore
   }
-  app.listen(port, () => {
+  const server = app.listen(port, () => {
     // eslint-disable-next-line no-console
     console.clear();
     // eslint-disable-next-line no-console
@@ -3345,6 +3374,14 @@ async function start() {
     console.log('[vertex] gcp-key.json exists:', fse.existsSync(vertexKeyPath) ? 'Yes' : 'No');
     // eslint-disable-next-line no-console
     console.log(`[server] assets lasts=${cachedAssets.lasts.length} soles=${cachedAssets.soles.length}`);
+  });
+  server.on('error', (err) => {
+    // eslint-disable-next-line no-console
+    console.error('[server] listen failed:', err?.message || err);
+    if (String(err?.code || '') === 'EADDRINUSE') {
+      // eslint-disable-next-line no-console
+      console.error(`[server] 端口 ${port} 被占用。请执行: npx kill-port ${port}`);
+    }
   });
 }
 

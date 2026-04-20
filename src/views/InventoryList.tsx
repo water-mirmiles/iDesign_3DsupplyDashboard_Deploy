@@ -160,6 +160,7 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType }: PreviewModalPro
 export default function InventoryList() {
   const [previewModal, setPreviewModal] = useState<{isOpen: boolean, assetCode: string, type: 'last'|'sole'}>({ isOpen: false, assetCode: '', type: 'last' });
   const [has3DFilter, setHas3DFilter] = useState<string>('all');
+  const [brandFilter, setBrandFilter] = useState<string>('all');
   const [items, setItems] = useState<InventoryItem[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -192,11 +193,22 @@ export default function InventoryList() {
     };
   }, []);
 
+  const brandOptions = useMemo(() => {
+    const set = new Set<string>();
+    for (const it of items) {
+      const b = (it.brand || '').trim();
+      if (b) set.add(b);
+    }
+    return Array.from(set.values()).sort((a, b) => a.localeCompare(b));
+  }, [items]);
+
   const filteredItems = useMemo(() => {
-    if (has3DFilter === 'all') return items;
-    if (has3DFilter === 'yes') return items.filter((x) => x.lastStatus === 'matched' || x.soleStatus === 'matched');
-    return items.filter((x) => x.lastStatus !== 'matched' && x.soleStatus !== 'matched');
-  }, [has3DFilter, items]);
+    let out = items;
+    if (brandFilter !== 'all') out = out.filter((x) => (x.brand || '').trim() === brandFilter);
+    if (has3DFilter === 'all') return out;
+    if (has3DFilter === 'yes') return out.filter((x) => x.lastStatus === 'matched' || x.soleStatus === 'matched');
+    return out.filter((x) => x.lastStatus !== 'matched' && x.soleStatus !== 'matched');
+  }, [brandFilter, has3DFilter, items]);
 
   return (
     <div className="space-y-6 animate-in fade-in duration-500 pb-10">
@@ -232,10 +244,17 @@ export default function InventoryList() {
             
             {/* Brand Filter Mock */}
             <div className="relative">
-              <select className="appearance-none pl-3 pr-8 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white text-slate-600 font-medium">
+              <select
+                value={brandFilter}
+                onChange={(e) => setBrandFilter(e.target.value)}
+                className="appearance-none pl-3 pr-8 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white text-slate-600 font-medium"
+              >
                 <option value="all">所有品牌</option>
-                <option value="nike">Nike</option>
-                <option value="adidas">Adidas</option>
+                {brandOptions.map((b) => (
+                  <option key={b} value={b}>
+                    {b}
+                  </option>
+                ))}
               </select>
               <ChevronDown className="w-4 h-4 absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
             </div>
@@ -363,12 +382,10 @@ export default function InventoryList() {
         
         {/* Pagination */}
         <div className="p-4 border-t border-slate-200 bg-slate-50/50 flex items-center justify-between">
-          <span className="text-sm text-slate-500">显示 1 到 11 条，共 11 条</span>
-          <div className="flex gap-1">
-            <button className="px-3 py-1 border border-slate-200 rounded text-sm text-slate-600 bg-white hover:bg-slate-50 disabled:opacity-50" disabled>上一页</button>
-            <button className="px-3 py-1 border border-blue-600 rounded text-sm text-white bg-blue-600">1</button>
-            <button className="px-3 py-1 border border-slate-200 rounded text-sm text-slate-600 bg-white hover:bg-slate-50 disabled:opacity-50" disabled>下一页</button>
-          </div>
+          <span className="text-sm text-slate-500">
+            当前展示 <span className="font-medium text-slate-900">{filteredItems.length}</span> 条
+            {items.length ? <>（总计 {items.length} 条）</> : null}
+          </span>
         </div>
       </div>
 

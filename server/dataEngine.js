@@ -34,6 +34,16 @@ export function isTruthyActiveStatus(v) {
   );
 }
 
+function normalizeInventoryStatus(v) {
+  const s = normalizeLower(v);
+  if (!s) return 'draft';
+  if (isTruthyActiveStatus(v)) return 'active';
+  if (s.includes('draft') || s.includes('草稿')) return 'draft';
+  if (s.includes('obsolete') || s.includes('作废') || s.includes('失效') || s.includes('废弃')) return 'obsolete';
+  // 未知状态默认视为草稿，避免把非生效误算为 active
+  return 'draft';
+}
+
 function safeJsonRead(filePath) {
   try {
     if (!fse.existsSync(filePath)) return null;
@@ -61,9 +71,22 @@ function parseConcatPipeToken(physicalColumn) {
 /** 比较单元格与查找键：强制 trim + toLowerCase，消除 Excel 数字/字符串形态差异 */
 export function valuesEqualForJoin(a, b) {
   const norm = (v) => String(v ?? '').trim().toLowerCase();
-  const sa = norm(a);
   const sb = norm(b);
-  if (!sa || !sb) return false;
+  if (!sb) return false;
+
+  // 若单元格已被“自动脱壳”为 Array：直接做 member-of（includes）判断
+  if (Array.isArray(a)) {
+    const set = new Set(a.map((x) => norm(x)).filter(Boolean));
+    return set.has(sb);
+  }
+  if (Array.isArray(b)) {
+    const set = new Set(b.map((x) => norm(x)).filter(Boolean));
+    const sa0 = norm(a);
+    return Boolean(sa0) && set.has(sa0);
+  }
+
+  const sa = norm(a);
+  if (!sa) return false;
   if (sa === sb) return true;
 
   // JSON 数组成员包含：支持从表字段存 ["SBOX26008M", ...] 或被转义成 \" 的字符串
@@ -1331,11 +1354,15 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap }) {
 
   const mainTableName = buildTableNameIndex(main.fileName);
   const inventory = [];
+  const statusDist = { active: 0, draft: 0, obsolete: 0 };
   for (let i = 0; i < main.rows.length; i++) {
     const row = main.rows[i] || {};
-    const statusVal = statusCol ? row?.[statusCol] : '';
-    const isActive = isTruthyActiveStatus(statusVal);
-    if (!isActive) continue;
+    const styleVal = styleCol ? normalize(row?.[styleCol]) : '';
+    if (!styleVal) continue;
+
+    const rawStatusVal = statusCol ? row?.[statusCol] : '';
+    const invStatus = normalizeInventoryStatus(rawStatusVal);
+    statusDist[invStatus] += 1;
 
     const lastCodeVal = resolveStandardMappedValue(standardMap.get('lastCode'), row, mainTableName, tablesMap, lastCol);
     const soleCodeVal = resolveStandardMappedValue(standardMap.get('soleCode'), row, mainTableName, tablesMap, soleCol);
@@ -1356,7 +1383,7 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap }) {
 
     inventory.push({
       id: `${dateDirName || 'latest'}-${main.fileName}-${i + 1}`,
-      style_wms: styleCol ? normalize(row?.[styleCol]) : '',
+      style_wms: styleVal,
       brand: brandVal,
       colorCode: colorCodeVal,
       materialCode: materialCodeVal,
@@ -1364,7 +1391,7 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap }) {
       lastStatus: has3DLast ? 'matched' : 'missing',
       soleCode: soleCodeVal || undefined,
       soleStatus: has3DSole ? 'matched' : 'missing',
-      data_status: 'active',
+      data_status: invStatus,
       lastUpdated: dateDirName || '',
       updatedBy: 'Storage',
       sourceTable: main.fileName,
@@ -1374,21 +1401,33 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap }) {
     });
   }
 
-  const activeStyles = inventory.length;
-  const matchedLasts = inventory.filter((x) => x.__has3DLast).length;
-  const matchedSoles = inventory.filter((x) => x.__has3DSole).length;
-  const stylesWithAny3D = inventory.filter((x) => x.__has3DAny).length;
+  const totalStyles = inventory.length;
+  const activeRows = inventory.filter((x) => x.data_status === 'active');
+  const activeStyles = activeRows.length;
+  const matchedLasts = activeRows.filter((x) => x.__has3DLast).length;
+  const matchedSoles = activeRows.filter((x) => x.__has3DSole).length;
+  const stylesWithAny3D = activeRows.filter((x) => x.__has3DAny).length;
   const lastCoverage = activeStyles > 0 ? Math.round((matchedLasts / activeStyles) * 100) : 0;
   const soleCoverage = activeStyles > 0 ? Math.round((matchedSoles / activeStyles) * 100) : 0;
   const any3DCoveragePercent = activeStyles > 0 ? Math.round((stylesWithAny3D / activeStyles) * 100) : 0;
 
-  const brandCoverage = computeBrandCoverage(inventory, 'brand', '__has3DAny');
+  // Dashboard 先要看到“各品牌真实款号总量”；3D 覆盖后续再细分，因此这里先把 linked=0，unlinked=total
+  const brandTotals = new Map();
+  for (const it of inventory) {
+    const b = normalize(it.brand) || '(空)';
+    brandTotals.set(b, (brandTotals.get(b) || 0) + 1);
+  }
+  const brandCoverage = Array.from(brandTotals.entries())
+    .map(([brand, total]) => ({ brand, linked: 0, unlinked: total }))
+    .sort((a, b) => b.unlinked - a.unlinked)
+    .slice(0, 30);
 
   const inventoryOut = inventory.map(({ __has3DAny, __has3DLast, __has3DSole, ...rest }) => rest);
 
   return {
     dateDirName,
     kpis: {
+      totalStyles,
       activeStyles,
       matchedLasts,
       matchedSoles,
@@ -1396,6 +1435,7 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap }) {
       soleCoverage,
       stylesWithAny3D,
       any3DCoveragePercent,
+      statusDist,
     },
     brandCoverage,
     inventory: inventoryOut,
@@ -1420,6 +1460,7 @@ export async function processAllData({ storageRoot }) {
     mapping: agg.mapping,
     meta: latest.meta,
     kpis: {
+      totalStyles: kpis.totalStyles ?? kpis.activeStyles,
       activeStyles: kpis.activeStyles,
       matched3DLasts: kpis.matchedLasts,
       matched3DSoles: kpis.matchedSoles,
@@ -1427,6 +1468,7 @@ export async function processAllData({ storageRoot }) {
       soleCoverage: kpis.soleCoverage,
       stylesWithAny3D: kpis.stylesWithAny3D,
       any3DCoveragePercent: kpis.any3DCoveragePercent,
+      statusDist: kpis.statusDist || undefined,
       deltaActiveStyles: agg.deltas.activeStyles.delta,
       deltaMatched3DLasts: agg.deltas.matchedLasts.delta,
       deltaMatched3DSoles: agg.deltas.matchedSoles.delta,
@@ -1660,7 +1702,41 @@ export async function resolveFirstActiveRowFromFolder({
   // 唯一合法寻行：只允许 style_wms == targetStyle（例如 SBOX26008M）
   if (targetStyleNorm) {
     const rowsAll = main.rows || [];
-    const hit = rowsAll.find((r) => eqLoose(r?.[styleCol], targetStyleNorm)) || rowsAll.find((r) => rowContainsTarget(r, targetStyleNorm)) || null;
+    const candidates = rowsAll.filter((r) => eqLoose(r?.[styleCol], targetStyleNorm) || rowContainsTarget(r, targetStyleNorm));
+    const preferKeys = [
+      'id',
+      'brand',
+      'associated_last_type',
+      'associated_sole_info',
+      'initial_sample_color_id',
+      'main_material',
+      'new_main_material',
+      'data_status',
+    ];
+    const scoreRow = (row) => {
+      if (!row || typeof row !== 'object') return { score: -1, hasPk: false };
+      let score = 0;
+      for (const k of preferKeys) {
+        const v = row?.[k];
+        if (v == null) continue;
+        const s = String(v).trim();
+        if (s !== '') score += 1;
+      }
+      const hasPk = String(row?.id ?? '').trim() !== '';
+      return { score, hasPk };
+    };
+    let hit = null;
+    if (candidates.length) {
+      hit = candidates
+        .map((r) => ({ r, ...scoreRow(r) }))
+        .sort((a, b) => {
+          if (b.score !== a.score) return b.score - a.score;
+          if (b.hasPk !== a.hasPk) return b.hasPk ? 1 : -1;
+          return 0;
+        })[0]?.r;
+    } else {
+      hit = null;
+    }
     if (!hit) {
       aiTraceLineSync(`[FAIL] 无法在主表 ods_pdm_pdm_product_info_df 的 style_wms 列找到 ${targetStyleNorm}`);
       return {
