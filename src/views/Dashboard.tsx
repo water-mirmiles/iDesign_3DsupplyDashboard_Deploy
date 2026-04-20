@@ -15,6 +15,7 @@ type DashboardStatsResponse = {
   mapping: { hasConfig: boolean; configPath: string };
   meta: { mainTable: string | null; requiredCols?: string[]; reason?: string };
   kpis: {
+    styles?: { totalAll: number; totalEffective: number };
     activeStyles: number;
     matched3DLasts: number;
     matched3DSoles: number;
@@ -22,6 +23,12 @@ type DashboardStatsResponse = {
     soleCoverage: number;
     last3DCount?: number;
     last3DCoverage?: number;
+    lastCodeLinked?: number;
+    lastCodeLinkRate?: number;
+    soleCodeLinked?: number;
+    soleCodeLinkRate?: number;
+    sole3DCount?: number;
+    sole3DCoverage?: number;
     /** 生效款中至少命中楦或底之一 */
     stylesWithAny3D?: number;
     /** (生效款且 has3D) / 生效款总数 · 百分比 */
@@ -31,6 +38,7 @@ type DashboardStatsResponse = {
     deltaMatched3DSoles: number;
   };
   brandCoverage: Array<{ brand: string; linked: number; unlinked: number }>;
+  trends?: { assetTrend?: AssetTrendStats[] };
   error?: string;
 };
 
@@ -55,6 +63,7 @@ export default function Dashboard() {
         if (!resp.ok || !json.ok) throw new Error(json.error || `加载失败（HTTP ${resp.status}）`);
         if (cancelled) return;
         setStats(json);
+        setChartData(json.trends?.assetTrend || []);
       } catch (e) {
         if (cancelled) return;
         setError(e instanceof Error ? e.message : '加载失败');
@@ -161,10 +170,14 @@ export default function Dashboard() {
           </div>
           <div className="mt-4">
             <div className="flex items-end gap-2">
-              <span className="text-3xl font-bold text-slate-900">{(stats?.kpis?.activeStyles || 0).toLocaleString()}</span>
+              <span className="text-3xl font-bold text-slate-900">
+                {(stats?.kpis?.styles?.totalAll ?? stats?.kpis?.totalStyles ?? 0).toLocaleString()}
+              </span>
               {getTrendBadge(stats?.kpis?.deltaActiveStyles || 0)}
             </div>
-            <div className="mt-1 text-xs text-slate-500">生效款号（按状态过滤）</div>
+            <div className="mt-1 text-xs text-slate-500">
+              其中生效款：<span className="font-medium text-slate-700">{(stats?.kpis?.styles?.totalEffective ?? stats?.kpis?.activeStyles ?? 0).toLocaleString()}</span>
+            </div>
           </div>
         </div>
 
@@ -184,7 +197,13 @@ export default function Dashboard() {
               {getTrendBadge(stats?.kpis?.deltaMatched3DLasts || 0)}
             </div>
             <div className="mt-1 text-xs text-slate-500">
-              覆盖率:{' '}
+              编号绑定率：{' '}
+              <span className="font-medium text-slate-700">
+                {stats?.kpis?.lastCodeLinkRate ?? 0}%
+              </span>
+            </div>
+            <div className="mt-1 text-xs text-slate-500">
+              3D 覆盖率：{' '}
               <span className="font-medium text-slate-700">
                 {stats?.kpis?.last3DCoverage ?? stats?.kpis?.lastCoverage ?? 0}%
               </span>
@@ -202,11 +221,16 @@ export default function Dashboard() {
           </div>
           <div className="mt-4">
             <div className="flex items-end gap-2">
-              <span className="text-3xl font-bold text-slate-900">{(stats?.kpis?.matched3DSoles || 0).toLocaleString()}</span>
+              <span className="text-3xl font-bold text-slate-900">
+                {(stats?.kpis?.sole3DCount ?? stats?.kpis?.matched3DSoles ?? 0).toLocaleString()}
+              </span>
               {getTrendBadge(stats?.kpis?.deltaMatched3DSoles || 0)}
             </div>
             <div className="mt-1 text-xs text-slate-500">
-              覆盖率: <span className="font-medium text-slate-700">{stats?.kpis?.soleCoverage ?? 0}%</span>
+              编号绑定率: <span className="font-medium text-slate-700">{stats?.kpis?.soleCodeLinkRate ?? 0}%</span>
+            </div>
+            <div className="mt-1 text-xs text-slate-500">
+              3D 覆盖率: <span className="font-medium text-slate-700">{stats?.kpis?.sole3DCoverage ?? stats?.kpis?.soleCoverage ?? 0}%</span>
             </div>
           </div>
         </div>

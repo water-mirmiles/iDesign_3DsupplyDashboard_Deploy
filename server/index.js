@@ -3219,6 +3219,7 @@ app.get('/api/dashboard-stats', async (req, res) => {
         meta: payload.meta,
         kpis: payload.kpis,
         brandCoverage: payload.brandCoverage || [],
+        trends: payload.trends || {},
       });
     }
 
@@ -3232,6 +3233,7 @@ app.get('/api/dashboard-stats', async (req, res) => {
       meta: snap.meta,
       kpis: snap.kpis,
       brandCoverage: snap.brandCoverage || [],
+      trends: snap.trends || {},
     });
 
   } catch (e) {
@@ -3285,12 +3287,28 @@ app.post('/api/certify-and-sync', async (req, res) => {
   }
 });
 
-// 真实款号清单：与看板一致，优先 final_dashboard_data.json
-app.get('/api/inventory-real', async (_req, res) => {
+// 真实款号清单：与看板一致，优先 final_dashboard_data.json（但若生产快照已更新则自动重算）
+app.get('/api/inventory-real', async (req, res) => {
   try {
     const snap = await readFinalDashboardSnapshot();
-    if (snap?.inventory) {
-      const items = (snap.inventory || []).map((it) => ({
+
+    const forceRefresh = String(req.query?.refresh || '') === '1';
+    const latestProdDir = await getLatestDataTablesDir();
+    const latestProdDate = isDateDirName(path.basename(latestProdDir)) ? path.basename(latestProdDir) : '';
+    const snapLatestDate = snap?.dates?.latest ? String(snap.dates.latest) : '';
+    const snapIsStale = Boolean(snap && latestProdDate && snapLatestDate && latestProdDate !== snapLatestDate);
+    const shouldRebuild = forceRefresh || !snap?.inventory || snapIsStale;
+
+    if (shouldRebuild) {
+      // eslint-disable-next-line no-console
+      console.log(
+        `[Prod-Engine] inventory-real refresh=${forceRefresh ? '1' : '0'} snap=${
+          snap ? 'yes' : 'no'
+        } stale=${snapIsStale ? 'yes' : 'no'} snap.latest=${snapLatestDate || '(none)'} prod.latest=${latestProdDate || '(none)'}`
+      );
+      const payload = await processAllData({ storageRoot: STORAGE_ROOT });
+      await persistFinalDashboardData(STORAGE_ROOT, payload);
+      const items = (payload.inventory || []).map((it) => ({
         ...it,
         brand_name: it.brand,
         status: it.data_status,
@@ -3298,25 +3316,26 @@ app.get('/api/inventory-real', async (_req, res) => {
       return res.json({
         ok: true,
         source: 'final_dashboard_data',
-        generatedAt: snap.generatedAt,
-        dates: snap.dates,
-        mapping: snap.mapping,
-        meta: snap.meta,
+        generatedAt: payload.generatedAt,
+        dates: payload.dates,
+        mapping: payload.mapping,
+        meta: payload.meta,
         items,
       });
     }
-    const agg = await aggregateProjectData({ storageRoot: STORAGE_ROOT });
-    const items = (agg.latest.inventory || []).map((it) => ({
+
+    const items = (snap.inventory || []).map((it) => ({
       ...it,
       brand_name: it.brand,
       status: it.data_status,
     }));
     return res.json({
       ok: true,
-      source: 'live',
-      dates: agg.dates,
-      mapping: agg.mapping,
-      meta: agg.latest.meta,
+      source: 'final_dashboard_data',
+      generatedAt: snap.generatedAt,
+      dates: snap.dates,
+      mapping: snap.mapping,
+      meta: snap.meta,
       items,
     });
   } catch (e) {
