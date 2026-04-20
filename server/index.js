@@ -3209,6 +3209,10 @@ app.get('/api/dashboard-stats', async (_req, res) => {
 
     const agg = await aggregateProjectData({ storageRoot: STORAGE_ROOT });
     const latest = agg.latest;
+    // eslint-disable-next-line no-console
+    console.log(
+      `[Prod-Engine] 正在为看板聚合生产数据，主表行数：${Number(latest?.meta?.mainRowCount || 0)} 行`
+    );
 
     return res.json({
       ok: true,

@@ -20,6 +20,25 @@ function stripExt(fileName) {
   return fileName.replace(/\.[^.]+$/, '');
 }
 
+function buildJoinIndexKey(tableName, fieldName) {
+  return `${normalizeLower(tableName)}::${normalizeLower(fieldName)}`;
+}
+
+function buildScalarIndexForTableField(tbl, fieldName) {
+  const tf = normalize(fieldName);
+  if (!tbl?.rows?.length || !tf) return null;
+  const m = new Map();
+  for (const r of tbl.rows) {
+    const v = getRowFieldLoose(r, tf, tbl.headers);
+    if (v == null) continue;
+    if (Array.isArray(v)) continue; // 数组包含类 join 不走 O(1) 索引
+    const k = String(v).trim().toLowerCase();
+    if (!k) continue;
+    if (!m.has(k)) m.set(k, r); // 取首条
+  }
+  return m;
+}
+
 export function isTruthyActiveStatus(v) {
   const s = normalizeLower(v);
   return (
@@ -1329,7 +1348,10 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap }) {
   const materialCol = columnNameForMainRow(standardMap.get('materialCode'));
 
   const required = [styleCol, brandCol, statusCol].filter(Boolean);
-  const main = required.length ? guessStyleMainTable(xlsxTables, required) : null;
+  // 生产看板强制主表：ods_pdm_pdm_product_info_df（逻辑名）
+  const forcedMain =
+    xlsxTables.find((t) => normalizeLower(getLogicalTableName(t.fileName)) === 'ods_pdm_pdm_product_info_df') || null;
+  const main = forcedMain || (required.length ? guessStyleMainTable(xlsxTables, required) : null);
 
   if (!main) {
     return {
@@ -1353,6 +1375,57 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap }) {
   const solesSet = await loadAssetsBaseNames(path.join(storageRoot, 'assets', 'soles'));
 
   const mainTableName = buildTableNameIndex(main.fileName);
+  // Join 性能优化：为常见维表构建 (table,targetField) -> Map<key,row> 的 O(1) 索引
+  const joinIndexes = new Map();
+  for (const entry of [standardMap.get('brand'), standardMap.get('lastCode'), standardMap.get('soleCode')].filter(Boolean)) {
+    const jp = entry?.joinPath;
+    if (!Array.isArray(jp) || jp.length < 2) continue;
+    // 仅对“纯等值” hop 做索引：最后一段是 terminal（valueField），且 hop 的 targetField 存在
+    for (let i = 0; i < jp.length - 1; i++) {
+      const seg = jp[i];
+      if (!seg || typeof seg !== 'object') continue;
+      const tt = normalize(seg.targetTable);
+      const tf = normalize(seg.targetField);
+      if (!tt || !tf) continue;
+      const k = buildJoinIndexKey(tt, tf);
+      if (joinIndexes.has(k)) continue;
+      const tbl = getTableFromMap(tt, tablesMap);
+      const idx = buildScalarIndexForTableField(tbl, tf);
+      if (idx) joinIndexes.set(k, idx);
+    }
+  }
+
+  const resolveFast = (entry, mainRow, fallbackColName) => {
+    if (!entry) return fallbackColName ? normalize(mainRow?.[fallbackColName]) : '';
+    const jp = entry?.joinPath;
+    if (!Array.isArray(jp) || jp.length !== 2) {
+      return resolveStandardMappedValue(entry, mainRow, mainTableName, tablesMap, fallbackColName);
+    }
+    const hop = jp[0];
+    const term = jp[1];
+    if (!hop || typeof hop !== 'object' || !term || typeof term !== 'object') {
+      return resolveStandardMappedValue(entry, mainRow, mainTableName, tablesMap, fallbackColName);
+    }
+    const sf = normalize(hop.sourceField);
+    const tt = normalize(hop.targetTable);
+    const tf = normalize(hop.targetField);
+    const vf = normalize(term.valueField);
+    const termT = normalize(term.targetTable);
+    if (!sf || !tt || !tf || !vf || normalizeLower(tt) !== normalizeLower(termT)) {
+      return resolveStandardMappedValue(entry, mainRow, mainTableName, tablesMap, fallbackColName);
+    }
+    const rawKey = getRowFieldLoose(mainRow, sf, tablesMap.get(normalize(mainTableName))?.headers || []);
+    const keyNorm = String(rawKey ?? '').trim().toLowerCase();
+    if (!keyNorm) return '';
+    const idx = joinIndexes.get(buildJoinIndexKey(tt, tf));
+    if (!idx) return resolveStandardMappedValue(entry, mainRow, mainTableName, tablesMap, fallbackColName);
+    const hit = idx.get(keyNorm);
+    if (!hit) return '';
+    const tbl = getTableFromMap(tt, tablesMap);
+    const out = getRowFieldLoose(hit, vf, tbl?.headers || []);
+    return out == null ? '' : normalize(out);
+  };
+
   const inventory = [];
   const statusDist = { active: 0, draft: 0, obsolete: 0 };
   for (let i = 0; i < main.rows.length; i++) {
@@ -1364,9 +1437,9 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap }) {
     const invStatus = normalizeInventoryStatus(rawStatusVal);
     statusDist[invStatus] += 1;
 
-    const lastCodeVal = resolveStandardMappedValue(standardMap.get('lastCode'), row, mainTableName, tablesMap, lastCol);
-    const soleCodeVal = resolveStandardMappedValue(standardMap.get('soleCode'), row, mainTableName, tablesMap, soleCol);
-    const colorCodeVal = resolveStandardMappedValue(standardMap.get('colorCode'), row, mainTableName, tablesMap, colorCol);
+    const lastCodeVal = resolveFast(standardMap.get('lastCode'), row, lastCol);
+    const soleCodeVal = resolveFast(standardMap.get('soleCode'), row, soleCol);
+    const colorCodeVal = resolveFast(standardMap.get('colorCode'), row, colorCol);
     const materialCodeVal = resolveStandardMappedValue(
       standardMap.get('materialCode'),
       row,
@@ -1379,7 +1452,7 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap }) {
     const has3DSole = soleCodeVal ? solesSet.has(stripExt(soleCodeVal)) || solesSet.has(soleCodeVal) : false;
     const has3DAny = has3DLast || has3DSole;
 
-    const brandVal = resolveStandardMappedValue(standardMap.get('brand'), row, mainTableName, tablesMap, brandCol);
+    const brandVal = resolveFast(standardMap.get('brand'), row, brandCol);
 
     inventory.push({
       id: `${dateDirName || 'latest'}-${main.fileName}-${i + 1}`,
@@ -1439,7 +1512,7 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap }) {
     },
     brandCoverage,
     inventory: inventoryOut,
-    meta: { mainTable: main.fileName, requiredCols: required },
+    meta: { mainTable: main.fileName, requiredCols: required, mainRowCount: main.rows?.length || 0, source: 'data_tables' },
   };
 }
 
