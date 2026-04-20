@@ -13,7 +13,7 @@ type DashboardStatsResponse = {
   generatedAt?: string;
   dates: { latest: string; prev: string };
   mapping: { hasConfig: boolean; configPath: string };
-  meta: { mainTable: string | null; requiredCols?: string[]; reason?: string };
+  meta: { mainTable: string | null; requiredCols?: string[]; reason?: string; uniqueBrandCount?: number };
   kpis: {
     styles?: { totalAll: number; totalEffective: number };
     activeStyles: number;
@@ -38,10 +38,10 @@ type DashboardStatsResponse = {
     deltaMatched3DSoles: number;
   };
   statusBuckets?: {
-    total?: { kpis?: any };
-    effective?: { kpis?: any };
-    draft?: { kpis?: any };
-    obsolete?: { kpis?: any };
+    total?: { kpis?: any; lastDigitizationStats?: any[]; soleDigitizationStats?: any[] };
+    effective?: { kpis?: any; lastDigitizationStats?: any[]; soleDigitizationStats?: any[] };
+    draft?: { kpis?: any; lastDigitizationStats?: any[]; soleDigitizationStats?: any[] };
+    obsolete?: { kpis?: any; lastDigitizationStats?: any[]; soleDigitizationStats?: any[] };
   };
   brandCoverage: Array<{ brand: string; linked: number; unlinked: number }>;
   brandBindingStats?: Array<{
@@ -80,6 +80,41 @@ type DashboardStatsResponse = {
 
 type TimePeriod = 'day' | 'week' | 'month' | 'quarter' | 'year';
 
+/** 无 inventory 时，用后端分桶的榜单合并（生效+草稿） */
+function mergeBrandDigitizationRows(a: any[] = [], b: any[] = []) {
+  const map = new Map<string, { brand: string; totalEffective: number; hasCode: number; has3D: number }>();
+  const ingest = (row: any) => {
+    const brand = String(row?.brand || '').trim();
+    if (!brand) return;
+    const cur = map.get(brand) || { brand, totalEffective: 0, hasCode: 0, has3D: 0 };
+    cur.totalEffective += Number(row?.totalEffective || 0);
+    cur.hasCode += Number(row?.hasCode || 0);
+    cur.has3D += Number(row?.has3D || 0);
+    map.set(brand, cur);
+  };
+  for (const r of a) ingest(r);
+  for (const r of b) ingest(r);
+  return Array.from(map.values())
+    .map((x) => {
+      const segment_no_code = Math.max(0, x.totalEffective - x.hasCode);
+      const segment_has_code_no_3d = Math.max(0, x.hasCode - x.has3D);
+      const segment_completed_3d = Math.max(0, x.has3D);
+      const completionRate = x.totalEffective > 0 ? Math.round((x.has3D / x.totalEffective) * 1000) / 10 : 0;
+      return {
+        brand: x.brand,
+        totalEffective: x.totalEffective,
+        hasCode: x.hasCode,
+        has3D: x.has3D,
+        segment_no_code,
+        segment_has_code_no_3d,
+        segment_completed_3d,
+        completionRate,
+      };
+    })
+    .sort((x, y) => (y.totalEffective || 0) - (x.totalEffective || 0))
+    .slice(0, 30);
+}
+
 export default function Dashboard() {
   const [stats, setStats] = useState<DashboardStatsResponse | null>(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -97,8 +132,11 @@ export default function Dashboard() {
       const b = String(it?.brand || '').trim();
       if (b) set.add(b);
     }
-    return set.size;
-  }, [stats?.inventory]);
+    if (set.size > 0) return set.size;
+    const n = Number(stats?.meta?.uniqueBrandCount);
+    if (Number.isFinite(n) && n > 0) return n;
+    return stats?.brandCoverage?.length || 0;
+  }, [stats?.inventory, stats?.meta?.uniqueBrandCount, stats?.brandCoverage]);
 
   const scopeKPIs = useMemo(() => {
     const sb: any = stats?.statusBuckets || null;
@@ -119,6 +157,8 @@ export default function Dashboard() {
 
       const last3DCoverage = totalStyles > 0 ? Math.round((matchedLasts / totalStyles) * 1000) / 10 : 0;
       const sole3DCoverage = totalStyles > 0 ? Math.round((matchedSoles / totalStyles) * 1000) / 10 : 0;
+      const lastCoverage = totalStyles > 0 ? Math.round((matchedLasts / totalStyles) * 100) : 0;
+      const soleCoverage = totalStyles > 0 ? Math.round((matchedSoles / totalStyles) * 100) : 0;
       const any3DCoveragePercent = totalStyles > 0 ? Math.round((stylesWithAny3D / totalStyles) * 100) : 0;
       const lastCodeLinkRate = totalStyles > 0 ? Math.round((lastCodeLinked / totalStyles) * 1000) / 10 : 0;
       const soleCodeLinkRate = totalStyles > 0 ? Math.round((soleCodeLinked / totalStyles) * 1000) / 10 : 0;
@@ -135,6 +175,8 @@ export default function Dashboard() {
         any3DCoveragePercent,
         last3DCoverage,
         sole3DCoverage,
+        lastCoverage,
+        soleCoverage,
         lastCodeLinked,
         soleCodeLinked,
         lastCodeLinkRate,
@@ -224,8 +266,10 @@ export default function Dashboard() {
         const json = (await resp.json()) as DashboardStatsResponse;
         if (!resp.ok || !json.ok) throw new Error(json.error || `加载失败（HTTP ${resp.status}）`);
         if (cancelled) return;
+        // eslint-disable-next-line no-console
+        console.log('Dashboard Raw Data Received:', json);
         setStats(json);
-        setChartData(json.trends?.assetTrend || []);
+        setChartData(Array.isArray(json.trends?.assetTrend) ? json.trends.assetTrend : []);
       } catch (e) {
         if (cancelled) return;
         setError(e instanceof Error ? e.message : '加载失败');
@@ -251,8 +295,10 @@ export default function Dashboard() {
       const resp2 = await fetch('/api/dashboard-stats?refresh=1');
       const json2 = (await resp2.json()) as DashboardStatsResponse;
       if (!resp2.ok || !json2.ok) throw new Error(json2.error || `刷新失败（HTTP ${resp2.status}）`);
+      // eslint-disable-next-line no-console
+      console.log('Dashboard Raw Data Received:', json2);
       setStats(json2);
-      setChartData(json2.trends?.assetTrend || []);
+      setChartData(Array.isArray(json2.trends?.assetTrend) ? json2.trends.assetTrend : []);
     } catch (e) {
       setError(e instanceof Error ? e.message : '重算失败');
     } finally {
@@ -323,8 +369,25 @@ export default function Dashboard() {
     noCodeStroke: '#cbd5e1', // slate-300
     label: '#475569', // slate-600
   };
-  const lastChartRows = useMemo(() => digitizationStats('last'), [digitizationStats]);
-  const soleChartRows = useMemo(() => digitizationStats('sole'), [digitizationStats]);
+  const lastChartRows = useMemo(() => {
+    const inv = stats?.inventory;
+    if (Array.isArray(inv) && inv.length > 0) return digitizationStats('last');
+    const sb: any = stats?.statusBuckets;
+    if (!sb) return stats?.lastDigitizationStats || [];
+    if (statusScope === 'effective') return sb.effective?.lastDigitizationStats || stats?.lastDigitizationStats || [];
+    if (statusScope === 'total') return sb.total?.lastDigitizationStats || [];
+    return mergeBrandDigitizationRows(sb.effective?.lastDigitizationStats, sb.draft?.lastDigitizationStats);
+  }, [stats?.inventory, stats?.statusBuckets, stats?.lastDigitizationStats, statusScope, digitizationStats]);
+
+  const soleChartRows = useMemo(() => {
+    const inv = stats?.inventory;
+    if (Array.isArray(inv) && inv.length > 0) return digitizationStats('sole');
+    const sb: any = stats?.statusBuckets;
+    if (!sb) return stats?.soleDigitizationStats || [];
+    if (statusScope === 'effective') return sb.effective?.soleDigitizationStats || stats?.soleDigitizationStats || [];
+    if (statusScope === 'total') return sb.total?.soleDigitizationStats || [];
+    return mergeBrandDigitizationRows(sb.effective?.soleDigitizationStats, sb.draft?.soleDigitizationStats);
+  }, [stats?.inventory, stats?.statusBuckets, stats?.soleDigitizationStats, statusScope, digitizationStats]);
 
   return (
     <div className="space-y-6 animate-in fade-in duration-500 pb-10">

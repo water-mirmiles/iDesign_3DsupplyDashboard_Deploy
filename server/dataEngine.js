@@ -1974,7 +1974,13 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
     lastDigitizationStats,
     soleDigitizationStats,
     inventory: inventoryOut,
-    meta: { mainTable: main.fileName, requiredCols: required, mainRowCount: main.rows?.length || 0, source: 'data_tables' },
+    meta: {
+      mainTable: main.fileName,
+      requiredCols: required,
+      mainRowCount: main.rows?.length || 0,
+      source: 'data_tables',
+      uniqueBrandCount: allBrands.length,
+    },
   };
 }
 
@@ -2046,6 +2052,21 @@ export async function processAllData({ storageRoot }) {
   console.log(
     `[Engine] 合成完成，耗时 ${Date.now() - t0}ms；生效款 ${kpis.activeStyles}，任一3D命中 ${kpis.stylesWithAny3D}（${kpis.any3DCoveragePercent}%）`
   );
+  const engineSummary = {
+    generatedAt: payload.generatedAt,
+    dates: payload.dates,
+    inventoryRows: Array.isArray(payload.inventory) ? payload.inventory.length : 0,
+    uniqueBrandCount: payload.meta?.uniqueBrandCount,
+    statusBuckets: payload.statusBuckets ? Object.keys(payload.statusBuckets) : [],
+    kpis: {
+      totalStyles: payload.kpis?.totalStyles,
+      activeStyles: payload.kpis?.activeStyles,
+      lastCodeLinkRate: payload.kpis?.lastCodeLinkRate,
+      soleCodeLinkRate: payload.kpis?.soleCodeLinkRate,
+    },
+  };
+  // eslint-disable-next-line no-console
+  console.log('Engine Final Stats Summary:', engineSummary);
   return payload;
 }
 
