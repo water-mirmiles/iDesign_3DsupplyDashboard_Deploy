@@ -7,7 +7,7 @@ import multer from 'multer';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import XLSX from 'xlsx';
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import { VertexAI } from '@google-cloud/vertexai';
 import {
   aggregateProjectData,
   buildStandardMap,
@@ -85,16 +85,25 @@ async function readFinalDashboardSnapshot() {
   }
 }
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const genAI = GEMINI_API_KEY ? new GoogleGenerativeAI(GEMINI_API_KEY) : null;
-// NOTE: This API key's available models are discoverable via /api/debug/gemini-models
-// Tier 1（New Users 权限限制）热修：锁定确权可用模型（不带 models/ 前缀，禁止使用 -exp 实验模型）
-const MODEL_PRIORITY = ['gemini-1.5-flash', 'gemini-2.0-flash', 'gemini-pro-latest'];
-// 环境变量强制指定：若设置 GEMINI_MODEL，则仅使用该模型，跳过优先级列表
-const GEMINI_FORCED_MODEL = (process.env.GEMINI_MODEL || '').trim();
-const GEMINI_DISCOVERY_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
-const GEMINI_V1_MODELS_URL = 'https://generativelanguage.googleapis.com/v1/models';
-const GEMINI_V1_GENERATE_URL = 'https://generativelanguage.googleapis.com/v1/models';
+// ============================
+// Vertex AI (Enterprise) Gemini
+// ============================
+const VERTEX_PROJECT_ID = 'idesign-3dsupplydashboard';
+const VERTEX_LOCATION = 'us-central1';
+const VERTEX_MODEL = 'gemini-1.5-flash-002';
+const MODEL_PRIORITY = [VERTEX_MODEL];
+
+function ensureVertexCredentialsEnv() {
+  const keyPath = path.join(__dirname, 'gcp-key.json');
+  if (!process.env.GOOGLE_APPLICATION_CREDENTIALS && fse.existsSync(keyPath)) {
+    process.env.GOOGLE_APPLICATION_CREDENTIALS = keyPath;
+  }
+  return keyPath;
+}
+
+const vertexKeyPath = ensureVertexCredentialsEnv();
+const vertexAI = new VertexAI({ project: VERTEX_PROJECT_ID, location: VERTEX_LOCATION });
+const vertexModel = vertexAI.getGenerativeModel({ model: VERTEX_MODEL });
 
 let currentAIStatus = {
   status: 'idle',
@@ -282,39 +291,8 @@ function isModelNotFoundError(e) {
   return msg.includes('404') || (msg.includes('model') && msg.includes('not found'));
 }
 
-function getGenerativeModelCompat(modelName) {
-  // SDK 有时要求带 models/ 前缀，有时要求裸名；这里做兼容兜底
-  const name = String(modelName || '').trim();
-  try {
-    return genAI.getGenerativeModel({ model: name });
-  } catch (e) {
-    const withPrefix = name.startsWith('models/') ? name : `models/${name}`;
-    // eslint-disable-next-line no-console
-    console.warn('[gemini] getGenerativeModel fallback to prefixed name:', withPrefix);
-    return genAI.getGenerativeModel({ model: withPrefix });
-  }
-}
-
 function normalizeModelName(name) {
   return String(name || '').replace(/^models\//, '').trim();
-}
-
-async function listAvailableModelsV1() {
-  if (!GEMINI_API_KEY) return [];
-  const url = `${GEMINI_V1_MODELS_URL}?key=${encodeURIComponent(GEMINI_API_KEY)}`;
-  try {
-    const resp = await fetch(url);
-    const json = await resp.json().catch(() => null);
-    const models = Array.isArray(json?.models) ? json.models : [];
-    return models
-      .filter((m) => Array.isArray(m?.supportedGenerationMethods) && m.supportedGenerationMethods.includes('generateContent'))
-      .map((m) => normalizeModelName(m?.name))
-      .filter(Boolean);
-  } catch (e) {
-    // eslint-disable-next-line no-console
-    console.error('[models] listAvailableModelsV1 failed', e instanceof Error ? e.message : String(e));
-    return [];
-  }
 }
 
 function pickBestFlashModel(available) {
@@ -340,39 +318,27 @@ function buildPriorityFromAvailable(available) {
   return dedup([best, f20, flashLatest, f15, proLatest]);
 }
 
-async function generateContentV1({ modelName, prompt }) {
-  if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY is not configured');
-  const cleanModel = normalizeModelName(modelName);
-  const url = `${GEMINI_V1_GENERATE_URL}/${encodeURIComponent(cleanModel)}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
-  const body = {
-    contents: [{ role: 'user', parts: [{ text: String(prompt || '') }] }],
-  };
-  const resp = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  const text = await resp.text();
-  if (!resp.ok) {
-    if (resp.status === 404) {
-      // eslint-disable-next-line no-console
-      console.error('[gemini][404] generateContent URL:', url);
-    }
-    const err = new Error(text || `Gemini generateContent failed (HTTP ${resp.status})`);
-    err.status = resp.status;
-    throw err;
-  }
-  let json = null;
+async function generateContentVertex({ prompt }) {
+  const p = String(prompt || '');
   try {
-    json = JSON.parse(text);
-  } catch {
+    const result = await vertexModel.generateContent({
+      contents: [{ role: 'user', parts: [{ text: p }] }],
+    });
+    const text =
+      result?.response?.candidates?.[0]?.content?.parts?.map((x) => x?.text).filter(Boolean).join('') ||
+      result?.response?.candidates?.[0]?.content?.parts?.[0]?.text ||
+      '';
     return { text: String(text || '') };
+  } catch (e) {
+    // 提示更友好的鉴权错误
+    const msg = String(e?.message || '');
+    if (!process.env.GOOGLE_APPLICATION_CREDENTIALS && !fse.existsSync(vertexKeyPath)) {
+      const err = new Error(`Vertex AI 未配置鉴权：请在 server/ 放置 gcp-key.json 或设置 GOOGLE_APPLICATION_CREDENTIALS。原始错误：${msg}`);
+      err.cause = e;
+      throw err;
+    }
+    throw e;
   }
-  const out =
-    json?.candidates?.[0]?.content?.parts?.map((p) => p?.text).filter(Boolean).join('') ||
-    json?.candidates?.[0]?.content?.parts?.[0]?.text ||
-    '';
-  return { text: String(out || '') };
 }
 
 function sanitizeSqlForAi(sqlText) {
@@ -559,49 +525,18 @@ function heuristicInferSuggestions({ tables }) {
 }
 
 async function generateWithModelList({ modelNames, prompt, retries = 3 }) {
+  // Vertex AI 企业版：取消“呼吸延迟/退避”；默认直接使用锁定模型
+  const modelName = normalizeModelName((modelNames && modelNames[0]) || VERTEX_MODEL);
   let lastErr = null;
-  for (const modelName of modelNames) {
+  for (let attempt = 1; attempt <= Math.max(1, retries); attempt++) {
     try {
-      setAIStatus({ status: 'running', model: modelName, message: `正在尝试模型: ${modelName}...` });
-      // 指数退避：1s,2s,4s（仅对 503/429/500）
-      let attemptErr = null;
-      for (let attempt = 1; attempt <= retries; attempt++) {
-        try {
-          const model = genAI.getGenerativeModel({ model: normalizeModelName(modelName) }); // 强制不带 models/ 前缀
-          const result = await model.generateContent(prompt);
-          const text = result?.response?.text?.() || '';
-          return { ok: true, text, modelName };
-        } catch (e) {
-          attemptErr = e;
-          const status = getHttpStatusFromGeminiError(e);
-          const is404 = status === 404 || String(e?.message || '').includes('404');
-          const transient = isTransientStatus(status);
-          if (is404) break; // 404 直接换下一个模型
-          if (attempt < retries && transient) {
-            const delay = 1000 * Math.pow(2, attempt - 1);
-            // eslint-disable-next-line no-console
-            console.warn(`[Retry] 模型 ${modelName} 忙碌/异常（HTTP ${status}），${delay / 1000}s 后重试...`);
-            await sleepWithCountdown(delay, { modelName, prefix: '[Retry] 模型忙碌，' });
-            continue;
-          }
-          break;
-        }
-      }
-      lastErr = attemptErr;
-      const status = getHttpStatusFromGeminiError(attemptErr);
-      const is404 = status === 404 || String(attemptErr?.message || '').includes('404');
-      const is503 = status === 503 || String(attemptErr?.message || '').includes('503');
-      if (is404 || is503) {
-        // eslint-disable-next-line no-console
-        console.warn(`[Fallback] 模型 ${modelName} 不可用（HTTP ${status}），尝试下一个模型...`);
-        continue;
-      }
-      throw attemptErr;
+      const out = await generateContentVertex({ prompt });
+      return { ok: true, text: out.text, modelName };
     } catch (e) {
       lastErr = e;
     }
   }
-  return { ok: false, error: lastErr };
+  return { ok: false, error: lastErr, modelName };
 }
 
 function getHttpStatusFromGeminiError(error) {
@@ -617,141 +552,15 @@ function getHttpStatusFromGeminiError(error) {
   return m ? Number(m[1]) : null;
 }
 
-async function sleep(ms) {
-  await new Promise((r) => setTimeout(r, ms));
-}
-
-async function sleepWithCountdown(ms, { modelName, prefix }) {
-  const totalSec = Math.max(1, Math.ceil(ms / 1000));
-  for (let s = totalSec; s >= 1; s--) {
-    setAIStatus({
-      status: 'retrying',
-      model: modelName,
-      message: `${prefix}${s}秒后自动重试...`,
-    });
-    await sleep(1000);
-  }
-}
-
 async function generateContentWithFallback({ prompt }) {
-  if (!genAI) throw new Error('GEMINI_API_KEY is not configured');
-  const models = (GEMINI_FORCED_MODEL ? [GEMINI_FORCED_MODEL] : MODEL_PRIORITY).map(normalizeModelName);
-  let lastError = null;
-
-  setAIStatus({ status: 'running', model: models[0] || '', message: '开始解析，准备请求模型...' });
-
-  for (let i = 0; i < models.length; i++) {
-    const modelName = models[i];
-    const nextModel = models[i + 1];
-    try {
-      setAIStatus({ status: 'running', model: modelName, message: `正在尝试模型: ${modelName}...` });
-      const model = getGenerativeModelCompat(modelName);
-      const result = await model.generateContent(prompt);
-      const text = result?.response?.text?.() || '';
-      setAIStatus({ status: 'done', model: modelName, message: '解析完成' });
-      return { text, modelName };
-    } catch (e) {
-      lastError = e;
-      const status = getHttpStatusFromGeminiError(e);
-      const transient = status === 503 || status === 429 || status === 500;
-      const notFound = isModelNotFoundError(e);
-
-      // 503: 指数级退避（先重试当前模型 1 次，再考虑降级）
-      if (status === 503) {
-        try {
-          // eslint-disable-next-line no-console
-          console.warn('[Retry] 模型忙碌，2秒后自动重试...', { model: modelName });
-          await sleepWithCountdown(2000, { modelName, prefix: '[Retry] 模型忙碌，' });
-          const modelRetry = getGenerativeModelCompat(modelName);
-          const resultRetry = await modelRetry.generateContent(prompt);
-          const textRetry = resultRetry?.response?.text?.() || '';
-          setAIStatus({ status: 'done', model: modelName, message: '解析完成' });
-          return { text: textRetry, modelName };
-        } catch (eRetry) {
-          lastError = eRetry;
-          // 仍失败则继续走降级逻辑（如果还有下一个模型）
-          setAIStatus({ status: 'running', model: modelName, message: `重试失败（503），准备降级到下一个模型...` });
-        }
-      }
-
-      // 若本次失败是“模型找不到”，再尝试一次带 models/ 前缀（有些 SDK/模型名要求）
-      if (notFound) {
-        const altName = String(modelName || '').startsWith('models/') ? String(modelName || '').replace(/^models\//, '') : `models/${modelName}`;
-        try {
-          // eslint-disable-next-line no-console
-          console.warn(`[Fallback] 模型 ${modelName} 返回 404，尝试别名 ${altName}...`);
-          setAIStatus({ status: 'running', model: modelName, message: `[Fallback] 模型 ${modelName} 返回 404，尝试别名 ${altName}...` });
-          const altModel = getGenerativeModelCompat(altName);
-          const result = await altModel.generateContent(prompt);
-          const text = result?.response?.text?.() || '';
-          setAIStatus({ status: 'done', model: altName, message: '解析完成' });
-          return { text, modelName: altName };
-        } catch (e2) {
-          lastError = e2;
-        }
-      }
-
-      if (notFound && nextModel) {
-        // eslint-disable-next-line no-console
-        console.warn(`[Fallback] 模型 ${modelName} 返回 404，正在尝试备用模型 ${nextModel}...`);
-        setAIStatus({ status: 'fallback', model: modelName, message: `[Fallback] 模型 ${modelName} 返回 404，正在尝试备用模型 ${nextModel}...` });
-        await sleep(50);
-        continue;
-      }
-
-      if (transient && nextModel) {
-        // eslint-disable-next-line no-console
-        console.warn(`[Fallback] 模型 ${modelName} 忙碌/异常（HTTP ${status}），正在尝试模型 ${nextModel}...`);
-        setAIStatus({ status: 'fallback', model: modelName, message: `[Fallback] 模型 ${modelName} 忙碌/异常（HTTP ${status}），正在尝试模型 ${nextModel}...` });
-        // 小间隔，避免瞬时抖动造成连续失败
-        await sleep(200);
-        continue;
-      }
-
-      // 非可降级错误，或者已经无模型可用：直接抛出
-      setAIStatus({ status: 'error', model: modelName, message: `解析失败（HTTP ${status || 'unknown'}）：${String(e?.message || '')}` });
-      throw e;
-    }
-  }
-
-  setAIStatus({ status: 'error', model: '', message: '所有模型均失败' });
-  throw lastError || new Error('All Gemini models failed');
-}
-
-async function listGeminiModels() {
-  if (!GEMINI_API_KEY) return null;
-  try {
-    const resp = await fetch(`${GEMINI_DISCOVERY_URL}?key=${encodeURIComponent(GEMINI_API_KEY)}`);
-    const text = await resp.text();
-    try {
-      return { status: resp.status, json: JSON.parse(text) };
-    } catch {
-      return { status: resp.status, text };
-    }
-  } catch (e) {
-    return { error: e instanceof Error ? e.message : String(e) };
-  }
+  // 兼容旧调用点：现在统一走 Vertex AI
+  const out = await generateContentVertex({ prompt });
+  return { text: out.text, modelName: VERTEX_MODEL };
 }
 
 async function listAvailableModels() {
-  // Prefer v1; fallback to v1beta if needed
-  const v1 = await listAvailableModelsV1();
-  if (v1.length) return v1.map((n) => `models/${normalizeModelName(n)}`);
-  if (!GEMINI_API_KEY) return [];
-  try {
-    const resp = await fetch(`${GEMINI_DISCOVERY_URL}?key=${encodeURIComponent(GEMINI_API_KEY)}`);
-    const json = await resp.json().catch(() => null);
-    const models = Array.isArray(json?.models) ? json.models : [];
-    const usable = models
-      .filter((m) => Array.isArray(m?.supportedGenerationMethods) && m.supportedGenerationMethods.includes('generateContent'))
-      .map((m) => `models/${normalizeModelName(m?.name)}`)
-      .filter(Boolean);
-    return usable;
-  } catch (e) {
-    // eslint-disable-next-line no-console
-    console.error('[models] listAvailableModels failed', e instanceof Error ? e.message : String(e));
-    return [];
-  }
+  // Vertex AI：固定锁定企业版稳定模型
+  return [VERTEX_MODEL];
 }
 
 // NOTE: 模型优先级已锁定，不再在启动时自动改写，以避免线上抖动与不可控切换
@@ -1011,10 +820,18 @@ app.post('/api/parse-ddl-schema', async (req, res) => {
   }
 });
 
-// 调试：列出当前 API Key 可用模型
+// 调试：列出当前 Vertex 锁定模型
 app.get('/api/debug/gemini-models', async (_req, res) => {
-  const out = await listGeminiModels();
-  res.json({ ok: true, out });
+  return res.json({
+    ok: true,
+    vertex: {
+      project: VERTEX_PROJECT_ID,
+      location: VERTEX_LOCATION,
+      model: VERTEX_MODEL,
+      googleApplicationCredentials: process.env.GOOGLE_APPLICATION_CREDENTIALS ? 'set' : 'unset',
+      gcpKeyJsonExists: fse.existsSync(vertexKeyPath),
+    },
+  });
 });
 
 // 诊断：列出当前 API Key 可用、且支持 generateContent 的模型清单
@@ -1139,7 +956,7 @@ app.post('/api/preview-mapping-row', async (req, res) => {
 app.post('/api/ai-parse-ddl', async (req, res) => {
   const sqlText = String(req.body?.sqlText || '');
   if (!sqlText.trim()) return res.status(400).json({ ok: false, error: 'sqlText is required' });
-  if (!genAI) return res.status(500).json({ ok: false, error: 'GEMINI_API_KEY is not configured' });
+  if (!vertexModel) return res.status(500).json({ ok: false, error: 'Vertex AI is not initialized' });
 
   try {
     clearEngineLogSync();
@@ -1205,7 +1022,7 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
   const tableNames = Array.isArray(req.body?.ddlTableNames) ? req.body.ddlTableNames.map((x) => String(x || '').trim()).filter(Boolean) : [];
   const ddlText = String(req.body?.ddlText || '').trim();
   if (!text) return res.status(400).json({ ok: false, error: 'text is required' });
-  if (!genAI) return res.status(500).json({ ok: false, error: 'GEMINI_API_KEY is not configured' });
+  // Vertex 不可用时也不失败：沿用 localFallback（never fail）
 
   const emptyDim = () => ({ targetGoal: '', rows: [] });
   const makeSegmentsRow = (value, notes = '') => ({
@@ -1434,10 +1251,8 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
     auditLineSync('[Audit][A] Input: conversational text');
     auditLineSync(text);
 
-    // Chat-to-Config 优先使用 flash，降低 503 概率；失败则本地兜底
-    const modelList = GEMINI_FORCED_MODEL
-      ? [normalizeModelName(GEMINI_FORCED_MODEL)]
-      : ['gemini-1.5-flash', 'gemini-2.0-flash', 'gemini-pro-latest'].map(normalizeModelName);
+    // Vertex AI：固定锁定企业版稳定模型；失败则本地兜底
+    const modelList = [VERTEX_MODEL];
     const prompt = [
       '你是一个专业的 ETL 配置员。你的任务：把用户的大白话业务案例，提取为“动态黄金样本配置（dimensionSamples）”。',
       '',
@@ -1559,7 +1374,7 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
       : null;
   const goldenExpectedMap = buildGoldenExpectedMap({ goldenBlocks, goldenSamples, reference });
   if (!sqlText.trim()) return res.status(400).json({ ok: false, error: 'sqlText is required' });
-  if (!genAI) return res.status(500).json({ ok: false, error: 'GEMINI_API_KEY is not configured' });
+  if (!vertexModel) return res.status(500).json({ ok: false, error: 'Vertex AI is not initialized' });
 
   try {
     // 新一轮 AI 建模开始：清空上一轮引擎 Trace 日志，便于用户直接看 engine.log
@@ -1688,7 +1503,7 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
     const parsedTables = [];
     const parsedNames = [];
 
-    const modelList = GEMINI_FORCED_MODEL ? [normalizeModelName(GEMINI_FORCED_MODEL)] : MODEL_PRIORITY.map(normalizeModelName);
+    const modelList = MODEL_PRIORITY.map(normalizeModelName);
     setAIStatus({ status: 'running', model: modelList[0] || '', message: `开始分批解析：0/${total}...`, parsedCount: 0, totalCount: total, parsedTables: [] });
 
     const refInstruction = reference
@@ -1734,7 +1549,7 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
     }
 
     // ===========================
-    // 新模式：维度串行解析（降低单次上下文，避免 503/超时）
+    // 新模式：维度并行解析（Vertex 企业版高吞吐）
     // ===========================
     {
       const schemaCompact = parsedTables.map((t) => ({
@@ -1812,7 +1627,7 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
       setAIStatus({
         status: 'running',
         model: modelList[0] || '',
-        message: `开始维度串行解析：0/${dimensionKeys.length}`,
+        message: `开始维度并行解析：0/${dimensionKeys.length}`,
         parsedCount: 0,
         totalCount: dimensionKeys.length,
         partialRevision: (currentAIStatus.partialRevision || 0) + 1,
@@ -1879,32 +1694,43 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
         }
       };
 
-      for (let di = 0; di < dimensionKeys.length; di++) {
-        const dimKey = dimensionKeys[di];
+      // Vertex 企业版：恢复 7 维并行解析（无 setTimeout / 呼吸延迟）
+      let done = 0;
+      let partialLock = Promise.resolve();
+      const withPartialLock = async (fn) => {
+        partialLock = partialLock.then(fn, fn);
+        return partialLock;
+      };
+
+      const runOneDim = async ({ dimKey }) => {
         const expected = goldenExpectedMap.get(dimKey) || '';
-        dims[dimKey] = { status: 'running', attempts: 0, expected: String(expected || '') };
-        setAIStatus({
-          status: 'running',
-          model: modelList[0] || '',
-          message: `正在破解 ${dimKey} 维度关联路径...`,
-          parsedCount: di,
-          totalCount: dimensionKeys.length,
-          partialRevision: (currentAIStatus.partialRevision || 0) + 1,
-          partial: { smartSuggestions, joinPathSuggestions, concatMappingSuggestions, dims },
+        await withPartialLock(async () => {
+          dims[dimKey] = { status: 'running', attempts: 0, expected: String(expected || '') };
+          setAIStatus({
+            status: 'running',
+            model: modelList[0] || '',
+            message: `正在并行破解 ${dimKey} 维度关联路径...`,
+            parsedCount: done,
+            totalCount: dimensionKeys.length,
+            partialRevision: (currentAIStatus.partialRevision || 0) + 1,
+            partial: { smartSuggestions, joinPathSuggestions, concatMappingSuggestions, dims },
+          });
         });
 
         let success = false;
         let lastErr = '';
         for (let attempt = 1; attempt <= 3; attempt++) {
-          dims[dimKey] = { ...(dims[dimKey] || {}), status: 'running', attempts: attempt };
-          setAIStatus({
-            status: 'running',
-            model: modelList[0] || '',
-            message: `正在破解 ${dimKey}...（尝试 ${attempt}/3）`,
-            parsedCount: di,
-            totalCount: dimensionKeys.length,
-            partialRevision: (currentAIStatus.partialRevision || 0) + 1,
-            partial: { smartSuggestions, joinPathSuggestions, concatMappingSuggestions, dims },
+          await withPartialLock(async () => {
+            dims[dimKey] = { ...(dims[dimKey] || {}), status: 'running', attempts: attempt };
+            setAIStatus({
+              status: 'running',
+              model: modelList[0] || '',
+              message: `正在破解 ${dimKey}...（并行尝试 ${attempt}/3）`,
+              parsedCount: done,
+              totalCount: dimensionKeys.length,
+              partialRevision: (currentAIStatus.partialRevision || 0) + 1,
+              partial: { smartSuggestions, joinPathSuggestions, concatMappingSuggestions, dims },
+            });
           });
 
           const prompt = buildSingleDimensionPrompt({ dimKey, dimExpected: expected });
@@ -1912,6 +1738,7 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
           auditLineSync(prompt);
           aiTraceLineSync(`[现场 A] ===== dim=${dimKey} attempt=${attempt} Prompt Audit =====`);
           aiTraceLineSync(prompt);
+
           const out = await generateWithModelList({ modelNames: modelList, prompt, retries: 2 });
           auditLineSync(`[Audit][B] AI Raw Output (single-dim) dim=${dimKey} attempt=${attempt}`);
           auditLineSync(out.ok ? String(out.text || '') : `[Audit][B] FAILED: ${String(out.error?.message || '')}`);
@@ -1947,28 +1774,32 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
           });
 
           if (validated && validated.length) {
-            // 现场 C/D：对通过的路径跑一次逐步 trace（只取第一条）
             const v0 = validated[0];
             const rawPathArr = Array.isArray(v0?.path) ? v0.path : [];
             if (rawPathArr.length >= 2) {
               await traceJoinPathOnOneRow({ dimKey, pathArr: rawPathArr, expectedValue: expected, smartSuggestionsForMain: ssRaw });
             }
-            const merged = new Map(joinPathSuggestions.map((x) => [x.targetStandardKey, x]));
-            for (const v of validated) merged.set(v.targetStandardKey, v);
-            joinPathSuggestions = Array.from(merged.values());
-            if (dimKey === 'materialCode' && Array.isArray(ccRaw) && ccRaw.length) concatMappingSuggestions = ccRaw;
-            if (Array.isArray(ssRaw) && ssRaw.length) smartSuggestions = ssRaw;
 
-            dims[dimKey] = { ...(dims[dimKey] || {}), status: 'success' };
-            setAIStatus({
-              status: 'running',
-              model: modelList[0] || '',
-              message: `${dimKey} 维度认证成功，正在处理下一个维度...`,
-              parsedCount: di + 1,
-              totalCount: dimensionKeys.length,
-              partialRevision: (currentAIStatus.partialRevision || 0) + 1,
-              partial: { smartSuggestions, joinPathSuggestions, concatMappingSuggestions, dims },
+            await withPartialLock(async () => {
+              const merged = new Map(joinPathSuggestions.map((x) => [x.targetStandardKey, x]));
+              for (const v of validated) merged.set(v.targetStandardKey, v);
+              joinPathSuggestions = Array.from(merged.values());
+              if (dimKey === 'materialCode' && Array.isArray(ccRaw) && ccRaw.length) concatMappingSuggestions = ccRaw;
+              if (Array.isArray(ssRaw) && ssRaw.length) smartSuggestions = ssRaw;
+
+              dims[dimKey] = { ...(dims[dimKey] || {}), status: 'success' };
+              done += 1;
+              setAIStatus({
+                status: 'running',
+                model: modelList[0] || '',
+                message: `${dimKey} 维度认证成功（并行完成 ${done}/${dimensionKeys.length}）`,
+                parsedCount: done,
+                totalCount: dimensionKeys.length,
+                partialRevision: (currentAIStatus.partialRevision || 0) + 1,
+                partial: { smartSuggestions, joinPathSuggestions, concatMappingSuggestions, dims },
+              });
             });
+
             success = true;
             break;
           }
@@ -1979,23 +1810,28 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
         }
 
         if (!success) {
-          dims[dimKey] = { ...(dims[dimKey] || {}), status: 'fail', lastError: lastErr };
-          setAIStatus({
-            status: 'running',
-            model: modelList[0] || '',
-            message: `${dimKey} 维度未能回测通过（先继续下一维度）`,
-            parsedCount: di + 1,
-            totalCount: dimensionKeys.length,
-            partialRevision: (currentAIStatus.partialRevision || 0) + 1,
-            partial: { smartSuggestions, joinPathSuggestions, concatMappingSuggestions, dims },
+          await withPartialLock(async () => {
+            dims[dimKey] = { ...(dims[dimKey] || {}), status: 'fail', lastError: lastErr };
+            done += 1;
+            setAIStatus({
+              status: 'running',
+              model: modelList[0] || '',
+              message: `${dimKey} 维度未能回测通过（并行完成 ${done}/${dimensionKeys.length}）`,
+              parsedCount: done,
+              totalCount: dimensionKeys.length,
+              partialRevision: (currentAIStatus.partialRevision || 0) + 1,
+              partial: { smartSuggestions, joinPathSuggestions, concatMappingSuggestions, dims },
+            });
           });
         }
-      }
+      };
+
+      await Promise.all(dimensionKeys.map((dimKey) => runOneDim({ dimKey })));
 
       setAIStatus({
         status: 'done',
         model: modelList[0] || '',
-        message: `维度串行解析完成：${dimensionKeys.length}/${dimensionKeys.length}`,
+        message: `维度并行解析完成：${dimensionKeys.length}/${dimensionKeys.length}`,
         parsedCount: dimensionKeys.length,
         totalCount: dimensionKeys.length,
         partialRevision: (currentAIStatus.partialRevision || 0) + 1,
@@ -2806,11 +2642,11 @@ async function start() {
     // eslint-disable-next-line no-console
     console.clear();
     // eslint-disable-next-line no-console
-    console.log('[startup] Gemini preferred model:', GEMINI_FORCED_MODEL || MODEL_PRIORITY[0]);
+    console.log('[startup] Vertex AI Gemini model (locked):', MODEL_PRIORITY[0]);
     (async () => {
       const modelsList = await listAvailableModels(); // returns models/xxx
       // eslint-disable-next-line no-console
-      console.log('✅ 你的 Key 可用的模型清单:', modelsList);
+      console.log('✅ Vertex 模型清单（锁定）:', modelsList);
       // eslint-disable-next-line no-console
       console.log('[startup] MODEL_PRIORITY (locked):', MODEL_PRIORITY);
     })().catch(() => {});
@@ -2823,7 +2659,9 @@ async function start() {
     // eslint-disable-next-line no-console
     console.log('[env] dotenv parsed keys:', Object.keys(dotenvResult.parsed || {}).join(', ') || '(none)');
     // eslint-disable-next-line no-console
-    console.log('Gemini Key Loaded:', process.env.GEMINI_API_KEY ? 'Yes' : 'No');
+    console.log('[vertex] GOOGLE_APPLICATION_CREDENTIALS:', process.env.GOOGLE_APPLICATION_CREDENTIALS ? 'Yes' : 'No');
+    // eslint-disable-next-line no-console
+    console.log('[vertex] gcp-key.json exists:', fse.existsSync(vertexKeyPath) ? 'Yes' : 'No');
     // eslint-disable-next-line no-console
     console.log(`[server] assets lasts=${cachedAssets.lasts.length} soles=${cachedAssets.soles.length}`);
   });
