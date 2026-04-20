@@ -3256,6 +3256,7 @@ app.get('/api/dashboard-stats', async (req, res) => {
         meta: payload.meta,
         kpis: payload.kpis,
         brandCoverage: payload.brandCoverage || [],
+        brandBindingStats: payload.brandBindingStats || [],
         trends: payload.trends || {},
       });
     }
@@ -3270,6 +3271,7 @@ app.get('/api/dashboard-stats', async (req, res) => {
       meta: snap.meta,
       kpis: snap.kpis,
       brandCoverage: snap.brandCoverage || [],
+      brandBindingStats: snap.brandBindingStats || [],
       trends: snap.trends || {},
     });
 

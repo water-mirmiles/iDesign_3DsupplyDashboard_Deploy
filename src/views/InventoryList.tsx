@@ -174,6 +174,16 @@ export default function InventoryList() {
 
   useEffect(() => {
     let cancelled = false;
+    // Dashboard 点击品牌跳转：通过 localStorage 预设过滤
+    try {
+      const preset = localStorage.getItem('inventoryBrandFilter');
+      if (preset) {
+        setBrandFilter(preset);
+        localStorage.removeItem('inventoryBrandFilter');
+      }
+    } catch {
+      // ignore
+    }
     const run = async () => {
       setIsLoading(true);
       setError(null);

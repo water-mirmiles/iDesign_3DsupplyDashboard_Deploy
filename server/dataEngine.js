@@ -995,6 +995,32 @@ function computeBrandCoverage(activeRows, brandKey, has3dAnyKey) {
   return Array.from(map.values()).sort((a, b) => (b.linked + b.unlinked) - (a.linked + a.unlinked));
 }
 
+function computeBrandBindingStats(activeRows) {
+  const map = new Map();
+  const isLinkedCode = (v) => {
+    const s = String(v ?? '').trim();
+    return s !== '' && s !== '-' && s !== '0';
+  };
+  for (const r of activeRows || []) {
+    const brand = normalize(r?.brand ?? 'Unknown') || 'Unknown';
+    const cur = map.get(brand) || { brand, total: 0, lastLinked: 0, soleLinked: 0 };
+    cur.total += 1;
+    if (isLinkedCode(r?.lastCode)) cur.lastLinked += 1;
+    if (isLinkedCode(r?.soleCode)) cur.soleLinked += 1;
+    map.set(brand, cur);
+  }
+  return Array.from(map.values())
+    .map((x) => ({
+      brand: x.brand,
+      lastBindingRate: x.total > 0 ? Math.round((x.lastLinked / x.total) * 100) : 0,
+      soleBindingRate: x.total > 0 ? Math.round((x.soleLinked / x.total) * 100) : 0,
+      __total: x.total,
+    }))
+    .sort((a, b) => b.__total - a.__total)
+    .slice(0, 30)
+    .map(({ __total, ...rest }) => rest);
+}
+
 function computeDelta(current, previous) {
   const delta = current - previous;
   const pct = previous > 0 ? (delta / previous) * 100 : null;
@@ -1715,6 +1741,8 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
     .sort((a, b) => b.unlinked - a.unlinked)
     .slice(0, 30);
 
+  const brandBindingStats = computeBrandBindingStats(activeRows);
+
   const inventoryOut = inventory.map(({ __has3DAny, __has3DLast, __has3DSole, ...rest }) => rest);
 
   return {
@@ -1748,6 +1776,7 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
         : undefined,
     },
     brandCoverage,
+    brandBindingStats,
     inventory: inventoryOut,
     meta: { mainTable: main.fileName, requiredCols: required, mainRowCount: main.rows?.length || 0, source: 'data_tables' },
   };
@@ -1798,6 +1827,7 @@ export async function processAllData({ storageRoot }) {
       deltaMatched3DSoles: agg.deltas.matchedSoles.delta,
     },
     brandCoverage: latest.brandCoverage,
+    brandBindingStats: latest.brandBindingStats || [],
     inventory: latest.inventory,
     trends: {
       assetTrend: buildAssetTrendSeries({
