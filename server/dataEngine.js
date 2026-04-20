@@ -1025,6 +1025,46 @@ function computeBrand3DCoverageStats(activeRows) {
     .slice(0, 30);
 }
 
+function computeBrandDigitizationStats(activeRows, dim) {
+  const map = new Map();
+  const isLinkedCode = (v) => {
+    const s = String(v ?? '').trim();
+    return s !== '' && s !== '-' && s !== '0';
+  };
+  const isHas3D = (r) => (dim === 'last' ? Boolean(r?.__has3DLast) : Boolean(r?.__has3DSole));
+  const codeField = dim === 'last' ? 'lastCode' : 'soleCode';
+
+  for (const r of activeRows || []) {
+    const brand = normalize(r?.brand ?? 'Unknown') || 'Unknown';
+    const cur = map.get(brand) || { brand, total: 0, hasCode: 0, has3D: 0 };
+    cur.total += 1;
+    const hasCode = isLinkedCode(r?.[codeField]);
+    if (hasCode) cur.hasCode += 1;
+    if (hasCode && isHas3D(r)) cur.has3D += 1;
+    map.set(brand, cur);
+  }
+
+  return Array.from(map.values())
+    .map((x) => {
+      const segment_no_code = Math.max(0, x.total - x.hasCode);
+      const segment_has_code_no_3d = Math.max(0, x.hasCode - x.has3D);
+      const segment_completed_3d = Math.max(0, x.has3D);
+      const completionRate = x.total > 0 ? Math.round((x.has3D / x.total) * 1000) / 10 : 0;
+      return {
+        brand: x.brand,
+        totalEffective: x.total,
+        hasCode: x.hasCode,
+        has3D: x.has3D,
+        segment_no_code,
+        segment_has_code_no_3d,
+        segment_completed_3d,
+        completionRate,
+      };
+    })
+    .sort((a, b) => (b.totalEffective || 0) - (a.totalEffective || 0))
+    .slice(0, 30);
+}
+
 function computeBrandBindingStats(activeRows) {
   const map = new Map();
   const isLinkedCode = (v) => {
@@ -1819,6 +1859,8 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
   const brandCoverage = computeBrand3DCoverageStats(activeRows);
 
   const brandBindingStats = computeBrandBindingStats(activeRows);
+  const lastDigitizationStats = computeBrandDigitizationStats(activeRows, 'last');
+  const soleDigitizationStats = computeBrandDigitizationStats(activeRows, 'sole');
 
   const inventoryOut = inventory.map(({ __has3DAny, __has3DLast, __has3DSole, ...rest }) => rest);
 
@@ -1854,6 +1896,8 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
     },
     brandCoverage,
     brandBindingStats,
+    lastDigitizationStats,
+    soleDigitizationStats,
     inventory: inventoryOut,
     meta: { mainTable: main.fileName, requiredCols: required, mainRowCount: main.rows?.length || 0, source: 'data_tables' },
   };
@@ -1907,6 +1951,8 @@ export async function processAllData({ storageRoot }) {
     },
     brandCoverage: latest.brandCoverage,
     brandBindingStats: latest.brandBindingStats || [],
+    lastDigitizationStats: latest.lastDigitizationStats || [],
+    soleDigitizationStats: latest.soleDigitizationStats || [],
     inventory: latest.inventory,
     trends: {
       assetTrend: buildAssetTrendSeries({

@@ -47,6 +47,26 @@ type DashboardStatsResponse = {
     soleLinked: number;
     last3DMatched: number;
   }>;
+  lastDigitizationStats?: Array<{
+    brand: string;
+    totalEffective: number;
+    hasCode: number;
+    has3D: number;
+    segment_no_code: number;
+    segment_has_code_no_3d: number;
+    segment_completed_3d: number;
+    completionRate: number;
+  }>;
+  soleDigitizationStats?: Array<{
+    brand: string;
+    totalEffective: number;
+    hasCode: number;
+    has3D: number;
+    segment_no_code: number;
+    segment_has_code_no_3d: number;
+    segment_completed_3d: number;
+    completionRate: number;
+  }>;
   trends?: { assetTrend?: AssetTrendStats[] };
   error?: string;
 };
@@ -125,6 +145,15 @@ export default function Dashboard() {
     if (!b) return;
     // 本项目无路由：用 localStorage 驱动导航与预过滤
     localStorage.setItem('inventoryBrandFilter', b);
+    localStorage.setItem('currentView', 'inventory');
+    window.location.reload();
+  };
+
+  const drilldownToInventory = (brand: string, dimension: 'last' | 'sole', bucket: 'no_code' | 'has_code_no_3d' | 'completed_3d') => {
+    const b = String(brand || '').trim();
+    if (!b) return;
+    localStorage.setItem('inventoryBrandFilter', b);
+    localStorage.setItem('inventoryDrilldown', JSON.stringify({ dimension, bucket }));
     localStorage.setItem('currentView', 'inventory');
     window.location.reload();
   };
@@ -336,174 +365,163 @@ export default function Dashboard() {
         </div>
       </div>
 
-      {/* Charts Section */}
+      {/* Digitization Leaderboards */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-
-        {/* Left column: two stacked cards */}
-        <div className="flex flex-col gap-6">
-          {/* Brand Coverage */}
-          <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm flex flex-col">
-            <div className="flex justify-between items-center mb-6">
-              <h3 className="text-base font-semibold text-slate-900">各品牌 3D 覆盖统计</h3>
-              <span className="text-xs text-slate-500">按款号数量统计</span>
-            </div>
-          <div className="flex-1 min-h-[400px] w-full">
-              <ResponsiveContainer width="100%" height="100%">
-              <BarChart
-                data={stats?.brandCoverage || []}
-                layout="vertical"
-                margin={{ top: 10, right: 10, left: 20, bottom: 0 }}
-              >
+        {/* Last Digitization */}
+        <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm flex flex-col">
+          <div className="flex justify-between items-center mb-6">
+            <h3 className="text-base font-semibold text-slate-900">楦头数字化全链路进度 (Last Digitization)</h3>
+            <span className="text-xs text-slate-500">Total → HasCode → Has3D</span>
+          </div>
+          <div className="flex-1 min-h-[420px] w-full">
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={stats?.lastDigitizationStats || []} layout="vertical" margin={{ top: 10, right: 16, left: 20, bottom: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
                 <XAxis type="number" axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
-                <YAxis
-                  type="category"
-                  dataKey="brand"
-                  axisLine={false}
-                  tickLine={false}
-                  width={150}
-                  tick={{ fill: '#64748b', fontSize: 12, textAnchor: 'end' }}
-                />
+                <YAxis type="category" dataKey="brand" axisLine={false} tickLine={false} width={160} tick={{ fill: '#64748b', fontSize: 12, textAnchor: 'end' }} />
                 <RechartsTooltip
                   cursor={{ fill: '#f8fafc' }}
                   content={({ active, payload }) => {
                     if (!active || !payload?.length) return null;
                     const p: any = payload?.[0]?.payload || {};
                     return (
-                      <div className="rounded-lg border border-slate-200 bg-white shadow-sm px-3 py-2 text-xs text-slate-700">
-                        <div className="font-medium text-slate-900 mb-1">{p.brand}</div>
-                        <div>该品牌总生效款：{p.totalActive ?? (p.linked + p.unlinked)}</div>
-                        <div>已绑定楦：{p.lastLinkedCount ?? '-'}</div>
-                        <div>已匹配 3D：{p.last3DMatchedCount ?? p.linked}</div>
+                      <div className="rounded-lg border border-slate-700 bg-slate-900/90 shadow-sm px-3 py-2 text-xs text-white">
+                        <div className="font-medium text-white mb-1">{p.brand}</div>
+                        <div className="text-white/90">总生效款：{p.totalEffective}</div>
+                        <div className="text-white/90">已绑编号：{p.hasCode}</div>
+                        <div className="text-white/90">已完成 3D：{p.has3D}</div>
+                        <div className="text-white/90">完成率：{p.completionRate}%</div>
                       </div>
                     );
                   }}
                 />
-                <Legend iconType="circle" wrapperStyle={{ fontSize: '13px', paddingTop: '12px' }} />
-                <Bar dataKey="linked" name="已关联 3D" stackId="a" fill="#10b981" maxBarSize={18} />
-                <Bar dataKey="unlinked" name="未关联/缺失" stackId="a" fill="#f59e0b" maxBarSize={18} />
-              </BarChart>
-              </ResponsiveContainer>
-            </div>
-          </div>
-
-          {/* Brand Binding Stats */}
-          <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm flex flex-col">
-            <div className="flex justify-between items-center mb-6">
-              <h3 className="text-base font-semibold text-slate-900">各品牌基础数据绑定率 (Data Completeness)</h3>
-            </div>
-            <div className="flex-1 min-h-[400px] w-full">
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart
-                  data={stats?.brandBindingStats || []}
-                  layout="vertical"
-                  margin={{ top: 10, right: 10, left: 20, bottom: 0 }}
-                  onClick={(state: any) => {
-                    const brand = state?.activePayload?.[0]?.payload?.brand;
-                    if (brand) handleBrandBindingClick(String(brand));
+                <Legend
+                  iconType="circle"
+                  verticalAlign="bottom"
+                  wrapperStyle={{ fontSize: '13px', paddingTop: '10px' }}
+                  payload={[
+                    { value: '已匹配 3D', type: 'circle', color: '#10b981' },
+                    { value: '已绑编号 (待 3D)', type: 'circle', color: '#38bdf8' },
+                    { value: '基础信息缺失 (未绑编号)', type: 'circle', color: '#e2e8f0' },
+                  ]}
+                />
+                <Bar
+                  dataKey="segment_completed_3d"
+                  name="已匹配 3D"
+                  stackId="a"
+                  fill="#10b981"
+                  maxBarSize={18}
+                  onClick={(_, idx) => {
+                    const row: any = (stats?.lastDigitizationStats || [])[idx];
+                    if (row?.brand) drilldownToInventory(String(row.brand), 'last', 'completed_3d');
                   }}
                 >
-                  <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
-                  <XAxis type="number" domain={[0, 100]} axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
-                  <YAxis
-                    type="category"
-                    dataKey="brand"
-                    axisLine={false}
-                    tickLine={false}
-                    width={150}
-                    tick={{ fill: '#64748b', fontSize: 12, textAnchor: 'end' }}
-                  />
-                  <RechartsTooltip
-                    cursor={{ fill: '#f8fafc' }}
-                    content={({ active, payload }) => {
-                      if (!active || !payload?.length) return null;
-                      const p: any = payload?.[0]?.payload || {};
-                      return (
-                        <div className="rounded-lg border border-slate-700 bg-slate-900/90 shadow-sm px-3 py-2 text-xs text-white">
-                          <div className="font-medium text-white mb-1">{p.brand}</div>
-                          <div className="text-white/90">该品牌总生效款：{p.totalEffective ?? '-'}</div>
-                          <div className="text-white/90">已绑定楦：{p.lastLinked ?? '-'}</div>
-                          <div className="text-white/90">已绑定底：{p.soleLinked ?? '-'}</div>
-                          <div className="text-white/90">已匹配 3D：{p.last3DMatched ?? '-'}</div>
-                        </div>
-                      );
-                    }}
-                  />
-                  <Legend
-                    iconType="circle"
-                    verticalAlign="bottom"
-                    wrapperStyle={{ fontSize: '13px', paddingTop: '10px' }}
-                    formatter={(value) =>
-                      value === 'lastBindingRate'
-                        ? '楦头绑定率 (Last ID Linked)'
-                        : value === 'soleBindingRate'
-                          ? '大底绑定率 (Sole ID Linked)'
-                          : value
-                    }
-                  />
-                  <Bar dataKey="lastBindingRate" name="lastBindingRate" fill="#0ea5e9" radius={[4, 4, 4, 4]} maxBarSize={16}>
-                    <LabelList dataKey="lastBindingRate" position="right" formatter={(v: any) => `${v}%`} />
-                  </Bar>
-                  <Bar dataKey="soleBindingRate" name="soleBindingRate" fill="#6366f1" radius={[4, 4, 4, 4]} maxBarSize={16}>
-                    <LabelList dataKey="soleBindingRate" position="right" formatter={(v: any) => `${v}%`} />
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-          </div>
-        </div>
-
-        {/* Right: Trend Area Chart */}
-        <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm flex flex-col">
-          <div className="flex justify-between items-center mb-6">
-            <h3 className="text-base font-semibold text-slate-900">3D 资产新增趋势</h3>
-            <div className="flex bg-slate-100 p-1 rounded-lg">
-              {(['day', 'week', 'month', 'quarter', 'year'] as const).map((period) => (
-                <button
-                  key={period}
-                  onClick={() => handlePeriodChange(period)}
-                  className={cn(
-                    "px-3 py-1.5 text-xs font-medium rounded-md transition-colors",
-                    trendPeriod === period ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"
-                  )}
-                >
-                  {period === 'day' ? '日' : period === 'week' ? '周' : period === 'month' ? '月' : period === 'quarter' ? '季' : '年'}
-                </button>
-              ))}
-            </div>
-          </div>
-          <div className="flex-1 min-h-[350px] w-full relative">
-            {isLoading && (
-              <div className="absolute inset-0 z-10 flex items-center justify-center bg-white/50 backdrop-blur-sm rounded-lg">
-                <Loader2 className="w-8 h-8 text-blue-500 animate-spin" />
-              </div>
-            )}
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={chartData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
-                <defs>
-                  <linearGradient id="colorLasts" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#0ea5e9" stopOpacity={0.3}/>
-                    <stop offset="95%" stopColor="#0ea5e9" stopOpacity={0}/>
-                  </linearGradient>
-                  <linearGradient id="colorSoles" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#8b5cf6" stopOpacity={0.3}/>
-                    <stop offset="95%" stopColor="#8b5cf6" stopOpacity={0}/>
-                  </linearGradient>
-                </defs>
-                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
-                <XAxis dataKey="date" axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} dy={10} />
-                <YAxis axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
-                <RechartsTooltip 
-                  contentStyle={{ borderRadius: '8px', border: '1px solid #e2e8f0', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }}
+                  <LabelList dataKey="completionRate" position="right" formatter={(v: any) => `${v}%`} />
+                </Bar>
+                <Bar
+                  dataKey="segment_has_code_no_3d"
+                  name="已绑编号 (待 3D)"
+                  stackId="a"
+                  fill="#38bdf8"
+                  maxBarSize={18}
+                  onClick={(_, idx) => {
+                    const row: any = (stats?.lastDigitizationStats || [])[idx];
+                    if (row?.brand) drilldownToInventory(String(row.brand), 'last', 'has_code_no_3d');
+                  }}
                 />
-                <Legend iconType="circle" wrapperStyle={{ fontSize: '13px', paddingTop: '20px' }} />
-                <Area type="monotone" dataKey="newLasts" name="新增 3D 楦" stroke="#0ea5e9" strokeWidth={2} fillOpacity={1} fill="url(#colorLasts)" />
-                <Area type="monotone" dataKey="newSoles" name="新增 3D 底" stroke="#8b5cf6" strokeWidth={2} fillOpacity={1} fill="url(#colorSoles)" />
-              </AreaChart>
+                <Bar
+                  dataKey="segment_no_code"
+                  name="基础信息缺失 (未绑编号)"
+                  stackId="a"
+                  fill="#e2e8f0"
+                  maxBarSize={18}
+                  onClick={(_, idx) => {
+                    const row: any = (stats?.lastDigitizationStats || [])[idx];
+                    if (row?.brand) drilldownToInventory(String(row.brand), 'last', 'no_code');
+                  }}
+                />
+              </BarChart>
             </ResponsiveContainer>
           </div>
         </div>
 
+        {/* Sole Digitization */}
+        <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm flex flex-col">
+          <div className="flex justify-between items-center mb-6">
+            <h3 className="text-base font-semibold text-slate-900">大底数字化全链路进度 (Sole Digitization)</h3>
+            <span className="text-xs text-slate-500">Total → HasCode → Has3D</span>
+          </div>
+          <div className="flex-1 min-h-[420px] w-full">
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={stats?.soleDigitizationStats || []} layout="vertical" margin={{ top: 10, right: 16, left: 20, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
+                <XAxis type="number" axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
+                <YAxis type="category" dataKey="brand" axisLine={false} tickLine={false} width={160} tick={{ fill: '#64748b', fontSize: 12, textAnchor: 'end' }} />
+                <RechartsTooltip
+                  cursor={{ fill: '#f8fafc' }}
+                  content={({ active, payload }) => {
+                    if (!active || !payload?.length) return null;
+                    const p: any = payload?.[0]?.payload || {};
+                    return (
+                      <div className="rounded-lg border border-slate-700 bg-slate-900/90 shadow-sm px-3 py-2 text-xs text-white">
+                        <div className="font-medium text-white mb-1">{p.brand}</div>
+                        <div className="text-white/90">总生效款：{p.totalEffective}</div>
+                        <div className="text-white/90">已绑编号：{p.hasCode}</div>
+                        <div className="text-white/90">已完成 3D：{p.has3D}</div>
+                        <div className="text-white/90">完成率：{p.completionRate}%</div>
+                      </div>
+                    );
+                  }}
+                />
+                <Legend
+                  iconType="circle"
+                  verticalAlign="bottom"
+                  wrapperStyle={{ fontSize: '13px', paddingTop: '10px' }}
+                  payload={[
+                    { value: '已匹配 3D', type: 'circle', color: '#10b981' },
+                    { value: '已绑编号 (待 3D)', type: 'circle', color: '#38bdf8' },
+                    { value: '基础信息缺失 (未绑编号)', type: 'circle', color: '#e2e8f0' },
+                  ]}
+                />
+                <Bar
+                  dataKey="segment_completed_3d"
+                  name="已匹配 3D"
+                  stackId="a"
+                  fill="#10b981"
+                  maxBarSize={18}
+                  onClick={(_, idx) => {
+                    const row: any = (stats?.soleDigitizationStats || [])[idx];
+                    if (row?.brand) drilldownToInventory(String(row.brand), 'sole', 'completed_3d');
+                  }}
+                >
+                  <LabelList dataKey="completionRate" position="right" formatter={(v: any) => `${v}%`} />
+                </Bar>
+                <Bar
+                  dataKey="segment_has_code_no_3d"
+                  name="已绑编号 (待 3D)"
+                  stackId="a"
+                  fill="#38bdf8"
+                  maxBarSize={18}
+                  onClick={(_, idx) => {
+                    const row: any = (stats?.soleDigitizationStats || [])[idx];
+                    if (row?.brand) drilldownToInventory(String(row.brand), 'sole', 'has_code_no_3d');
+                  }}
+                />
+                <Bar
+                  dataKey="segment_no_code"
+                  name="基础信息缺失 (未绑编号)"
+                  stackId="a"
+                  fill="#e2e8f0"
+                  maxBarSize={18}
+                  onClick={(_, idx) => {
+                    const row: any = (stats?.soleDigitizationStats || [])[idx];
+                    if (row?.brand) drilldownToInventory(String(row.brand), 'sole', 'no_code');
+                  }}
+                />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
       </div>
     </div>
   );

@@ -162,6 +162,7 @@ export default function InventoryList() {
   const [has3DFilter, setHas3DFilter] = useState<string>('all');
   const [brandFilter, setBrandFilter] = useState<string>('all');
   const [searchTerm, setSearchTerm] = useState<string>('');
+  const [drilldown, setDrilldown] = useState<{ dimension: 'last' | 'sole'; bucket: 'no_code' | 'has_code_no_3d' | 'completed_3d' } | null>(null);
   const [items, setItems] = useState<InventoryItem[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -180,6 +181,17 @@ export default function InventoryList() {
       if (preset) {
         setBrandFilter(preset);
         localStorage.removeItem('inventoryBrandFilter');
+      }
+      const dd = localStorage.getItem('inventoryDrilldown');
+      if (dd) {
+        const parsed = JSON.parse(dd);
+        if (parsed && (parsed.dimension === 'last' || parsed.dimension === 'sole') && typeof parsed.bucket === 'string') {
+          setDrilldown({
+            dimension: parsed.dimension,
+            bucket: parsed.bucket,
+          } as any);
+        }
+        localStorage.removeItem('inventoryDrilldown');
       }
     } catch {
       // ignore
@@ -226,10 +238,26 @@ export default function InventoryList() {
         return style.includes(q) || brand.includes(q) || lastCode.includes(q) || soleCode.includes(q);
       });
     }
+
+    // 图表钻取：按责任区间过滤（无 UI 暴露，来自 Dashboard 点击）
+    if (drilldown) {
+      if (drilldown.dimension === 'last') {
+        if (drilldown.bucket === 'no_code') out = out.filter((x) => !String(x.lastCode || '').trim());
+        if (drilldown.bucket === 'has_code_no_3d')
+          out = out.filter((x) => Boolean(String(x.lastCode || '').trim()) && x.lastStatus !== 'matched');
+        if (drilldown.bucket === 'completed_3d') out = out.filter((x) => x.lastStatus === 'matched');
+      } else {
+        if (drilldown.bucket === 'no_code') out = out.filter((x) => !String(x.soleCode || '').trim());
+        if (drilldown.bucket === 'has_code_no_3d')
+          out = out.filter((x) => Boolean(String(x.soleCode || '').trim()) && x.soleStatus !== 'matched');
+        if (drilldown.bucket === 'completed_3d') out = out.filter((x) => x.soleStatus === 'matched');
+      }
+    }
+
     if (has3DFilter === 'all') return out;
     if (has3DFilter === 'yes') return out.filter((x) => x.lastStatus === 'matched' || x.soleStatus === 'matched');
     return out.filter((x) => x.lastStatus !== 'matched' && x.soleStatus !== 'matched');
-  }, [brandFilter, has3DFilter, items, searchTerm]);
+  }, [brandFilter, has3DFilter, items, searchTerm, drilldown]);
 
   return (
     <div className="space-y-6 animate-in fade-in duration-500 pb-10">
