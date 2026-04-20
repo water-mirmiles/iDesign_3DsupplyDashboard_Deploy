@@ -75,9 +75,9 @@ export function Sidebar({ currentView, onNavigate, onLogout }: SidebarProps) {
 
 export function Layout({ children, currentView, onNavigate, onLogout }: { children: React.ReactNode, currentView: string, onNavigate: (view: string) => void, onLogout: () => void }) {
   return (
-    <div className="flex h-screen bg-slate-50 overflow-hidden font-sans">
+    <div className="flex h-screen min-h-0 bg-slate-50 overflow-hidden font-sans">
       <Sidebar currentView={currentView} onNavigate={onNavigate} onLogout={onLogout} />
-      <main className="flex-1 overflow-y-auto">
+      <main className="flex-1 h-screen min-h-0 overflow-y-auto">
         <div className="w-full px-4 py-4">
           {children}
         </div>

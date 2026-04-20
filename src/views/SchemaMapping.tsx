@@ -162,7 +162,7 @@ type DdlColumn = {
 
 type AiTable = { tableName: string; columns: Array<{ name: string; comment?: string }> };
 type AiSuggestion = { standardKey: string; sourceField: string; sourceTable: string };
-type AiJoinPath = { targetStandardKey: string; path: string[] };
+type AiJoinPath = { targetStandardKey: string; path?: string[]; joinPath?: any };
 type AiConcatPart = { sourceField: string; sourceTable: string; joinPath?: string[] };
 type AiConcatSuggestion = { standardKey: string; parts: AiConcatPart[]; operator?: string };
 
@@ -171,22 +171,53 @@ function mergeAiSuggestionsIntoStandardFields(
   prev: GlobalSchemaField[],
   sug: AiSuggestion[],
   jp: AiJoinPath[],
-  concatSuggestions: AiConcatSuggestion[]
+  concatSuggestions: AiConcatSuggestion[],
+  lockedStandardKeys: Set<string>
 ): GlobalSchemaField[] {
   const next = prev.map((f) => ({ ...f, mappedSources: [...(f.mappedSources || [])] }));
   for (const s of sug) {
     const target = next.find((f) => f.standardKey === s.standardKey);
     if (!target) continue;
+    if (lockedStandardKeys.has(s.standardKey)) continue;
     target.mappedSources = [`${s.sourceField}@${s.sourceTable}`];
   }
+  const normalizeStructuredToLegacyPath = (joinPath: any): string[] => {
+    if (!Array.isArray(joinPath) || joinPath.length < 2) return [];
+    // hop: {sourceTable,sourceField,targetTable,targetField} ... terminal: {targetTable,valueField}
+    const out: string[] = [];
+    for (let i = 0; i < joinPath.length; i++) {
+      const seg = joinPath[i];
+      if (!seg || typeof seg !== 'object') return [];
+      const isLast = i === joinPath.length - 1;
+      if (!isLast) {
+        const st = String((seg as any).sourceTable || '').trim();
+        const sf = String((seg as any).sourceField || '').trim();
+        const tt = String((seg as any).targetTable || '').trim();
+        const tf = String((seg as any).targetField || '').trim();
+        if (!st || !sf || !tt || !tf) return [];
+        if (out.length === 0) out.push(`${st}.${sf}`, `${tt}.${tf}`);
+        else out.push(`${tt}.${tf}`);
+      } else {
+        const tt = String((seg as any).targetTable || '').trim();
+        const vf = String((seg as any).valueField || '').trim();
+        if (!tt || !vf) return [];
+        out.push(`${tt}.${vf}`);
+      }
+    }
+    return out;
+  };
   for (const j of jp) {
     const target = next.find((f) => f.standardKey === j.targetStandardKey);
     if (!target) continue;
-    target.mappedSources = [`CHAIN|${j.path.join('->')}`];
+    if (lockedStandardKeys.has(j.targetStandardKey)) continue;
+    const pathArr =
+      Array.isArray(j.path) && j.path.length >= 2 ? j.path : j.joinPath ? normalizeStructuredToLegacyPath(j.joinPath) : [];
+    if (pathArr.length >= 2) target.mappedSources = [`CHAIN|${pathArr.join('->')}`];
   }
   for (const c of concatSuggestions) {
     const target = next.find((f) => f.standardKey === c.standardKey);
     if (!target || !Array.isArray(c.parts) || c.parts.length < 2) continue;
+    if (lockedStandardKeys.has(c.standardKey)) continue;
     const tokens = c.parts
       .map((p) => {
         const jpArr = Array.isArray(p.joinPath) ? p.joinPath.map((x) => String(x).trim()).filter(Boolean) : [];
@@ -204,6 +235,36 @@ function mergeAiSuggestionsIntoStandardFields(
 
 function normalize(s: string) {
   return (s || '').trim().toLowerCase();
+}
+
+/** 与后端 buildTableNameIndex 一致：数据文件名 → 逻辑表名 */
+function logicalTableFromDataFile(fileName: string) {
+  const base = String(fileName || '').replace(/\.(xlsx|xls)$/i, '');
+  return base.replace(/^\d{8}_/, '');
+}
+
+/** 非主表 CHAIN 首段：主表外键列候选（brand 优先用列名 brand） */
+function fkColumnCandidatesForStandardKey(standardKey: string): string[] {
+  const sk = String(standardKey || '').trim();
+  const out: string[] = [];
+  if (sk === 'brand') out.push('brand', 'brand_id', 'base_brand_id', 'wms_brand_id');
+  if (sk === 'lastCode') out.push('associated_last', 'associated_last_type', 'last_id', 'last_type_id');
+  if (sk === 'soleCode') out.push('associated_sole_info', 'sole_id', 'associated_sole');
+  if (sk === 'colorCode') out.push('initial_sample_color_id', 'color_id');
+  if (sk === 'materialCode') out.push('material_id', 'main_material');
+  if (sk) out.push(`${sk}_id`, sk);
+  return [...new Set(out.filter(Boolean))];
+}
+
+function pickFkColumnOnMaster(masterCols: string[], standardKey: string): string {
+  const set = new Set(masterCols.map((c) => String(c)));
+  const lowerToOrig = new Map(masterCols.map((c) => [String(c).trim().toLowerCase(), c]));
+  for (const cand of fkColumnCandidatesForStandardKey(standardKey)) {
+    if (set.has(cand)) return cand;
+    const lo = lowerToOrig.get(cand.toLowerCase());
+    if (lo) return lo;
+  }
+  return '';
 }
 
 function sortDdlColumnsForGolden(
@@ -236,6 +297,14 @@ type GoldenDimensionRow = {
 /** Step2 AI 学习区：按标准维度分组的样本（持久化字段名 dimensionSamples） */
 type DimensionSamplesState = Record<string, { targetGoal: string; rows: GoldenDimensionRow[] }>;
 
+type DraftDimensionSamples = Record<
+  string,
+  {
+    targetValue: string;
+    samples: Array<{ tableName: string; fieldName: string; sampleValue: string; notes: string; rowId?: string }>;
+  }
+>;
+
 function createEmptyDimensionSamples(): DimensionSamplesState {
   const o: DimensionSamplesState = {};
   for (const f of initialStandardFields) {
@@ -250,44 +319,6 @@ function newGoldenRowId() {
 
 function emptyGoldenDimensionRow(): GoldenDimensionRow {
   return { id: newGoldenRowId(), notes: '', segments: [{ tableName: '', fieldName: '', value: '' }] };
-}
-
-function normalizeDraftDimensionSamples(raw: unknown): DimensionSamplesState {
-  const base = createEmptyDimensionSamples();
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return base;
-  const rec = raw as Record<string, unknown>;
-  for (const f of initialStandardFields) {
-    const g = rec[f.standardKey];
-    if (!g || typeof g !== 'object' || Array.isArray(g)) continue;
-    const go = g as { targetGoal?: unknown; rows?: unknown };
-    const targetGoal = typeof go.targetGoal === 'string' ? go.targetGoal : '';
-    const rowsRaw = Array.isArray(go.rows) ? go.rows : [];
-    const rows: GoldenDimensionRow[] = [];
-    rowsRaw.forEach((r: unknown, idx: number) => {
-      if (!r || typeof r !== 'object' || Array.isArray(r)) return;
-      const ro = r as { id?: unknown; notes?: unknown; segments?: unknown };
-      const segments = Array.isArray(ro.segments)
-        ? ro.segments.map((seg: unknown) => {
-            if (!seg || typeof seg !== 'object' || Array.isArray(seg)) {
-              return { tableName: '', fieldName: '', value: '' };
-            }
-            const s = seg as { tableName?: unknown; fieldName?: unknown; value?: unknown };
-            return {
-              tableName: typeof s.tableName === 'string' ? s.tableName : '',
-              fieldName: typeof s.fieldName === 'string' ? s.fieldName : '',
-              value: typeof s.value === 'string' ? s.value : '',
-            };
-          })
-        : [];
-      rows.push({
-        id: typeof ro.id === 'string' && ro.id.trim() ? ro.id.trim() : `d_${idx}_${newGoldenRowId()}`,
-        notes: typeof ro.notes === 'string' ? ro.notes : '',
-        segments: segments.length ? segments : [{ tableName: '', fieldName: '', value: '' }],
-      });
-    });
-    base[f.standardKey] = { targetGoal, rows };
-  }
-  return base;
 }
 
 function migrateLegacyGoldenSamplesToByDimension(gs: unknown[]): DimensionSamplesState {
@@ -343,7 +374,8 @@ function flattenDimensionSamplesForLegacySave(g: DimensionSamplesState) {
   return out;
 }
 
-function serializeDimensionSamplesForApi(g: DimensionSamplesState) {
+/** legacy/AI payload：targetGoal + rows[].segments（保留 rowId 与 notes） */
+function serializeDimensionSamplesForAiLegacy(g: DimensionSamplesState) {
   const o: Record<
     string,
     { targetGoal: string; rows: { id: string; notes: string; segments: GoldenSampleSegment[] }[] }
@@ -364,6 +396,144 @@ function serializeDimensionSamplesForApi(g: DimensionSamplesState) {
     };
   }
   return o;
+}
+
+/** draft payload（所见即所得最高优先级）：targetValue + samples[] */
+function serializeDimensionSamplesForDraft(g: DimensionSamplesState): DraftDimensionSamples {
+  const out: DraftDimensionSamples = {};
+  for (const f of initialStandardFields) {
+    const b = g[f.standardKey] || { targetGoal: '', rows: [] };
+    out[f.standardKey] = {
+      targetValue: String(b.targetGoal || ''),
+      samples: (b.rows || []).flatMap((r) => {
+        const notes = String(r?.notes || '');
+        const rowId = String(r?.id || '');
+        const segs = Array.isArray(r?.segments) ? r.segments : [];
+        return segs.map((s) => ({
+          tableName: String(s?.tableName || ''),
+          fieldName: String(s?.fieldName || ''),
+          sampleValue: String(s?.value || ''),
+          notes,
+          rowId,
+        }));
+      }),
+    };
+  }
+  return out;
+}
+
+function suggestTableFieldFromDdl(parsedTableMap: Record<string, Column[]>, standardKey: string): { tableName: string; fieldName: string } {
+  const sk = String(standardKey || '').trim();
+  const keywords: string[] =
+    sk === 'styleCode'
+      ? ['style', 'style_wms', '款号', 'style_no']
+      : sk === 'brand'
+        ? ['brand', '品牌', 'brand_name', 'name']
+        : sk === 'lastCode'
+          ? ['last', '楦', 'code', 'last_code']
+          : sk === 'soleCode'
+            ? ['sole', '底', 'heel', 'code', 'sole_code']
+            : sk === 'colorCode'
+              ? ['color', '颜色', 'colour', 'code', 'color_code']
+              : sk === 'materialCode'
+                ? ['material', '材质', 'category', 'code', 'name', 'material_code', 'category_code']
+                : sk === 'status'
+                  ? ['status', '状态', 'data_status', '生效', '有效']
+                  : [];
+
+  let best: { tableName: string; fieldName: string; score: number } | null = null;
+  for (const [tn, cols] of Object.entries(parsedTableMap || {})) {
+    for (const c of cols || []) {
+      const name = String(c?.name || '').trim();
+      const comment = String((c as any)?.comment || '').trim();
+      if (!name) continue;
+      const hay = `${name} ${comment}`.toLowerCase();
+      let score = 0;
+      for (const kw of keywords) {
+        const k = String(kw).toLowerCase();
+        if (!k) continue;
+        if (hay.includes(k)) score += 10;
+      }
+      if (sk.endsWith('Code') && name.toLowerCase() === 'code') score += 8;
+      if (sk === 'brand' && name.toLowerCase() === 'brand_name') score += 12;
+      if (score <= 0) continue;
+      if (!best || score > best.score) best = { tableName: tn, fieldName: name, score };
+    }
+  }
+  return best ? { tableName: best.tableName, fieldName: best.fieldName } : { tableName: '', fieldName: '' };
+}
+
+function normalizeDraftDimensionSamples(raw: unknown): DimensionSamplesState {
+  // New draft shape: { targetValue, samples[] }
+  const base = createEmptyDimensionSamples();
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return base;
+  const rec = raw as Record<string, unknown>;
+  for (const f of initialStandardFields) {
+    const g = rec[f.standardKey];
+    if (!g || typeof g !== 'object' || Array.isArray(g)) continue;
+    const go = g as any;
+    // preferred
+    if (Array.isArray(go.samples)) {
+      const targetGoal = typeof go.targetValue === 'string' ? String(go.targetValue) : '';
+      const samples = go.samples as any[];
+      const byRow = new Map<string, GoldenDimensionRow>();
+      samples.forEach((s, idx) => {
+        const rowId = typeof s?.rowId === 'string' && s.rowId.trim() ? s.rowId.trim() : `r_${idx}_${newGoldenRowId()}`;
+        const row = byRow.get(rowId) || { id: rowId, notes: typeof s?.notes === 'string' ? s.notes : '', segments: [] };
+        // keep last non-empty notes
+        const nextNotes = typeof s?.notes === 'string' ? s.notes : '';
+        if (nextNotes) row.notes = nextNotes;
+        row.segments.push({
+          tableName: typeof s?.tableName === 'string' ? s.tableName : '',
+          fieldName: typeof s?.fieldName === 'string' ? s.fieldName : '',
+          value: typeof s?.sampleValue === 'string' ? s.sampleValue : '',
+        });
+        byRow.set(rowId, row);
+      });
+      base[f.standardKey] = { targetGoal, rows: Array.from(byRow.values()).filter((r) => r.segments.length) };
+      continue;
+    }
+  }
+  // fallback to legacy shape if new shape absent
+  return normalizeDraftDimensionSamplesLegacy(raw, base);
+}
+
+function normalizeDraftDimensionSamplesLegacy(raw: unknown, baseIn?: DimensionSamplesState): DimensionSamplesState {
+  const base = baseIn || createEmptyDimensionSamples();
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return base;
+  const rec = raw as Record<string, unknown>;
+  for (const f of initialStandardFields) {
+    const g = rec[f.standardKey];
+    if (!g || typeof g !== 'object' || Array.isArray(g)) continue;
+    const go = g as { targetGoal?: unknown; rows?: unknown };
+    const targetGoal = typeof go.targetGoal === 'string' ? go.targetGoal : '';
+    const rowsRaw = Array.isArray(go.rows) ? go.rows : [];
+    const rows: GoldenDimensionRow[] = [];
+    rowsRaw.forEach((r: unknown, idx: number) => {
+      if (!r || typeof r !== 'object' || Array.isArray(r)) return;
+      const ro = r as { id?: unknown; notes?: unknown; segments?: unknown };
+      const segments = Array.isArray(ro.segments)
+        ? ro.segments.map((seg: unknown) => {
+            if (!seg || typeof seg !== 'object' || Array.isArray(seg)) {
+              return { tableName: '', fieldName: '', value: '' };
+            }
+            const s = seg as { tableName?: unknown; fieldName?: unknown; value?: unknown };
+            return {
+              tableName: typeof s.tableName === 'string' ? s.tableName : '',
+              fieldName: typeof s.fieldName === 'string' ? s.fieldName : '',
+              value: typeof s.value === 'string' ? s.value : '',
+            };
+          })
+        : [];
+      rows.push({
+        id: typeof ro.id === 'string' && ro.id.trim() ? ro.id.trim() : `d_${idx}_${newGoldenRowId()}`,
+        notes: typeof ro.notes === 'string' ? ro.notes : '',
+        segments: segments.length ? segments : [{ tableName: '', fieldName: '', value: '' }],
+      });
+    });
+    base[f.standardKey] = { targetGoal, rows };
+  }
+  return base;
 }
 
 type DdlSchemaResponse = {
@@ -406,6 +576,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
   /** 避免草稿尚未从服务器恢复前用户编辑被后续 setState 覆盖 */
   const [schemaDraftLoadState, setSchemaDraftLoadState] = useState<'loading' | 'ready'>('loading');
   const [draftSaveFeedback, setDraftSaveFeedback] = useState(false);
+  const [draftSaving, setDraftSaving] = useState(false);
   const draftSaveFeedbackTimerRef = useRef<number | null>(null);
   const step2DimGroupRef = useRef<Record<string, HTMLDivElement | null>>({});
   const [concatPickNext, setConcatPickNext] = useState(false);
@@ -434,6 +605,11 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
   const [certifyEngineRunning, setCertifyEngineRunning] = useState(false);
   /** Step4：最近一次 AI 建模成功后仍为空的维度（用于提示「尽力了」而非笼统「未回填」） */
   const [aiUnfilledAfterRun, setAiUnfilledAfterRun] = useState<Record<string, boolean>>({});
+  /** 手动纠偏锁定：一旦用户手动点选字段，该维度不允许被 AI 覆盖 */
+  const [lockedStandardKeys, setLockedStandardKeys] = useState<Set<string>>(() => new Set());
+  const [conversationalInput, setConversationalInput] = useState('');
+  const [chatToConfigBusy, setChatToConfigBusy] = useState(false);
+  const [reviewTweakOpen, setReviewTweakOpen] = useState(false);
   const [authSyncHint, setAuthSyncHint] = useState<string>('');
   const authSyncHintTimerRef = useRef<number | null>(null);
 
@@ -489,10 +665,15 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
   const previewMatchByStandardKey = useMemo(() => {
     const out: Record<string, { expected: string; actual: string; ok: boolean; hasExpectation: boolean }> = {};
     for (const f of initialStandardFields) {
-      const expected = String(expectedByStandardKey[f.standardKey] || '').trim();
-      const actual = String(actualByStandardKey[f.standardKey] || '').trim();
+      const expected = String(expectedByStandardKey[f.standardKey] ?? '').trim();
+      const actual = String(actualByStandardKey[f.standardKey] ?? '').trim();
       const hasExpectation = Boolean(expected);
-      out[f.standardKey] = { expected, actual, hasExpectation, ok: hasExpectation ? expected === actual : false };
+      out[f.standardKey] = {
+        expected,
+        actual,
+        hasExpectation,
+        ok: hasExpectation && expected === actual,
+      };
     }
     return out;
   }, [actualByStandardKey, expectedByStandardKey]);
@@ -589,16 +770,17 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
 
   const saveSchemaDraft = useCallback(async () => {
     try {
-      const serialized = serializeDimensionSamplesForApi(dimensionSamples);
+      const dimensionSamplesDraft = serializeDimensionSamplesForDraft(dimensionSamples);
+      const legacy = serializeDimensionSamplesForAiLegacy(dimensionSamples);
       const data = {
         ddlText,
         masterTable,
-        dimensionSamples: serialized,
-        goldenByDimension: serialized,
-        goldenSamples: flattenDimensionSamplesForLegacySave(dimensionSamples),
+        dimensionSamples: dimensionSamplesDraft,
+        goldenByDimension: legacy,
+        goldenSamples: flattenDimensionSamplesForLegacySave(dimensionSamples), // 兼容旧后端/Prompt
       };
       // eslint-disable-next-line no-console
-      console.log('🚀 准备发送草稿:', data);
+      console.log('💾 正在保存全量配置:', data);
 
       const resp = await fetch(`${API_BASE}/api/save-schema-draft`, {
         method: 'POST',
@@ -679,11 +861,12 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
       return;
     }
     let alive = true;
+    let lastPartialRevision = 0;
     const tick = async () => {
       try {
         const resp = await fetch(`${API_BASE}/api/ai-status`);
         if (!resp.ok) return;
-        const json = (await resp.json()) as { ok: boolean; status?: string; message?: string; model?: string; parsedCount?: number; totalCount?: number; parsedTables?: string[] };
+        const json = (await resp.json()) as any;
         if (!alive || !json?.ok) return;
         const model = json.model ? `正在尝试模型: ${json.model}` : '';
         const msg = json.message ? String(json.message) : '';
@@ -694,6 +877,24 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
           total: Number(json.totalCount || 0),
           tables: Array.isArray(json.parsedTables) ? json.parsedTables.map(String) : [],
         });
+
+        const rev = Number(json.partialRevision || 0);
+        const partial = json.partial && typeof json.partial === 'object' ? json.partial : null;
+        if (rev && partial && rev > lastPartialRevision) {
+          lastPartialRevision = rev;
+          const sug = Array.isArray(partial.smartSuggestions) ? partial.smartSuggestions : [];
+          const jp = Array.isArray(partial.joinPathSuggestions) ? partial.joinPathSuggestions : [];
+          const cc = Array.isArray(partial.concatMappingSuggestions) ? partial.concatMappingSuggestions : [];
+          let mergedFields: GlobalSchemaField[] = [];
+          flushSync(() => {
+            setStandardFields((prev) => {
+              mergedFields = mergeAiSuggestionsIntoStandardFields(prev, sug, jp, cc, lockedStandardKeys);
+              return mergedFields;
+            });
+          });
+          const mappingNow = buildCertifiedMapping(mergedFields);
+          void runPreviewMappingRow(mappingNow);
+        }
       } catch {
         // ignore polling errors
       }
@@ -918,16 +1119,21 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
       setAiTables([]);
       const controller = new AbortController();
       const t = window.setTimeout(() => controller.abort(), 180000);
+      const payload = {
+        sqlText: ddlText,
+        masterTable: masterTable || undefined,
+        // AI 仅消费 legacy 结构（targetGoal/rows/segments）；dimensionSamples 用于草稿持久化
+        goldenByDimension: serializeDimensionSamplesForAiLegacy(dimensionSamples),
+        // 兼容旧 Prompt：扁平化样本（每一行保留用户选定的 tableName/fieldName）
+        goldenSamples: flattenDimensionSamplesForLegacySave(dimensionSamples),
+      };
+      // eslint-disable-next-line no-console
+      console.log('[ai-parse-multi-sql] payload:', payload);
       const resp = await fetch(`${API_BASE}/api/ai-parse-multi-sql`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,
-        body: JSON.stringify({
-          sqlText: ddlText,
-          masterTable: masterTable || undefined,
-          dimensionSamples: serializeDimensionSamplesForApi(dimensionSamples),
-          goldenByDimension: serializeDimensionSamplesForApi(dimensionSamples),
-        }),
+        body: JSON.stringify(payload),
       });
       window.clearTimeout(t);
       const text = await resp.text();
@@ -978,7 +1184,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
       let mergedFields: GlobalSchemaField[] = [];
       flushSync(() => {
         setStandardFields((prev) => {
-          mergedFields = mergeAiSuggestionsIntoStandardFields(prev, sug, jp, concatSug);
+          mergedFields = mergeAiSuggestionsIntoStandardFields(prev, sug, jp, concatSug, lockedStandardKeys);
           return mergedFields;
         });
       });
@@ -1032,9 +1238,25 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
   };
 
   const assignPhysicalColumn = (physicalColumn: string, sourceFile: string) => {
-    const tok = `${physicalColumn}@${sourceFile}`;
     const append = concatPickNext;
     if (append) setConcatPickNext(false);
+
+    const masterLogical = String(masterTable || '').trim();
+    const targetLogical = logicalTableFromDataFile(sourceFile);
+    const buildToken = (): string => {
+      if (append) return `${physicalColumn}@${sourceFile}`;
+      if (masterLogical && targetLogical && targetLogical !== masterLogical) {
+        const masterFile =
+          Object.keys(tables || {}).find((fn) => logicalTableFromDataFile(fn) === masterLogical) || '';
+        const masterCols = masterFile ? tables[masterFile] || [] : [];
+        const fk = pickFkColumnOnMaster(masterCols, activeFieldKey);
+        const fkUse = fk || `${activeFieldKey}_id`;
+        return `CHAIN|${masterLogical}.${fkUse}->${targetLogical}.id->${targetLogical}.${physicalColumn}`;
+      }
+      return `${physicalColumn}@${sourceFile}`;
+    };
+    const tok = buildToken();
+
     let nextFields: GlobalSchemaField[] = [];
     flushSync(() => {
       setStandardFields((prev) => {
@@ -1049,6 +1271,12 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
         });
         return nextFields;
       });
+    });
+    // 手动纠偏后锁定该维度：后续 AI 建模不允许覆盖
+    setLockedStandardKeys((prev) => {
+      const next = new Set(prev);
+      next.add(activeFieldKey);
+      return next;
     });
     if (nextFields.length) void runPreviewMappingRow(buildCertifiedMapping(nextFields));
   };
@@ -1296,10 +1524,112 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
         {/* Step 2: 动态样本配置（核心重构） */}
         <div className="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
           <div className="px-3 py-2 bg-slate-900 text-white flex items-center justify-between gap-2">
-            <div className="text-sm font-semibold">Step 2 · AI 学习区（动态样本配置）</div>
-            <div className="text-[11px] text-slate-200">严禁分析后清空：配置会一直保留并可保存草稿</div>
+            <div className="text-sm font-semibold">Step 2 · 对话驱动型智能配置中心（Chat-first）</div>
+            <div className="text-[11px] text-slate-200">描述业务案例 → 一键智能建模 → 结果自动验证</div>
           </div>
           <div className="p-3 space-y-3">
+            <div className="border border-slate-200 rounded-xl overflow-hidden bg-slate-50/40">
+              <div className="px-3 py-2 bg-white border-b border-slate-200 flex items-center justify-between gap-2 flex-wrap">
+                <div className="text-[11px] font-semibold text-slate-800">业务场景描述 (Conversational Input)</div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={step12Disabled || chatToConfigBusy || !String(conversationalInput || '').trim()}
+                    onClick={async () => {
+                      setChatToConfigBusy(true);
+                      setError(null);
+                      try {
+                        const resp = await fetch(`${API_BASE}/api/parse-chat-to-samples`, {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({
+                            text: conversationalInput,
+                            masterTable: masterTable || undefined,
+                            ddlTableNames,
+                            ddlText,
+                          }),
+                        });
+                        const json = (await resp.json().catch(() => null)) as any;
+                        if (!resp.ok || !json?.ok) throw new Error(json?.error || `HTTP ${resp.status}`);
+                        const ds = json.dimensionSamples && typeof json.dimensionSamples === 'object' ? (json.dimensionSamples as any) : null;
+                        if (!ds) throw new Error('AI 返回的 dimensionSamples 为空');
+
+                        // 自动补全 tableName/fieldName：基于 Step1 解析出的 DDL 字段做快速启发式匹配
+                        const next: DimensionSamplesState = createEmptyDimensionSamples();
+                        for (const f of initialStandardFields) {
+                          const k = f.standardKey;
+                          const blk = ds[k] && typeof ds[k] === 'object' ? ds[k] : { targetGoal: '', rows: [] };
+                          const targetGoal = String(blk?.targetGoal || '');
+                          const rowsRaw = Array.isArray(blk?.rows) ? blk.rows : [];
+                          const suggestion = suggestTableFieldFromDdl(parsedTableMap, k);
+                          const rows = rowsRaw
+                            .map((r: any) => {
+                              const notes = String(r?.notes || '');
+                              const id = String(r?.id || '') || newGoldenRowId();
+                              const segs = Array.isArray(r?.segments) ? r.segments : [];
+                              const segments = segs.map((s: any) => {
+                                const value = String(s?.value ?? '');
+                                const tableName = String(s?.tableName || '').trim() || suggestion.tableName;
+                                const fieldName = String(s?.fieldName || '').trim() || suggestion.fieldName;
+                                return { tableName, fieldName, value };
+                              });
+                              return {
+                                id,
+                                notes,
+                                segments: segments.length
+                                  ? segments
+                                  : [{ tableName: suggestion.tableName, fieldName: suggestion.fieldName, value: '' }],
+                              };
+                            })
+                            .filter(
+                              (r: any) =>
+                                Array.isArray(r.segments) && r.segments.some((s: any) => String(s?.value || '').trim() !== '')
+                            );
+                          next[k] = { targetGoal, rows };
+                        }
+                        setDimensionSamples(next);
+                        setReviewTweakOpen(false);
+
+                        // 直接触发 AI 建模（串行维度 + 回测闭环）
+                        const r = await handleAiLogicModeling();
+                        if (!r.ok) throw new Error(r.error);
+                      } catch (e) {
+                        const msg = e instanceof Error ? e.message : String(e);
+                        setError(msg);
+                      } finally {
+                        setChatToConfigBusy(false);
+                      }
+                    }}
+                    className="px-4 py-2 text-[12px] font-semibold rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
+                    title="解析业务描述 → 自动预填配置 → 直接执行 AI 智能建模"
+                  >
+                    {chatToConfigBusy ? 'AI 智能建模中…' : 'AI 智能建模'}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={step12Disabled}
+                    onClick={() => setReviewTweakOpen((v) => !v)}
+                    className="px-3 py-2 text-[11px] font-semibold rounded-lg bg-white border border-slate-200 text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                    title="展开后可查看 AI 识别详情并手动微调"
+                  >
+                    {reviewTweakOpen ? '收起：识别详情与微调' : '展开：识别详情与微调'}
+                  </button>
+                </div>
+              </div>
+              <div className="p-3 space-y-2 bg-white">
+                <div className="text-[11px] text-slate-600">
+                  请直接描述一个真实的业务数据案例。例如：‘款号 A 对应品牌 B，楦头是 C，材质是由 D 和 E 拼成的’。
+                </div>
+                <textarea
+                  value={conversationalInput}
+                  onChange={(e) => setConversationalInput(e.target.value)}
+                  placeholder="请直接描述一个真实的业务数据案例。例如：‘款号 A 对应品牌 B，楦头是 C，材质是由 D 和 E 拼成的’。"
+                  className="w-full min-h-[260px] p-3 text-xs border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent resize-y text-slate-800 bg-white"
+                  disabled={step12Disabled || chatToConfigBusy}
+                />
+              </div>
+            </div>
+
             <div className="grid grid-cols-12 gap-2 items-end">
               <div className="col-span-12 lg:col-span-6">
                 <div className="text-[11px] font-medium text-slate-700 mb-1">业务主表（Master Table）</div>
@@ -1323,7 +1653,9 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                 <button
                   type="button"
                   onClick={async () => {
+                    setDraftSaving(true);
                     const r = await saveSchemaDraft();
+                    setDraftSaving(false);
                     if (r.ok) {
                       setDraftSaveFeedback(true);
                       if (draftSaveFeedbackTimerRef.current) window.clearTimeout(draftSaveFeedbackTimerRef.current);
@@ -1334,7 +1666,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                   className="px-3 py-2 text-[11px] font-semibold rounded-lg bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-50"
                   title="写入 server/storage/schema_draft.json"
                 >
-                  {draftSaveFeedback ? '✅ 已存至服务器' : '保存当前配置草稿'}
+                  {draftSaving ? '正在保存...' : draftSaveFeedback ? '✅ 成功存至服务器(持久化)' : '保存当前配置草稿'}
                 </button>
                 <button
                   type="button"
@@ -1366,11 +1698,17 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
               </div>
             </div>
 
-            <div className="border border-slate-200 rounded-xl">
-              <div className="px-3 py-2 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-2 flex-wrap">
-                <div className="text-[11px] font-semibold text-slate-800">动态黄金样本（按 7 个标准维度分组）</div>
+            {!reviewTweakOpen ? (
+              <div className="border border-slate-200 rounded-xl bg-slate-50/40 px-3 py-3 text-[11px] text-slate-600">
+                <span className="font-semibold text-slate-800">AI 识别详情与手动微调 (Review &amp; Tweak)</span>
+                <span className="ml-2 text-slate-500">默认已折叠。点击上方按钮展开后，可查看维度分组样本并进行微调。</span>
               </div>
-              <div className="p-3 space-y-3">
+            ) : (
+              <div className="border border-slate-200 rounded-xl">
+                <div className="px-3 py-2 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-2 flex-wrap">
+                  <div className="text-[11px] font-semibold text-slate-800">AI 识别详情与手动微调 (Review &amp; Tweak)</div>
+                </div>
+                <div className="p-3 space-y-3">
                 <div className="text-[11px] text-slate-600">
                   每个维度独立配置<strong>目标期望值</strong>与若干<strong>样本行</strong>。行内可用「+ 组合」为多段物理字段（拼接），并在右侧填写<strong>逻辑备注/线索</strong>告知
                   AI（例如父类/子类）。例：材质目标 <code className="font-mono">LT04</code>，两行分别备注「这是父类」「这是子类，需拼接」。
@@ -1670,8 +2008,9 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                     })}
                   </div>
                 )}
+                </div>
               </div>
-            </div>
+            )}
           </div>
         </div>
         </div>
@@ -1740,8 +2079,10 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                 const isConcat = m.operator === 'CONCAT' || token.startsWith('CONCAT|');
                 const pm = previewMatchByStandardKey[m.standardKey] || { expected: '', actual: '', ok: false, hasExpectation: false };
                 const hasPreview = Boolean(pm.actual);
-                const isMismatch = has && pm.hasExpectation && hasPreview && !pm.ok;
-                const isMatched = has && pm.hasExpectation && hasPreview && pm.ok;
+                const isMismatch = has && pm.hasExpectation && !pm.ok;
+                const isMatched = has && pm.hasExpectation && pm.ok;
+                const brandIdWarning =
+                  m.standardKey === 'brand' && hasPreview && /^\d+$/.test(String(pm.actual).trim());
                 return (
                   <button
                     key={m.standardKey}
@@ -1758,15 +2099,17 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                       isActive ? "border-indigo-500 ring-2 ring-indigo-100" : "border-slate-200 hover:bg-slate-50",
                       !has
                         ? "bg-slate-50"
-                        : isMismatch
-                          ? "bg-orange-50/60 border-orange-200"
-                          : isMatched
-                            ? "bg-emerald-50/60 border-emerald-200"
-                            : isConcat
-                              ? "bg-violet-50/50"
-                              : isJoin
-                                ? "bg-amber-50/40"
-                                : "bg-emerald-50/40"
+                        : brandIdWarning
+                          ? "bg-amber-50/70 border-amber-300"
+                          : isMismatch
+                            ? "bg-orange-50/60 border-orange-200"
+                            : isMatched
+                              ? "bg-emerald-50/60 border-emerald-200"
+                              : isConcat
+                                ? "bg-violet-50/50"
+                                : isJoin
+                                  ? "bg-amber-50/40"
+                                  : "bg-emerald-50/40"
                     )}
                   >
                     <div className="flex items-center justify-between gap-2">
@@ -1815,6 +2158,11 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                         预览：<span className={cn('font-mono', isMatched ? 'text-emerald-700' : isMismatch ? 'text-orange-700' : 'text-slate-700')}>{pm.actual || '-'}</span>
                       </div>
                     )}
+                    {brandIdWarning && (
+                      <div className="mt-1 text-[10px] font-medium text-amber-700 bg-amber-50/80 border border-amber-200/80 rounded px-1.5 py-0.5">
+                        检测到 ID，请检查是否需要关联品牌名称表
+                      </div>
+                    )}
                   </button>
                 );
               })}
@@ -1832,6 +2180,35 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                 </div>
               </div>
               <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={async () => {
+                    try {
+                      const resp = await fetch(`${API_BASE}/api/engine-audit-log`);
+                      const json = (await resp.json().catch(() => null)) as any;
+                      if (!resp.ok || !json?.ok) throw new Error(json?.error || `HTTP ${resp.status}`);
+                      const text = String(json.text || '');
+                      const w = window.open('', '_blank');
+                      if (!w) return;
+                      w.document.open();
+                      w.document.write(
+                        `<pre style="white-space:pre-wrap;word-break:break-word;font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;font-size:12px;margin:16px;">${text
+                          .replace(/&/g, '&amp;')
+                          .replace(/</g, '&lt;')
+                          .replace(/>/g, '&gt;')}</pre>`
+                      );
+                      w.document.close();
+                    } catch (e) {
+                      // eslint-disable-next-line no-console
+                      console.warn('[engine-audit-log] open failed', e);
+                    }
+                  }}
+                  className="px-3 py-1.5 text-[11px] font-semibold rounded-lg border disabled:opacity-50 bg-white border-slate-200 text-slate-700 hover:bg-slate-50"
+                  title="打开 server/storage/engine_audit.log"
+                >
+                  下载/查看完整逻辑审计日志
+                </button>
                 <button
                   type="button"
                   onClick={() => setConcatPickNext((v) => !v)}

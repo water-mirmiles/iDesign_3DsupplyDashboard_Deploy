@@ -1,6 +1,7 @@
 import fse from 'fs-extra';
 import path from 'path';
 import XLSX from 'xlsx';
+import { fileURLToPath } from 'url';
 
 function isDateDirName(name) {
   return /^\d{4}-\d{2}-\d{2}$/.test(name);
@@ -47,23 +48,100 @@ function parseConcatPipeToken(physicalColumn) {
   return parts.length >= 2 ? parts : null;
 }
 
-/** 比较单元格与查找键：trim、数字/字符串宽松相等 */
+/** 比较单元格与查找键：强制 trim + toLowerCase，消除 Excel 数字/字符串形态差异 */
 export function valuesEqualForJoin(a, b) {
-  if (a === b) return true;
-  const sa = a == null ? '' : String(a).trim();
-  const sb = b == null ? '' : String(b).trim();
-  if (sa === sb) return true;
-  if (sa === '' || sb === '') return false;
-  const na = Number(sa);
-  const nb = Number(sb);
-  if (Number.isFinite(na) && Number.isFinite(nb) && na === nb) return true;
-  return false;
+  const sa = a == null ? '' : String(a).trim().toLowerCase();
+  const sb = b == null ? '' : String(b).trim().toLowerCase();
+  return sa === sb;
+}
+
+function engineLogPath() {
+  const __filename = fileURLToPath(import.meta.url);
+  const __dirname = path.dirname(__filename);
+  return path.join(__dirname, 'storage', 'engine.log');
+}
+
+function engineAuditLogPath() {
+  const __filename = fileURLToPath(import.meta.url);
+  const __dirname = path.dirname(__filename);
+  return path.join(__dirname, 'storage', 'engine_audit.log');
+}
+
+function appendEngineLogSync(line) {
+  try {
+    const p = engineLogPath();
+    fse.ensureDirSync(path.dirname(p));
+    fse.appendFileSync(p, `${String(line ?? '')}\n`, { encoding: 'utf8' });
+  } catch {
+    // ignore: file logging should never break engine runtime
+  }
+}
+
+function appendEngineAuditLogSync(line) {
+  try {
+    const p = engineAuditLogPath();
+    fse.ensureDirSync(path.dirname(p));
+    fse.appendFileSync(p, `${String(line ?? '')}\n`, { encoding: 'utf8' });
+  } catch {
+    // ignore
+  }
+}
+
+export function clearEngineLogSync() {
+  try {
+    const p = engineLogPath();
+    fse.ensureDirSync(path.dirname(p));
+    fse.writeFileSync(p, '', { encoding: 'utf8' });
+  } catch {
+    // ignore
+  }
+}
+
+export function clearEngineAuditLogSync() {
+  try {
+    const p = engineAuditLogPath();
+    fse.ensureDirSync(path.dirname(p));
+    fse.writeFileSync(p, '', { encoding: 'utf8' });
+  } catch {
+    // ignore
+  }
+}
+
+export function auditLineSync(line) {
+  const out = String(line ?? '');
+  if (!out) return;
+  appendEngineAuditLogSync(out);
 }
 
 function engineJoinTrace(enabled, message) {
   if (!enabled) return;
   // eslint-disable-next-line no-console
   console.log(`[Engine] ${message}`);
+}
+
+function traceJoin(enabled, message) {
+  if (!enabled) return;
+  const line = `[Trace] ${message}`;
+  // eslint-disable-next-line no-console
+  console.log(line);
+  appendEngineLogSync(line);
+  appendEngineAuditLogSync(line);
+}
+
+function traceLine(line) {
+  const out = String(line ?? '');
+  if (!out) return;
+  // eslint-disable-next-line no-console
+  console.log(out);
+  if (out.startsWith('[Trace]')) {
+    appendEngineLogSync(out);
+    appendEngineAuditLogSync(out);
+  }
+}
+
+function setJoinDiag(diagnosticsMap, key, msg) {
+  if (!diagnosticsMap || !key) return;
+  if (!diagnosticsMap.has(key)) diagnosticsMap.set(key, msg);
 }
 
 /** 按表头宽松匹配列名（trim / 大小写），从行上取值 */
@@ -203,15 +281,32 @@ export function parseJoinPathFromConfig({ joinPath, physicalColumn }) {
 
 /**
  * 万能递归路径解析：主表行出发，按 hop 在维表中逐层定位行，终端段读取 valueField。
- * @param {{ trace?: boolean, traceLabel?: string }} [opts] — traceLabel 用于首跳「字段: xxx」日志
+ * @param {{ trace?: boolean, traceLabel?: string, standardKey?: string, diagnosticsMap?: Map<string,string> }} [opts]
  */
-export function resolveRecursiveValue({ mainRow, mainTableName, joinPath, tablesMap, trace = false, traceLabel = '' }) {
+export function resolveRecursiveValue({
+  mainRow,
+  mainTableName,
+  joinPath,
+  tablesMap,
+  trace = false,
+  traceLabel = '',
+  standardKey = '',
+  diagnosticsMap = null,
+}) {
   const path = Array.isArray(joinPath) ? normalizeStructuredJoinPath(joinPath) : null;
-  if (!path?.length) return '';
+  const sk = normalize(standardKey) || normalize(traceLabel);
+
+  if (!path?.length) {
+    setJoinDiag(diagnosticsMap, sk, 'Invalid Or Empty Join Path');
+    return '';
+  }
+
+  if (trace) traceJoin(true, `正在处理维度: ${sk || 'join'}`);
 
   let currentRow = mainRow;
   let currentTable = normalize(mainTableName);
   const mainKey = normalize(mainTableName);
+  let hopStep = 0;
 
   for (let i = 0; i < path.length; i++) {
     const seg = path[i];
@@ -222,16 +317,16 @@ export function resolveRecursiveValue({ mainRow, mainTableName, joinPath, tables
       const tt = normalize(seg.targetTable);
       const vf = normalize(seg.valueField);
       if (normalize(currentTable) !== tt) {
-        engineJoinTrace(trace, `终端段表名不匹配：当前 ${currentTable}，期望 ${tt}`);
+        setJoinDiag(diagnosticsMap, sk, `Join Path Table Mismatch (expected ${tt}, got ${currentTable})`);
+        traceJoin(trace, `匹配结果: 失败 (终端表不一致: 当前 ${currentTable}，期望 ${tt})`);
         return '';
       }
-      const termTbl = tablesMap.get(tt);
+      const termTbl = getTableFromMap(tt, tablesMap);
       const headers = termTbl?.headers || [];
-      engineJoinTrace(trace, `找到匹配行，准备提取 ${vf} 的值...`);
       const v = getRowFieldLoose(currentRow, vf, headers);
       const out = v == null ? '' : normalize(v);
-      if (out !== '') engineJoinTrace(trace, `提取成功: ${out}`);
-      else engineJoinTrace(trace, `提取失败: 字段 ${vf} 为空或不存在`);
+      traceJoin(trace, `最终提取列 ${vf} 的值: ${out === '' ? '(空)' : out}`);
+      if (out === '') setJoinDiag(diagnosticsMap, sk, `Join Terminal Empty: ${tt}.${vf}`);
       return out;
     }
 
@@ -242,7 +337,8 @@ export function resolveRecursiveValue({ mainRow, mainTableName, joinPath, tables
     const tf = normalize(seg.targetField);
 
     if (i > 0 && normalize(currentTable) !== st) {
-      engineJoinTrace(trace, `Join 中断：当前表 ${currentTable} 与 hop.sourceTable ${st} 不一致`);
+      setJoinDiag(diagnosticsMap, sk, `Join Path Broken: current table ${currentTable} !== hop.sourceTable ${st}`);
+      traceJoin(trace, `匹配结果: 失败 (链路表名不一致)`);
       return '';
     }
     if (i === 0 && st && currentTable && st !== currentTable) {
@@ -252,27 +348,30 @@ export function resolveRecursiveValue({ mainRow, mainTableName, joinPath, tables
     const srcHeaders = i === 0 ? tablesMap.get(mainKey)?.headers || [] : tablesMap.get(st)?.headers || [];
     const rawKey = getRowFieldLoose(currentRow, sf, srcHeaders);
     if (rawKey == null || normalize(rawKey) === '') {
-      engineJoinTrace(trace, `起点值为空，字段 ${sf}（表 ${i === 0 ? mainKey : st}）`);
+      setJoinDiag(diagnosticsMap, sk, `Join Source Empty: ${i === 0 ? mainKey : st}.${sf}`);
+      traceJoin(trace, `匹配结果: 失败 (源字段无值)`);
       return '';
     }
 
-    const fieldTag = i === 0 && traceLabel ? traceLabel : sf;
-    engineJoinTrace(trace, `起点值: ${rawKey} (字段: ${fieldTag})`);
+    if (i === 0 && trace) traceJoin(true, `起始值: ${rawKey} (来自主表)`);
 
-    const tbl = tablesMap.get(tt);
+    hopStep += 1;
+    const tbl = getTableFromMap(tt, tablesMap);
     if (!tbl?.rows?.length) {
-      engineJoinTrace(trace, `维表 ${tt} 无数据行`);
+      setJoinDiag(diagnosticsMap, sk, `Table Not Found: ${tt}`);
+      traceJoin(trace, `步骤 ${hopStep}: 在表 ${tt} 中匹配 ${tf} === ${rawKey}`);
+      traceJoin(trace, `匹配结果: 失败 (未找到行)`);
       return '';
     }
 
-    engineJoinTrace(trace, `正在表 ${tt} 中寻找 ${tf} = ${rawKey} 的行...`);
+    traceJoin(trace, `步骤 ${hopStep}: 在表 ${tt} 中匹配 ${tf} === ${rawKey}`);
     const hit = tbl.rows.find((r) => valuesEqualForJoin(getRowFieldLoose(r, tf, tbl.headers), rawKey));
+    traceJoin(trace, `匹配结果: ${hit ? '成功' : '失败 (未找到行)'}`);
     if (!hit) {
-      engineJoinTrace(trace, `未在表 ${tt} 中找到 ${tf} = ${rawKey} 的行`);
+      setJoinDiag(diagnosticsMap, sk, `Join Match Failed: ${tt}.${tf}=${rawKey}`);
       return '';
     }
 
-    engineJoinTrace(trace, `已在表 ${tt} 中命中行，继续 Join 链路`);
     currentRow = hit;
     currentTable = tt;
   }
@@ -376,7 +475,9 @@ function resolveScalarMappingPart(part, mainRow, mainTableName, tablesMap, stand
   if (!part) return '';
   const trace = Boolean(options.trace);
   const lbl = normalize(options.traceLabel) || normalize(standardKeyHint);
-  const recOpts = { trace, traceLabel: lbl };
+  const sk = normalize(options.standardKey) || lbl;
+  const diagnosticsMap = options.diagnosticsMap;
+  const recOpts = { trace, traceLabel: lbl, standardKey: sk, diagnosticsMap };
   if (Array.isArray(part.joinPath) && part.joinPath.length >= 2) {
     if (typeof part.joinPath[0] === 'object' && part.joinPath[0] !== null) {
       return resolveRecursiveValue({ mainRow, mainTableName, joinPath: part.joinPath, tablesMap, ...recOpts });
@@ -403,6 +504,7 @@ function resolveScalarMappingPart(part, mainRow, mainTableName, tablesMap, stand
         standardKey: standardKeyHint,
         trace,
         traceLabel: lbl,
+        diagnosticsMap,
       });
       if (cross !== '') return cross;
     }
@@ -420,7 +522,8 @@ function resolveStandardMappedValue(entry, mainRow, mainTableName, tablesMap, fa
   const trace = Boolean(options.trace);
   const traceLabel = normalize(options.traceLabel);
   const sk = entry ? normalize(entry.standardKey) : '';
-  const ro = { trace, traceLabel: traceLabel || sk };
+  const diagnosticsMap = options.diagnosticsMap;
+  const ro = { trace, traceLabel: traceLabel || sk, standardKey: sk, diagnosticsMap };
   if (!entry) {
     if (!fallbackCol) return '';
     const mainTbl = tablesMap.get(normalize(mainTableName));
@@ -428,6 +531,21 @@ function resolveStandardMappedValue(entry, mainRow, mainTableName, tablesMap, fa
     return v == null ? '' : normalize(v);
   }
   if (entry.mode === 'concat' && Array.isArray(entry.parts)) {
+    if (sk === 'materialCode' && entry.parts.length >= 2) {
+      const partVals = entry.parts.map((p, idx) => {
+        const v = resolveScalarMappingPart(p, mainRow, mainTableName, tablesMap, sk, ro);
+        traceLine(
+          `[Trace][materialCode CONCAT / LT04] part[${idx}] => ${JSON.stringify({
+            physicalColumn: p.physicalColumn,
+            sourceField: p.sourceField,
+            sourceTable: p.sourceTable,
+            joinPathLen: Array.isArray(p.joinPath) ? p.joinPath.length : 0,
+          })} | resolved="${v}"`
+        );
+        return v;
+      });
+      return partVals.join('');
+    }
     return entry.parts.map((p) => resolveScalarMappingPart(p, mainRow, mainTableName, tablesMap, sk, ro)).join('');
   }
   if (entry.mode === 'simple' && Array.isArray(entry.joinPath) && entry.joinPath.length >= 2) {
@@ -555,6 +673,12 @@ function getXlsxTableByLogicalName(logicalName, tablesMap) {
   return null;
 }
 
+function getTableFromMap(tableKey, tablesMap) {
+  const k = normalize(tableKey);
+  if (!k || !(tablesMap instanceof Map)) return null;
+  return tablesMap.get(k) || getXlsxTableByLogicalName(k, tablesMap);
+}
+
 /** 主表行上用于关联维表的外键列猜测（含 brand→brand） */
 function fkTryOrder(standardKey) {
   const sk = normalize(standardKey);
@@ -605,9 +729,14 @@ function resolveHeuristicDimLookup({
   standardKey,
   trace = false,
   traceLabel = '',
+  diagnosticsMap = null,
 }) {
+  const sk = normalize(standardKey) || normalize(traceLabel);
   const dim = getXlsxTableByLogicalName(dimLogical, tablesMap);
-  if (!dim?.rows?.length) return '';
+  if (!dim?.rows?.length) {
+    setJoinDiag(diagnosticsMap, sk, `Table Not Found: ${dimLogical}`);
+    return '';
+  }
   if (normalize(dimLogical) === normalize(mainTableName)) return '';
 
   const mainTbl = tablesMap.get(normalize(mainTableName));
@@ -626,6 +755,7 @@ function resolveHeuristicDimLookup({
   const hit = dim.rows.find((r) => valuesEqualForJoin(getRowFieldLoose(r, keyCol, headers), fkVal));
   if (!hit) {
     engineJoinTrace(trace, `未在表 ${dimLogical} 中找到 ${keyCol} = ${fkVal} 的行`);
+    setJoinDiag(diagnosticsMap, sk, `Join Match Failed: ${dimLogical}.${keyCol}=${fkVal}`);
     return '';
   }
 
@@ -633,7 +763,10 @@ function resolveHeuristicDimLookup({
   const v = getRowFieldLoose(hit, valueCol, headers);
   const out = v == null ? '' : normalize(v);
   if (out !== '') engineJoinTrace(trace, `提取成功: ${out}`);
-  else engineJoinTrace(trace, `提取失败: 字段 ${valueCol} 为空或不存在`);
+  else {
+    engineJoinTrace(trace, `提取失败: 字段 ${valueCol} 为空或不存在`);
+    setJoinDiag(diagnosticsMap, sk, `Join Terminal Empty: ${dimLogical}.${valueCol}`);
+  }
   return out;
 }
 
@@ -644,6 +777,11 @@ function buildTablesMap(xlsxTables) {
     map.set(tableName, t);
   }
   return map;
+}
+
+/** 读取目录下全部 Excel，构建与聚合引擎一致的 tablesMap（预览前强制调用以保证最新磁盘内容） */
+export async function readAllFilesFromFolder(folderPath) {
+  return loadExcelFolderAsTablesMap(folderPath);
 }
 
 /** 读取目录下全部 Excel，构建与聚合引擎一致的 tablesMap */
@@ -933,20 +1071,54 @@ export async function persistFinalDashboardData(storageRoot, payload) {
   return outPath;
 }
 
+function expectsDimensionJoin(entry) {
+  if (!entry) return false;
+  if (entry.mode === 'concat') return true;
+  if (Array.isArray(entry.joinPath) && entry.joinPath.length >= 2) return true;
+  if (normalize(entry.physicalColumn).startsWith('CHAIN|')) return true;
+  const fileRef = normalize(entry.sourceTable);
+  if (fileRef && isSpreadsheetFileRef(fileRef)) return true;
+  return false;
+}
+
+/** 预览模式：禁止把未解析的外键当业务值返回，并合并引擎诊断信息 */
+function previewSanitizeField(fieldKey, entry, value, row, mainTableName, tablesMap, fallbackCol, diagnosticsMap) {
+  if (!diagnosticsMap || !entry) return value;
+  const sk = normalize(fieldKey);
+  const existing = diagnosticsMap.get(sk);
+  if (existing) return '';
+  if (!expectsDimensionJoin(entry)) return value;
+
+  const mainHeaders = tablesMap.get(normalize(mainTableName))?.headers || [];
+  if (value === '' || value == null) {
+    setJoinDiag(diagnosticsMap, sk, 'Join Match Failed');
+    return '';
+  }
+  if (fallbackCol) {
+    const raw = getRowFieldLoose(row, fallbackCol, mainHeaders);
+    if (raw != null && normalize(value) === normalize(raw) && normalize(raw) !== '') {
+      setJoinDiag(diagnosticsMap, sk, 'Join Likely Unresolved: value equals source FK column');
+      return '';
+    }
+  }
+  return value;
+}
+
 /**
  * 在任意目录（如 storage/sandbox）上跑与 aggregateForDateRoot 相同的解析逻辑，取第一条生效行用于沙盒校验。
+ * @param {{ preload?: { xlsxTables: unknown[], tablesMap: Map }, previewStrict?: boolean }} [opts]
  */
-export async function resolveFirstActiveRowFromFolder({ folderPath, standardMap, traceJoins = false }) {
-  const excelFiles = (await listFiles(folderPath)).filter((n) => ['.xlsx', '.xls'].includes(path.extname(n).toLowerCase()));
-  if (!excelFiles.length) {
+export async function resolveFirstActiveRowFromFolder({
+  folderPath,
+  standardMap,
+  traceJoins = false,
+  preload = null,
+  previewStrict = false,
+}) {
+  const { xlsxTables, tablesMap } = preload ?? (await readAllFilesFromFolder(folderPath));
+  if (!xlsxTables?.length) {
     return { ok: false, error: 'sandbox 目录下没有 XLSX 文件', row: null, mainTable: null };
   }
-  const xlsxTables = excelFiles.map((fileName) => {
-    const fullPath = path.join(folderPath, fileName);
-    const { headers, rows } = readSheetRows(fullPath);
-    return { fileName, fullPath, headers, rows };
-  });
-  const tablesMap = buildTablesMap(xlsxTables);
 
   const styleCol = columnNameForMainRow(standardMap.get('styleCode'));
   const brandCol = columnNameForMainRow(standardMap.get('brand'));
@@ -964,9 +1136,15 @@ export async function resolveFirstActiveRowFromFolder({ folderPath, standardMap,
   }
 
   const mainTableName = buildTableNameIndex(main.fileName);
-  const traceOpts = (label) => (traceJoins ? { trace: true, traceLabel: label } : {});
+  const diagnosticsMap = previewStrict ? new Map() : null;
+  const traceOpts = (label) => ({
+    trace: traceJoins,
+    traceLabel: label,
+    standardKey: label,
+    ...(previewStrict ? { diagnosticsMap } : {}),
+  });
   const tryRow = (row) => {
-    const brandVal = resolveStandardMappedValue(
+    const brandRaw = resolveStandardMappedValue(
       standardMap.get('brand'),
       row,
       mainTableName,
@@ -974,7 +1152,7 @@ export async function resolveFirstActiveRowFromFolder({ folderPath, standardMap,
       brandCol,
       traceOpts('brand')
     );
-    const lastCodeVal = resolveStandardMappedValue(
+    const lastRaw = resolveStandardMappedValue(
       standardMap.get('lastCode'),
       row,
       mainTableName,
@@ -982,7 +1160,7 @@ export async function resolveFirstActiveRowFromFolder({ folderPath, standardMap,
       lastCol,
       traceOpts('lastCode')
     );
-    const soleCodeVal = resolveStandardMappedValue(
+    const soleRaw = resolveStandardMappedValue(
       standardMap.get('soleCode'),
       row,
       mainTableName,
@@ -990,7 +1168,7 @@ export async function resolveFirstActiveRowFromFolder({ folderPath, standardMap,
       soleCol,
       traceOpts('soleCode')
     );
-    const colorCodeVal = resolveStandardMappedValue(
+    const colorRaw = resolveStandardMappedValue(
       standardMap.get('colorCode'),
       row,
       mainTableName,
@@ -998,13 +1176,55 @@ export async function resolveFirstActiveRowFromFolder({ folderPath, standardMap,
       colorCol,
       traceOpts('colorCode')
     );
-    const materialCodeVal = resolveStandardMappedValue(
+    const materialRaw = resolveStandardMappedValue(
       standardMap.get('materialCode'),
       row,
       mainTableName,
       tablesMap,
       materialCol,
       traceOpts('materialCode')
+    );
+
+    const brandVal = previewSanitizeField('brand', standardMap.get('brand'), brandRaw, row, mainTableName, tablesMap, brandCol, diagnosticsMap);
+    const lastCodeVal = previewSanitizeField(
+      'lastCode',
+      standardMap.get('lastCode'),
+      lastRaw,
+      row,
+      mainTableName,
+      tablesMap,
+      lastCol,
+      diagnosticsMap
+    );
+    const soleCodeVal = previewSanitizeField(
+      'soleCode',
+      standardMap.get('soleCode'),
+      soleRaw,
+      row,
+      mainTableName,
+      tablesMap,
+      soleCol,
+      diagnosticsMap
+    );
+    const colorCodeVal = previewSanitizeField(
+      'colorCode',
+      standardMap.get('colorCode'),
+      colorRaw,
+      row,
+      mainTableName,
+      tablesMap,
+      colorCol,
+      diagnosticsMap
+    );
+    const materialCodeVal = previewSanitizeField(
+      'materialCode',
+      standardMap.get('materialCode'),
+      materialRaw,
+      row,
+      mainTableName,
+      tablesMap,
+      materialCol,
+      diagnosticsMap
     );
 
     return {
@@ -1018,29 +1238,31 @@ export async function resolveFirstActiveRowFromFolder({ folderPath, standardMap,
     };
   };
 
+  const packOk = (row, usedFallbackRow, warning) => {
+    const outRow = tryRow(row);
+    const previewFieldErrors = diagnosticsMap?.size ? Object.fromEntries(diagnosticsMap) : undefined;
+    return {
+      ok: true,
+      mainTable: main.fileName,
+      row: outRow,
+      usedFallbackRow,
+      ...(warning ? { warning } : {}),
+      ...(previewFieldErrors ? { previewFieldErrors } : {}),
+    };
+  };
+
   for (let i = 0; i < main.rows.length; i++) {
     const row = main.rows[i] || {};
     const statusVal = statusCol ? row?.[statusCol] : '';
     const isActive = isTruthyActiveStatus(statusVal);
     if (!isActive) continue;
 
-    return {
-      ok: true,
-      mainTable: main.fileName,
-      row: tryRow(row),
-      usedFallbackRow: false,
-    };
+    return packOk(row, false);
   }
 
   if (main.rows.length > 0) {
     const row = main.rows[0] || {};
-    return {
-      ok: true,
-      mainTable: main.fileName,
-      row: tryRow(row),
-      usedFallbackRow: true,
-      warning: '未找到生效行，已使用首行做沙盒校验（生产仍以生效行为准）',
-    };
+    return packOk(row, true, '未找到生效行，已使用首行做沙盒校验（生产仍以生效行为准）');
   }
 
   return { ok: false, error: '沙盒主表无数据行', row: null, mainTable: main?.fileName || null };

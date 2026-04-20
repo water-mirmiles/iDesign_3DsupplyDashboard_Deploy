@@ -90,7 +90,24 @@ const GEMINI_DISCOVERY_URL = 'https://generativelanguage.googleapis.com/v1beta/m
 const GEMINI_V1_MODELS_URL = 'https://generativelanguage.googleapis.com/v1/models';
 const GEMINI_V1_GENERATE_URL = 'https://generativelanguage.googleapis.com/v1/models';
 
-let currentAIStatus = { status: 'idle', message: '', model: '', updatedAt: Date.now() };
+let currentAIStatus = {
+  status: 'idle',
+  message: '',
+  model: '',
+  updatedAt: Date.now(),
+  parsedCount: 0,
+  totalCount: 0,
+  parsedTables: [],
+  // 串行维度建模：阶段性产出给前端轮询消费
+  partialRevision: 0,
+  partial: {
+    smartSuggestions: [],
+    joinPathSuggestions: [],
+    concatMappingSuggestions: [],
+    // 记录每个维度的状态（success/fail/attempts/lastError）
+    dims: {},
+  },
+};
 function setAIStatus(patch) {
   currentAIStatus = {
     ...currentAIStatus,
@@ -1175,6 +1192,346 @@ app.post('/api/ai-parse-ddl', async (req, res) => {
   }
 });
 
+// Chat-to-Config：将“业务场景描述”解析为 Step2 dimensionSamples 结构（不猜表字段，可留空供前端基于 DDL 自动补全）
+app.post('/api/parse-chat-to-samples', async (req, res) => {
+  const text = String(req.body?.text || req.body?.chat || '').trim();
+  const masterTable = typeof req.body?.masterTable === 'string' ? String(req.body.masterTable).trim() : '';
+  const tableNames = Array.isArray(req.body?.ddlTableNames) ? req.body.ddlTableNames.map((x) => String(x || '').trim()).filter(Boolean) : [];
+  const ddlText = String(req.body?.ddlText || '').trim();
+  if (!text) return res.status(400).json({ ok: false, error: 'text is required' });
+  if (!genAI) return res.status(500).json({ ok: false, error: 'GEMINI_API_KEY is not configured' });
+
+  const emptyDim = () => ({ targetGoal: '', rows: [] });
+  const makeSegmentsRow = (value, notes = '') => ({
+    id: `chat_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+    notes,
+    segments: [{ tableName: '', fieldName: '', value: String(value ?? '') }],
+  });
+  const localFallback = (raw) => {
+    const s = String(raw || '');
+    const out = {
+      styleCode: emptyDim(),
+      brand: emptyDim(),
+      lastCode: emptyDim(),
+      soleCode: emptyDim(),
+      colorCode: emptyDim(),
+      materialCode: emptyDim(),
+      status: emptyDim(),
+    };
+
+    // styleCode: 常见形态 SBOX26008M / 任意大写字母+数字+字母
+    const style = s.match(/\b[A-Z]{2,10}\d{3,10}[A-Z]?\b/);
+    if (style) {
+      out.styleCode.rows.push(makeSegmentsRow(style[0], '从描述中提取：款号/StyleCode'));
+      out.styleCode.targetGoal = style[0];
+    }
+
+    // lastCode: L-xxxx（示例：L-B26097M）
+    const last = s.match(/\bL-[A-Za-z0-9-]{3,30}\b/);
+    if (last) {
+      out.lastCode.rows.push(makeSegmentsRow(last[0], '从描述中提取：楦号/lastCode'));
+      out.lastCode.targetGoal = last[0];
+    }
+
+    // soleCode: S-xxxx / SOLE- / H- (粗略)
+    const sole = s.match(/\b(?:S-|SOLE-|H-)[A-Za-z0-9-]{3,30}\b/);
+    if (sole) {
+      out.soleCode.rows.push(makeSegmentsRow(sole[0], '从描述中提取：底号/soleCode'));
+      out.soleCode.targetGoal = sole[0];
+    }
+
+    // status: 生效/有效/active
+    if (/(生效|有效|active|enabled)/i.test(s)) {
+      const v = /(生效|有效)/.test(s) ? '生效' : 'active';
+      out.status.rows.push(makeSegmentsRow(v, '从描述中提取：状态'));
+      out.status.targetGoal = v;
+    }
+
+    // materialCode: LT04 或 LT + 04 拼接
+    const matDirect = s.match(/\bLT\d{2}\b/i);
+    if (matDirect) {
+      const v = matDirect[0].toUpperCase();
+      out.materialCode.rows.push(makeSegmentsRow(v, '从描述中提取：材质编码'));
+      out.materialCode.targetGoal = v;
+    } else {
+      const matParts = s.match(/\b(LT)\b[\s\S]{0,12}\b(0?\d{1,2})\b/i);
+      if (matParts) {
+        const p1 = String(matParts[1]).toUpperCase();
+        const p2 = String(matParts[2]).padStart(2, '0');
+        out.materialCode.rows.push(makeSegmentsRow(p1, '拼接段1：父/前缀（例如 LT）'));
+        out.materialCode.rows.push(makeSegmentsRow(p2, '拼接段2：子/后缀（例如 04）'));
+        out.materialCode.targetGoal = `${p1}${p2}`;
+      }
+    }
+
+    // brand: 提取“品牌 X/brand X”后的文本（尽量保守，避免误判）
+    const brand =
+      s.match(/品牌[:：\s]*([A-Za-z][A-Za-z\s]{1,40})/i) ||
+      s.match(/\bbrand[:：\s]*([A-Za-z][A-Za-z\s]{1,40})/i);
+    if (brand && brand[1]) {
+      const v = String(brand[1]).trim().replace(/\s+/g, ' ');
+      out.brand.rows.push(makeSegmentsRow(v, '从描述中提取：品牌名称'));
+      out.brand.targetGoal = v;
+    }
+
+    // colorCode: 简单提取“颜色 X/color X”
+    const color =
+      s.match(/颜色[:：\s]*([A-Za-z0-9-]{2,20})/i) ||
+      s.match(/\bcolor[:：\s]*([A-Za-z0-9-]{2,20})/i);
+    if (color && color[1]) {
+      const v = String(color[1]).trim();
+      out.colorCode.rows.push(makeSegmentsRow(v, '从描述中提取：颜色编码/名称'));
+      out.colorCode.targetGoal = v;
+    }
+
+    return out;
+  };
+
+  const ddlTables = (() => {
+    try {
+      if (!ddlText) return [];
+      const ddls = splitCreateTableStatements(ddlText);
+      return ddls.map((ddl, idx) => {
+        const t = parseSingleTableLocal(ddl);
+        if (!t.tableName) t.tableName = extractTableNameFromDdl(ddl) || `table_${idx + 1}`;
+        return t;
+      });
+    } catch {
+      return [];
+    }
+  })();
+
+  const ddlTableMap = (() => {
+    const m = new Map();
+    for (const t of ddlTables) {
+      const tn = String(t?.tableName || '').trim();
+      if (!tn) continue;
+      const cols = Array.isArray(t?.columns) ? t.columns : [];
+      m.set(
+        tn,
+        cols
+          .map((c) => ({ name: String(c?.name || '').trim(), comment: String(c?.comment || '') }))
+          .filter((c) => c.name)
+      );
+    }
+    return m;
+  })();
+
+  const findTableContainingField = (fieldName) => {
+    const want = String(fieldName || '').trim().toLowerCase();
+    if (!want) return '';
+    for (const [tn, cols] of ddlTableMap) {
+      if (cols.some((c) => String(c.name || '').trim().toLowerCase() === want)) return tn;
+    }
+    return '';
+  };
+
+  const suggestFieldInTable = (tableName, standardKey) => {
+    const tn = String(tableName || '').trim();
+    const cols = ddlTableMap.get(tn) || [];
+    const kw =
+      standardKey === 'styleCode'
+        ? ['style', 'style_wms', '款号', 'style_no']
+        : standardKey === 'brand'
+          ? ['brand_name', 'brand', '品牌', 'name']
+          : standardKey === 'lastCode'
+            ? ['last', '楦', 'code', 'last_code']
+            : standardKey === 'soleCode'
+              ? ['sole', '底', 'heel', 'code', 'sole_code']
+              : standardKey === 'colorCode'
+                ? ['color', '颜色', 'colour', 'code', 'color_code']
+                : standardKey === 'materialCode'
+                  ? ['material', '材质', 'category', 'code', 'name', 'material_code', 'category_code']
+                  : standardKey === 'status'
+                    ? ['status', '状态', 'data_status', '生效', '有效']
+                    : [];
+    let best = '';
+    let bestScore = 0;
+    for (const c of cols) {
+      const hay = `${c.name || ''} ${c.comment || ''}`.toLowerCase();
+      let score = 0;
+      for (const k of kw) if (hay.includes(String(k).toLowerCase())) score += 10;
+      if (standardKey.endsWith('Code') && String(c.name || '').toLowerCase() === 'code') score += 8;
+      if (standardKey === 'brand' && String(c.name || '').toLowerCase() === 'brand_name') score += 12;
+      if (score > bestScore) {
+        bestScore = score;
+        best = c.name;
+      }
+    }
+    return best || (cols[0]?.name || '');
+  };
+
+  const fillCoordinatesFromDdl = (dimensionSamples) => {
+    const keys = ['styleCode', 'brand', 'lastCode', 'soleCode', 'colorCode', 'materialCode', 'status'];
+    const explicit = [];
+    const refRe = /\b([\w.]+)\.([A-Za-z_][A-Za-z0-9_]*)\b/g;
+    let m;
+    while ((m = refRe.exec(text)) !== null) {
+      const t = String(m[1] || '').trim();
+      const f = String(m[2] || '').trim();
+      if (t && f) explicit.push({ tableName: t, fieldName: f });
+    }
+    const explicitSet = new Set(explicit.map((x) => `${x.tableName}.${x.fieldName}`));
+
+    for (const k of keys) {
+      const blk = dimensionSamples[k];
+      if (!blk || !Array.isArray(blk.rows)) continue;
+      for (const r of blk.rows) {
+        const segs = Array.isArray(r?.segments) ? r.segments : [];
+        for (const s of segs) {
+          const curT = String(s.tableName || '').trim();
+          const curF = String(s.fieldName || '').trim();
+          if (curT && curF) continue;
+
+          // 若用户明确写了 table.field，优先信任（按 DDL 验证存在则用）
+          const pick = explicit.find((x) => {
+            if (!x.tableName || !x.fieldName) return false;
+            if (!ddlTableMap.size) return true;
+            const cols = ddlTableMap.get(x.tableName);
+            return cols ? cols.some((c) => String(c.name).toLowerCase() === x.fieldName.toLowerCase()) : false;
+          });
+          if (pick && !explicitSet.has(`${pick.tableName}.${pick.fieldName}`)) {
+            // keep
+          }
+          if (pick) {
+            s.tableName = pick.tableName;
+            s.fieldName = pick.fieldName;
+            continue;
+          }
+
+          // 若只知道 fieldName：在 DDL 中找表
+          if (!curT && curF) {
+            const tFound = findTableContainingField(curF);
+            if (tFound) {
+              s.tableName = tFound;
+              continue;
+            }
+          }
+
+          // 维度启发式：优先 masterTable，否则扫全库选最可能字段
+          if (!curT) {
+            const tPref = masterTable && ddlTableMap.has(masterTable) ? masterTable : (ddlTables[0]?.tableName || '');
+            if (tPref) s.tableName = tPref;
+          }
+          if (s.tableName && !curF) {
+            s.fieldName = suggestFieldInTable(s.tableName, k);
+          }
+        }
+      }
+    }
+    return dimensionSamples;
+  };
+
+  try {
+    clearEngineAuditLogSync();
+    auditLineSync(`[Audit] ===== Chat-to-Config 开始 ${new Date().toISOString()} =====`);
+    auditLineSync('[Audit][A] Input: conversational text');
+    auditLineSync(text);
+
+    // Chat-to-Config 优先使用 flash，降低 503 概率；失败则本地兜底
+    const modelList = GEMINI_FORCED_MODEL
+      ? [normalizeModelName(GEMINI_FORCED_MODEL)]
+      : ['gemini-1.5-flash', 'gemini-2.0-flash', 'gemini-pro-latest'].map(normalizeModelName);
+    const prompt = [
+      '你是一个专业的 ETL 配置员。你的任务：把用户的大白话业务案例，提取为“动态黄金样本配置（dimensionSamples）”。',
+      '',
+      '标准维度（standardKey）固定为以下 7 个：',
+      '- styleCode (款号)',
+      '- brand (品牌)',
+      '- lastCode (楦)',
+      '- soleCode (底)',
+      '- colorCode (颜色)',
+      '- materialCode (材质)',
+      '- status (状态)',
+      '',
+      '输出必须是严格 JSON 对象（不要 Markdown，不要解释），结构必须与前端 dimensionSamples 状态一致：',
+      '{',
+      '  "styleCode": { "targetGoal": "", "rows": [ { "id": "可省略", "notes": "", "segments": [ { "tableName": "", "fieldName": "", "value": "" } ] } ] },',
+      '  "brand": { "targetGoal": "", "rows": [ ... ] },',
+      '  ... 其余维度 ...',
+      '}',
+      '',
+      '规则：',
+      '1) 你可以把用户描述中的“期望结果”写入 targetGoal（例如材质 LT04）。',
+      '2) rows 表示该维度的“样本行”。每行可带 notes（逻辑备注/线索）。',
+      '3) segments 表示该行的“物理取值分段”。',
+      '4) 【特别注意复合逻辑】如果用户提到“拼接/合成/父子/由X和Y组成”，请在同一维度下返回多行 rows（每一行对应一个分段），并在 notes 中清晰写明“父/子/拼接顺序”。',
+      '5) tableName 与 fieldName 若用户未明确指出，必须留空字符串（不要胡编表名字段名）。前端会基于 DDL 自动检索补全。',
+      '',
+      masterTable ? `业务主表（供参考，不要臆造字段）：${masterTable}` : '',
+      tableNames.length ? `DDL 表名清单（供参考，不要臆造）：${tableNames.join(', ')}` : '',
+      '',
+      '用户描述：',
+      text,
+    ]
+      .filter(Boolean)
+      .join('\n');
+
+    auditLineSync('[Audit][A] Prompt: parse-chat-to-samples');
+    auditLineSync(prompt);
+
+    const out = await generateWithModelList({ modelNames: modelList, prompt, retries: 3 });
+    auditLineSync('[Audit][B] AI Raw Output: parse-chat-to-samples');
+    auditLineSync(out.ok ? String(out.text || '') : `[Audit][B] FAILED: ${String(out.error?.message || '')}`);
+    if (!out.ok) {
+      auditLineSync('[Audit][Fallback] Gemini failed; use local regex fallback');
+      let dimensionSamples = localFallback(text);
+      if (ddlText) dimensionSamples = fillCoordinatesFromDdl(dimensionSamples);
+      auditLineSync(JSON.stringify({ fallback: true, dimensionSamples }, null, 2));
+      auditLineSync(`[Audit] ===== Chat-to-Config 结束(本地兜底) ${new Date().toISOString()} =====`);
+      return res.json({ ok: true, dimensionSamples, fallback: true });
+    }
+
+    const obj = extractJsonObject(stripJsonFences(out.text));
+    if (!obj || typeof obj !== 'object') {
+      auditLineSync('[Audit][Fallback] AI JSON invalid; use local regex fallback');
+      let dimensionSamples = localFallback(text);
+      if (ddlText) dimensionSamples = fillCoordinatesFromDdl(dimensionSamples);
+      auditLineSync(JSON.stringify({ fallback: true, dimensionSamples }, null, 2));
+      auditLineSync(`[Audit] ===== Chat-to-Config 结束(本地兜底) ${new Date().toISOString()} =====`);
+      return res.json({ ok: true, dimensionSamples, fallback: true });
+    }
+
+    const keys = ['styleCode', 'brand', 'lastCode', 'soleCode', 'colorCode', 'materialCode', 'status'];
+    const normalized = {};
+    for (const k of keys) {
+      const blk = obj[k] && typeof obj[k] === 'object' ? obj[k] : {};
+      const targetGoal = typeof blk?.targetGoal === 'string' ? String(blk.targetGoal) : '';
+      const rowsRaw = Array.isArray(blk?.rows) ? blk.rows : [];
+      const rows = rowsRaw
+        .map((r) => {
+          const notes = typeof r?.notes === 'string' ? String(r.notes) : '';
+          const id = typeof r?.id === 'string' ? String(r.id) : '';
+          const segs = Array.isArray(r?.segments) ? r.segments : [];
+          const segments = segs
+            .map((s) => ({
+              tableName: typeof s?.tableName === 'string' ? String(s.tableName) : '',
+              fieldName: typeof s?.fieldName === 'string' ? String(s.fieldName) : '',
+              value: typeof s?.value === 'string' ? String(s.value) : String(s?.value ?? ''),
+            }))
+            .filter((s) => String(s.value || '').trim() !== '' || s.tableName || s.fieldName);
+          return { ...(id ? { id } : {}), notes, segments: segments.length ? segments : [{ tableName: '', fieldName: '', value: '' }] };
+        })
+        .filter((r) => r.segments.some((s) => String(s.value || '').trim() !== ''));
+      normalized[k] = { targetGoal, rows };
+    }
+    if (ddlText) fillCoordinatesFromDdl(normalized);
+
+    auditLineSync(`[Audit] ===== Chat-to-Config 结束 ${new Date().toISOString()} =====`);
+    return res.json({ ok: true, dimensionSamples: normalized, fallback: false });
+  } catch (e) {
+    auditLineSync(`[Audit] ===== Chat-to-Config 异常 ${new Date().toISOString()} =====`);
+    auditLineSync(String(e instanceof Error ? e.stack || e.message : String(e)));
+    // 兜底：任何异常都走本地解析，保证前端可用
+    let dimensionSamples = localFallback(text);
+    if (ddlText) dimensionSamples = fillCoordinatesFromDdl(dimensionSamples);
+    auditLineSync('[Audit][Fallback] Exception; use local regex fallback');
+    auditLineSync(JSON.stringify({ fallback: true, error: e instanceof Error ? e.message : String(e), dimensionSamples }, null, 2));
+    auditLineSync(`[Audit] ===== Chat-to-Config 结束(本地兜底) ${new Date().toISOString()} =====`);
+    return res.json({ ok: true, dimensionSamples, fallback: true });
+  }
+});
+
 // Gemini AI 解析多表 SQL：返回 tables + smartSuggestions
 app.post('/api/ai-parse-multi-sql', async (req, res) => {
   const sqlText = String(req.body?.sqlText || '');
@@ -1246,10 +1603,9 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
         ].filter(Boolean)
       : [];
 
-    // 2) 逐表调用 Gemini（每表独立重试：1s,2s,4s）
+    // 2) DDL 解析：强制本地解析（避免对 Gemini 的 N 次调用导致 503/超时）
     for (let idx = 0; idx < ddls.length; idx++) {
       const ddl = ddls[idx];
-      const ddlForAi = sanitizeSqlForAi(ddl);
       const nameHint = extractTableNameFromDdl(ddl) || `table_${idx + 1}`;
       setAIStatus({
         status: 'running',
@@ -1259,54 +1615,8 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
         totalCount: total,
         parsedTables: parsedNames,
       });
-
-      const prompt = [
-        '你是一个 SQL DDL 专家，请只解析“单张表”的建表语句。',
-        '目标：返回严格 JSON（不要输出 Markdown、不要解释）。',
-        '返回格式：',
-        '{ "tableName": "...", "columns": [{ "name": "...", "comment": "..." }] }',
-        '规则：',
-        '- tableName 必须是表名',
-        '- columns 必须包含该表所有字段',
-        '- comment 优先使用 COMMENT，若没有 COMMENT 则返回空字符串',
-        ...refInstruction,
-        '',
-        'DDL:',
-        ddlForAi,
-      ].join('\n');
-
-      const out = await generateWithModelList({ modelNames: modelList, prompt, retries: 3 });
-      auditLineSync(`[Audit][B] AI Raw Output (single-table ddl parse) table=${nameHint}`);
-      auditLineSync(out.ok ? String(out.text || '') : `[Audit][B] FAILED: ${String(out.error?.message || '')}`);
-      let normalized;
-      if (!out.ok) {
-        // 3) 终极 fallback：本地解析（不报错，保证字段目录可用）
-        // eslint-disable-next-line no-console
-        console.warn('[ai-parse-multi-sql] all models failed, fallback to local parser for table:', nameHint, out.error?.message);
-        normalized = parseSingleTableLocal(ddl);
-        if (!normalized.tableName) normalized.tableName = nameHint;
-      } else {
-        const obj = extractJsonObject(out.text);
-        if (!obj) {
-          // 模型输出不规范：本地兜底
-          // eslint-disable-next-line no-console
-          console.warn('[ai-parse-multi-sql] invalid JSON object, fallback to local parser for table:', nameHint);
-          normalized = parseSingleTableLocal(ddl);
-          if (!normalized.tableName) normalized.tableName = nameHint;
-        } else {
-          normalized = {
-            tableName: typeof obj?.tableName === 'string' ? obj.tableName.trim() : nameHint,
-            columns: Array.isArray(obj?.columns)
-              ? obj.columns
-                  .map((c) => ({
-                    name: typeof c?.name === 'string' ? c.name.trim() : '',
-                    comment: typeof c?.comment === 'string' ? c.comment.trim() : '',
-                  }))
-                  .filter((c) => c.name)
-              : [],
-          };
-        }
-      }
+      const normalized = parseSingleTableLocal(ddl);
+      if (!normalized.tableName) normalized.tableName = nameHint;
 
       parsedTables.push(normalized);
       parsedNames.push(normalized.tableName);
@@ -1317,6 +1627,220 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
         parsedCount: parsedNames.length,
         totalCount: total,
         parsedTables: parsedNames,
+      });
+    }
+
+    // ===========================
+    // 新模式：维度串行解析（降低单次上下文，避免 503/超时）
+    // ===========================
+    {
+      const schemaCompact = parsedTables.map((t) => ({
+        tableName: t.tableName,
+        columns: (t.columns || []).slice(0, 200),
+      }));
+      const allDdlTableNames = parsedTables.map((t) => String(t.tableName || '').trim()).filter(Boolean);
+      const dimensionKeys = ['styleCode', 'brand', 'lastCode', 'soleCode', 'colorCode', 'materialCode', 'status'];
+
+      const buildSingleDimensionPrompt = ({ dimKey, dimExpected }) => {
+        const expectation = dimExpected != null ? String(dimExpected).trim() : '';
+        const hintLines =
+          goldenBlocks && goldenBlocks.length
+            ? (() => {
+                const blk = goldenBlocks.find((b) => String(b.standardKey || '').trim() === dimKey);
+                if (!blk) return [];
+                return [
+                  '',
+                  `【该维度的用户线索】standardKey=${dimKey}`,
+                  blk.targetGoal ? `- Target Goal: ${JSON.stringify(String(blk.targetGoal))}` : '',
+                  ...(blk.rows || []).flatMap((r, idx) => {
+                    const note = r?.notes ? ` ｜ notes=${JSON.stringify(String(r.notes))}` : '';
+                    const detail = (r?.segments || [])
+                      .map((s) => `${s.tableName}.${s.fieldName}=${JSON.stringify(String(s.value ?? ''))}`)
+                      .join(' + ');
+                    return [`- 样本行 ${idx + 1}${note}: ${detail}`];
+                  }),
+                ].filter(Boolean);
+              })()
+            : (() => {
+                const gs = goldenSamples.filter((g) => String(g.standardKey || '').trim() === dimKey);
+                if (!gs.length) return [];
+                return [
+                  '',
+                  `【该维度的用户线索】standardKey=${dimKey}`,
+                  ...gs.slice(0, 10).map((g) => {
+                    const joined = (g.segments || []).map((s) => String(s.value ?? '')).join('');
+                    const detail = (g.segments || [])
+                      .map((s) => `${s.tableName}.${s.fieldName}=${JSON.stringify(String(s.value ?? ''))}`)
+                      .join(' + ');
+                    return `- 合成≈${JSON.stringify(joined)} ｜ ${detail}`;
+                  }),
+                ];
+              })();
+
+        return [
+          `你现在是一个数据专家/数据侦探。`,
+          masterTable ? `业务主表（Master Table）是：${masterTable}` : '',
+          '',
+          '【任务】仅针对一个维度强制连线，输出可执行 joinPath（结构化数组）。',
+          `目标维度：${dimKey}`,
+          expectation ? `黄金期望值：${JSON.stringify(expectation)}` : '黄金期望值：（空；仍需输出最合理路径）',
+          '',
+          '【强制要求】',
+          '1) 你必须输出 joinPathSuggestions 数组，且仅包含本维度的 1 条候选路径（targetStandardKey=dimKey）。',
+          '2) 若 dimKey=materialCode 且用户提供多行样本/多段目标，请输出 concatMappingSuggestions（operator:"CONCAT"，parts 数量与样本行一致）。',
+          '3) 路径末项必须是 { targetTable, valueField } 且 valueField 必须是业务值列（code/name/category_code/brand_name...），禁止以 id 结尾。',
+          '4) 你严禁输出“未找到”。请在 DDL 中寻找最可能的 *_id / associated_* 链路（允许 0~2 中间表）。',
+          '',
+          '【DDL 表名清单】',
+          allDdlTableNames.join(', '),
+          ...hintLines,
+          '',
+          '输入数据（表结构精简版）：',
+          JSON.stringify(schemaCompact),
+          '',
+          '输出严格 JSON（不要 Markdown，不要解释），形如：',
+          '{ "smartSuggestions": [], "joinPathSuggestions": [{"targetStandardKey":"DIM","joinPath":[{"sourceTable":"...","sourceField":"...","targetTable":"...","targetField":"..."},{"targetTable":"...","valueField":"..."}]}], "concatMappingSuggestions":[] }',
+        ]
+          .filter(Boolean)
+          .join('\n');
+      };
+
+      // 初始化阶段性状态：前端轮询 /api/ai-status 后可即时合并进卡片
+      setAIStatus({
+        status: 'running',
+        model: modelList[0] || '',
+        message: `开始维度串行解析：0/${dimensionKeys.length}`,
+        parsedCount: 0,
+        totalCount: dimensionKeys.length,
+        partialRevision: (currentAIStatus.partialRevision || 0) + 1,
+        partial: { smartSuggestions: [], joinPathSuggestions: [], concatMappingSuggestions: [], dims: {} },
+      });
+
+      const latestDirForBacktest = await getLatestDataTablesDir();
+      let smartSuggestions = [];
+      let joinPathSuggestions = [];
+      let concatMappingSuggestions = [];
+      const dims = {};
+
+      for (let di = 0; di < dimensionKeys.length; di++) {
+        const dimKey = dimensionKeys[di];
+        const expected = goldenExpectedMap.get(dimKey) || '';
+        dims[dimKey] = { status: 'running', attempts: 0, expected: String(expected || '') };
+        setAIStatus({
+          status: 'running',
+          model: modelList[0] || '',
+          message: `正在破解 ${dimKey} 维度关联路径...`,
+          parsedCount: di,
+          totalCount: dimensionKeys.length,
+          partialRevision: (currentAIStatus.partialRevision || 0) + 1,
+          partial: { smartSuggestions, joinPathSuggestions, concatMappingSuggestions, dims },
+        });
+
+        let success = false;
+        let lastErr = '';
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          dims[dimKey] = { ...(dims[dimKey] || {}), status: 'running', attempts: attempt };
+          setAIStatus({
+            status: 'running',
+            model: modelList[0] || '',
+            message: `正在破解 ${dimKey}...（尝试 ${attempt}/3）`,
+            parsedCount: di,
+            totalCount: dimensionKeys.length,
+            partialRevision: (currentAIStatus.partialRevision || 0) + 1,
+            partial: { smartSuggestions, joinPathSuggestions, concatMappingSuggestions, dims },
+          });
+
+          const prompt = buildSingleDimensionPrompt({ dimKey, dimExpected: expected });
+          auditLineSync(`[Audit][A] Prompt Snapshot (single-dim) dim=${dimKey} attempt=${attempt}`);
+          auditLineSync(prompt);
+          const out = await generateWithModelList({ modelNames: modelList, prompt, retries: 2 });
+          auditLineSync(`[Audit][B] AI Raw Output (single-dim) dim=${dimKey} attempt=${attempt}`);
+          auditLineSync(out.ok ? String(out.text || '') : `[Audit][B] FAILED: ${String(out.error?.message || '')}`);
+          if (!out.ok) {
+            lastErr = String(out.error?.message || 'AI failed');
+            continue;
+          }
+
+          const obj = extractJsonObject(stripJsonFences(out.text));
+          const ssRaw = Array.isArray(obj?.smartSuggestions) ? obj.smartSuggestions : [];
+          const jpRaw = Array.isArray(obj?.joinPathSuggestions) ? obj.joinPathSuggestions : [];
+          const ccRaw = Array.isArray(obj?.concatMappingSuggestions) ? obj.concatMappingSuggestions : [];
+
+          const jpOne = jpRaw
+            .map((j) => {
+              const targetStandardKey = typeof j?.targetStandardKey === 'string' ? j.targetStandardKey.trim() : '';
+              if (targetStandardKey !== dimKey) return null;
+              const rawJoin =
+                Array.isArray(j?.joinPath) && j.joinPath.length ? j.joinPath : Array.isArray(j?.path) ? j.path : [];
+              const pathArr = normalizeAiJoinPathToStringPath(rawJoin);
+              return pathArr.length >= 2 ? { targetStandardKey, path: pathArr } : null;
+            })
+            .filter(Boolean);
+
+          const validated = await validateJoinPathSuggestionsWithGoldenXlsx({
+            joinPathSuggestions: jpOne,
+            goldenByStandardKey: goldenExpectedMap,
+            folderPath: latestDirForBacktest,
+            smartSuggestions: ssRaw,
+          });
+
+          if (validated && validated.length) {
+            const merged = new Map(joinPathSuggestions.map((x) => [x.targetStandardKey, x]));
+            for (const v of validated) merged.set(v.targetStandardKey, v);
+            joinPathSuggestions = Array.from(merged.values());
+            if (dimKey === 'materialCode' && Array.isArray(ccRaw) && ccRaw.length) concatMappingSuggestions = ccRaw;
+            if (Array.isArray(ssRaw) && ssRaw.length) smartSuggestions = ssRaw;
+
+            dims[dimKey] = { ...(dims[dimKey] || {}), status: 'success' };
+            setAIStatus({
+              status: 'running',
+              model: modelList[0] || '',
+              message: `${dimKey} 维度认证成功，正在处理下一个维度...`,
+              parsedCount: di + 1,
+              totalCount: dimensionKeys.length,
+              partialRevision: (currentAIStatus.partialRevision || 0) + 1,
+              partial: { smartSuggestions, joinPathSuggestions, concatMappingSuggestions, dims },
+            });
+            success = true;
+            break;
+          }
+
+          lastErr = `Join backtest failed (expected=${String(expected || '')})`;
+          auditLineSync(`[Audit][D] FAIL dim=${dimKey} attempt=${attempt}: ${lastErr}`);
+        }
+
+        if (!success) {
+          dims[dimKey] = { ...(dims[dimKey] || {}), status: 'fail', lastError: lastErr };
+          setAIStatus({
+            status: 'running',
+            model: modelList[0] || '',
+            message: `${dimKey} 维度未能回测通过（先继续下一维度）`,
+            parsedCount: di + 1,
+            totalCount: dimensionKeys.length,
+            partialRevision: (currentAIStatus.partialRevision || 0) + 1,
+            partial: { smartSuggestions, joinPathSuggestions, concatMappingSuggestions, dims },
+          });
+        }
+      }
+
+      setAIStatus({
+        status: 'done',
+        model: modelList[0] || '',
+        message: `维度串行解析完成：${dimensionKeys.length}/${dimensionKeys.length}`,
+        parsedCount: dimensionKeys.length,
+        totalCount: dimensionKeys.length,
+        partialRevision: (currentAIStatus.partialRevision || 0) + 1,
+        partial: { smartSuggestions, joinPathSuggestions, concatMappingSuggestions, dims },
+      });
+
+      auditLineSync(`[Audit] ===== AI 逻辑建模结束 ${new Date().toISOString()} =====`);
+      return res.json({
+        ok: true,
+        tables: parsedTables,
+        smartSuggestions,
+        joinPathSuggestions,
+        concatMappingSuggestions,
+        _debug: { mode: 'dimension-serial', totalDims: dimensionKeys.length },
       });
     }
 
