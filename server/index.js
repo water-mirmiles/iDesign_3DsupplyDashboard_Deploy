@@ -1093,11 +1093,31 @@ app.post('/api/ai-parse-ddl', async (req, res) => {
 // Chat-to-Config：将“业务场景描述”解析为 Step2 dimensionSamples 结构（不猜表字段，可留空供前端基于 DDL 自动补全）
 app.post('/api/parse-chat-to-samples', async (req, res) => {
   const text = String(req.body?.text || req.body?.chat || '').trim();
-  const masterTable = typeof req.body?.masterTable === 'string' ? String(req.body.masterTable).trim() : '';
+  const masterTableFromBody = typeof req.body?.masterTable === 'string' ? String(req.body.masterTable).trim() : '';
   const tableNames = Array.isArray(req.body?.ddlTableNames) ? req.body.ddlTableNames.map((x) => String(x || '').trim()).filter(Boolean) : [];
   const ddlText = String(req.body?.ddlText || '').trim();
   if (!text) return res.status(400).json({ ok: false, error: 'text is required' });
   // Vertex 不可用时也不失败：沿用 localFallback（never fail）
+
+  // 对话即最高指令：硬规则提取（确定性，不依赖 AI）
+  const hardDirective = (() => {
+    const s = String(text || '');
+    const out = { masterTable: '', style: null };
+
+    // 1) 主表是 XXX
+    const mMaster = s.match(/主表是\s*([A-Za-z_][\w.]*)/);
+    if (mMaster && mMaster[1]) out.masterTable = String(mMaster[1]).trim();
+
+    // 2) 款号在...字段，值为...
+    // 支持：款号在 ods_xxx_df.style_wms 字段，值为 SBOX26008M
+    const mStyle =
+      s.match(/款号在\s*([A-Za-z_][\w.]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*字段[，,]?\s*值为\s*([A-Za-z0-9_-]+)/) ||
+      s.match(/styleCode\s*在\s*([A-Za-z_][\w.]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*(?:字段|列)?[，,]?\s*值为\s*([A-Za-z0-9_-]+)/i);
+    if (mStyle && mStyle[1] && mStyle[2] && mStyle[3]) {
+      out.style = { tableName: String(mStyle[1]).trim(), fieldName: String(mStyle[2]).trim(), value: String(mStyle[3]).trim() };
+    }
+    return out;
+  })();
 
   function modelingDebugLogPath() {
     return path.join(__dirname, 'storage', 'modeling_debug.log');
@@ -1526,12 +1546,25 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
       auditLineSync('[Audit][Fallback] Gemini failed; use local regex fallback');
       let dimensionSamples = localFallback(text);
       if (ddlText) dimensionSamples = fillCoordinatesFromDdl(dimensionSamples);
+      // 硬性覆盖：对话指令优先
+      if (hardDirective?.style) {
+        dimensionSamples.styleCode = {
+          targetGoal: hardDirective.style.value,
+          rows: [
+            {
+              id: `hard_style_${Date.now()}`,
+              notes: '硬规则：款号在指定字段，值为指定值（对话即最高指令）',
+              segments: [{ tableName: hardDirective.style.tableName, fieldName: hardDirective.style.fieldName, value: hardDirective.style.value }],
+            },
+          ],
+        };
+      }
       modelingDebugLineSync('[Final][FallbackRegex]');
       modelingDebugLineSync(JSON.stringify(dimensionSamples, null, 2));
       modelingDebugLineSync(`[${new Date().toISOString()}] ===== parse-chat-to-samples END (fallback) =====`);
       auditLineSync(JSON.stringify({ fallback: true, dimensionSamples }, null, 2));
       auditLineSync(`[Audit] ===== Chat-to-Config 结束(本地兜底) ${new Date().toISOString()} =====`);
-      return res.json({ ok: true, dimensionSamples, fallback: true });
+      return res.json({ ok: true, masterTable: hardDirective.masterTable || masterTableFromBody || '', dimensionSamples, fallback: true });
     }
 
     const obj = extractJsonObject(stripJsonFences(out.text));
@@ -1539,12 +1572,24 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
       auditLineSync('[Audit][Fallback] AI JSON invalid; use local regex fallback');
       let dimensionSamples = localFallback(text);
       if (ddlText) dimensionSamples = fillCoordinatesFromDdl(dimensionSamples);
+      if (hardDirective?.style) {
+        dimensionSamples.styleCode = {
+          targetGoal: hardDirective.style.value,
+          rows: [
+            {
+              id: `hard_style_${Date.now()}`,
+              notes: '硬规则：款号在指定字段，值为指定值（对话即最高指令）',
+              segments: [{ tableName: hardDirective.style.tableName, fieldName: hardDirective.style.fieldName, value: hardDirective.style.value }],
+            },
+          ],
+        };
+      }
       modelingDebugLineSync('[Final][FallbackJsonInvalid]');
       modelingDebugLineSync(JSON.stringify(dimensionSamples, null, 2));
       modelingDebugLineSync(`[${new Date().toISOString()}] ===== parse-chat-to-samples END (fallback-json-invalid) =====`);
       auditLineSync(JSON.stringify({ fallback: true, dimensionSamples }, null, 2));
       auditLineSync(`[Audit] ===== Chat-to-Config 结束(本地兜底) ${new Date().toISOString()} =====`);
-      return res.json({ ok: true, dimensionSamples, fallback: true });
+      return res.json({ ok: true, masterTable: hardDirective.masterTable || masterTableFromBody || '', dimensionSamples, fallback: true });
     }
 
     const keys = ['styleCode', 'brand', 'lastCode', 'soleCode', 'colorCode', 'materialCode', 'status'];
@@ -1648,25 +1693,51 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
     }
     if (ddlText) fillCoordinatesFromDdl(normalized);
 
+    // 硬性覆盖：对话指令优先（masterTable + styleCode 唯一坐标）
+    if (hardDirective?.style) {
+      normalized.styleCode = {
+        targetGoal: hardDirective.style.value,
+        rows: [
+          {
+            id: `hard_style_${Date.now()}`,
+            notes: '硬规则：款号在指定字段，值为指定值（对话即最高指令）',
+            segments: [{ tableName: hardDirective.style.tableName, fieldName: hardDirective.style.fieldName, value: hardDirective.style.value }],
+          },
+        ],
+      };
+    }
+
     modelingDebugLineSync('[Final][AI]');
     modelingDebugLineSync(JSON.stringify(normalized, null, 2));
     modelingDebugLineSync(`[${new Date().toISOString()}] ===== parse-chat-to-samples END (ai) =====`);
 
     auditLineSync(`[Audit] ===== Chat-to-Config 结束 ${new Date().toISOString()} =====`);
-    return res.json({ ok: true, dimensionSamples: normalized, fallback: false });
+    return res.json({ ok: true, masterTable: hardDirective.masterTable || masterTableFromBody || '', dimensionSamples: normalized, fallback: false });
   } catch (e) {
     auditLineSync(`[Audit] ===== Chat-to-Config 异常 ${new Date().toISOString()} =====`);
     auditLineSync(String(e instanceof Error ? e.stack || e.message : String(e)));
     // 兜底：任何异常都走本地解析，保证前端可用
     let dimensionSamples = localFallback(text);
     if (ddlText) dimensionSamples = fillCoordinatesFromDdl(dimensionSamples);
+    if (hardDirective?.style) {
+      dimensionSamples.styleCode = {
+        targetGoal: hardDirective.style.value,
+        rows: [
+          {
+            id: `hard_style_${Date.now()}`,
+            notes: '硬规则：款号在指定字段，值为指定值（对话即最高指令）',
+            segments: [{ tableName: hardDirective.style.tableName, fieldName: hardDirective.style.fieldName, value: hardDirective.style.value }],
+          },
+        ],
+      };
+    }
     modelingDebugLineSync('[Final][ExceptionFallback]');
     modelingDebugLineSync(JSON.stringify(dimensionSamples, null, 2));
     modelingDebugLineSync(`[${new Date().toISOString()}] ===== parse-chat-to-samples END (exception-fallback) =====`);
     auditLineSync('[Audit][Fallback] Exception; use local regex fallback');
     auditLineSync(JSON.stringify({ fallback: true, error: e instanceof Error ? e.message : String(e), dimensionSamples }, null, 2));
     auditLineSync(`[Audit] ===== Chat-to-Config 结束(本地兜底) ${new Date().toISOString()} =====`);
-    return res.json({ ok: true, dimensionSamples, fallback: true });
+    return res.json({ ok: true, masterTable: hardDirective.masterTable || masterTableFromBody || '', dimensionSamples, fallback: true });
   }
 });
 
@@ -1675,7 +1746,7 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
   const sqlText = String(req.body?.sqlText || '');
   const conversationalInput = String(req.body?.conversationalInput || req.body?.chat || '').trim();
   const reference = req.body?.reference || null;
-  const masterTable = typeof req.body?.masterTable === 'string' ? String(req.body.masterTable).trim() : '';
+  let masterTable = typeof req.body?.masterTable === 'string' ? String(req.body.masterTable).trim() : '';
   const goldenByDimRaw = req.body?.dimensionSamples ?? req.body?.goldenByDimension;
   let goldenBlocks = null;
   let goldenSamples = [];
@@ -1722,6 +1793,12 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
     if (conversationalInput) {
       aiTraceLineSync('[Step 1] conversationalInput detected; parsing chat-to-samples');
       try {
+        // 对话即最高指令：主表是 XXX 直接覆盖 masterTable（优先级最高）
+        const mm = String(conversationalInput).match(/主表是\s*([A-Za-z_][\w.]*)/);
+        if (mm && mm[1]) {
+          masterTable = String(mm[1]).trim();
+          aiTraceLineSync(`[Step 1] masterTable overridden by chat: ${masterTable}`);
+        }
         const emptyDim = () => ({ targetGoal: '', rows: [] });
         const makeSegmentsRow = (value, notes = '') => ({
           id: `chat_${Date.now()}_${Math.random().toString(16).slice(2)}`,
@@ -1891,6 +1968,7 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
         '2) 每个维度必须输出 1 条 joinPath（结构化数组），允许 0~2 个中间表。',
         '3) joinPath 末段必须是 { targetTable, valueField }，且 valueField 必须是业务可读列（code/name/brand_name...），严禁以 id 结尾。',
         '4) 严禁输出“未找到”。',
+        '5) 【材质 LT04 专项】如果黄金材质为 LT04/或对话中描述为拼接：你必须同时输出 concatMappingSuggestions，standardKey="materialCode"，operator="CONCAT"，parts=2。每个 part 必须包含 joinPath，并尽量利用 parent_id 等层级关联把父段(LT)与子段(04)从各自列取出。',
         '',
         goldenSection,
         '',

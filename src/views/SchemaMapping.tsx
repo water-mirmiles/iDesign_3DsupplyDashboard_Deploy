@@ -1158,7 +1158,9 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
     return () => ac.abort();
   }, [mappingPreview, runPreviewMappingRow]);
 
-  const handleAiLogicModeling = async (): Promise<{ ok: true } | { ok: false; error: string }> => {
+  const handleAiLogicModeling = async (
+    override?: { masterTable?: string }
+  ): Promise<{ ok: true } | { ok: false; error: string }> => {
     setError(null);
     setAiBusy503(false);
     setAiQueueHint(true);
@@ -1170,7 +1172,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
       const t = window.setTimeout(() => controller.abort(), 180000);
       const payload = {
         sqlText: ddlText,
-        masterTable: masterTable || undefined,
+        masterTable: (override?.masterTable || masterTable) || undefined,
         conversationalInput: conversationalInput || undefined,
         // AI 仅消费 legacy 结构（targetGoal/rows/segments）；dimensionSamples 用于草稿持久化
         goldenByDimension: serializeDimensionSamplesForAiLegacy(dimensionSamples),
@@ -1616,6 +1618,10 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                         if (!resp.ok || !json?.ok) throw new Error(json?.error || `HTTP ${resp.status}`);
                         const ds = json.dimensionSamples && typeof json.dimensionSamples === 'object' ? (json.dimensionSamples as any) : null;
                         if (!ds) throw new Error('AI 返回的 dimensionSamples 为空');
+                        const mt = typeof json.masterTable === 'string' ? String(json.masterTable).trim() : '';
+                        if (mt) {
+                          flushSync(() => setMasterTable(mt));
+                        }
 
                         // 若 AI 提取的 tableName 在 DDL 中存在，但当前 parsedTableMap 缺失：再强制刷新一次 DDL 解析
                         try {
@@ -1683,7 +1689,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                         setReviewTweakOpen(false);
 
                         // 直接触发 AI 建模（串行维度 + 回测闭环）
-                        const r = await handleAiLogicModeling();
+                        const r = await handleAiLogicModeling({ masterTable: mt || masterTable });
                         if (!r.ok) throw new Error(r.error);
                       } catch (e) {
                         const msg = e instanceof Error ? e.message : String(e);
