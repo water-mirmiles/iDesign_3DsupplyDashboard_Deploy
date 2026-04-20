@@ -92,12 +92,11 @@ async function readFinalDashboardSnapshot() {
 // ============================
 const VERTEX_PROJECT_ID = 'idesign-3dsupplydashboard';
 const VERTEX_LOCATION = 'us-central1';
-// 404 兜底：部分项目/区域配额未下发时，切换 region 重试
-const VERTEX_LOCATION_FALLBACKS = ['us-east1', 'asia-northeast1'];
-const VERTEX_LOCATIONS = [VERTEX_LOCATION, ...VERTEX_LOCATION_FALLBACKS];
-// 按最新线上实践：优先锁定明确版本号，避免 alias 在部分 Vertex 项目/区域下 404
-const VERTEX_MODEL = 'gemini-1.5-flash-002';
-const MODEL_PRIORITY = [VERTEX_MODEL, 'gemini-1.5-flash-001', 'gemini-1.5-pro'];
+// 2026 Stack：废弃 1.5；升级到 Gemini 3.x / 2.5
+// NOTE: 官方文档中明确可见的字符串包含 gemini-2.5-flash 与 gemini-3-flash-preview；
+// 若你的项目确实已开通 gemini-3.1-flash，则会优先命中；否则会自动降级到可用版本。
+const VERTEX_MODEL = 'gemini-3.1-flash';
+const MODEL_PRIORITY = [VERTEX_MODEL, 'gemini-3-flash-preview', 'gemini-2.5-flash'];
 
 function ensureVertexCredentialsEnv() {
   const keyPath = path.join(__dirname, 'gcp-key.json');
@@ -108,23 +107,12 @@ function ensureVertexCredentialsEnv() {
 }
 
 const vertexKeyPath = ensureVertexCredentialsEnv();
-// 标准 SDK 模式：仅使用 model alias（不手动拼接 projects/.../models/... 长路径）
-const _vertexClientByLocation = new Map();
-function getVertexClient(location) {
-  const loc = String(location || '').trim() || VERTEX_LOCATION;
-  if (_vertexClientByLocation.has(loc)) return _vertexClientByLocation.get(loc);
-  const c = new VertexAI({ project: VERTEX_PROJECT_ID, location: loc });
-  _vertexClientByLocation.set(loc, c);
-  return c;
-}
-function getVertexModel({ modelName, location }) {
-  const m = String(modelName || '').trim();
-  const loc = String(location || '').trim() || VERTEX_LOCATION;
-  return getVertexClient(loc).getGenerativeModel({ model: m });
-}
-
 // 作用域锁定：全局初始化对象（用于路由里做“是否已初始化”的判定）
-const vertexAi = getVertexClient(VERTEX_LOCATION);
+// 修复 ReferenceError：统一命名为 vertexAI（不要 vertexAi/vertexAI 混用）
+const vertexAI = new VertexAI({ project: VERTEX_PROJECT_ID, location: VERTEX_LOCATION });
+function getVertexModel(modelName) {
+  return vertexAI.getGenerativeModel({ model: String(modelName || '').trim() });
+}
 
 let currentAIStatus = {
   status: 'idle',
@@ -322,8 +310,10 @@ function pickBestFlashModel(available) {
   if (by2Flash) return by2Flash;
   const byFlashLatest = list.find((n) => n.includes('gemini-flash-latest') || n.includes('flash-latest')) || '';
   if (byFlashLatest) return byFlashLatest;
-  const by15Flash = list.find((n) => n.includes('gemini-1.5-flash') || n.includes('1.5-flash')) || '';
-  if (by15Flash) return by15Flash;
+  const by25Flash = list.find((n) => n.includes('gemini-2.5-flash') || n.includes('2.5-flash')) || '';
+  if (by25Flash) return by25Flash;
+  const by3Flash = list.find((n) => n.includes('gemini-3') && n.includes('flash')) || '';
+  if (by3Flash) return by3Flash;
   const anyFlash = list.find((n) => n.includes('flash')) || '';
   return anyFlash || (list[0] || '');
 }
@@ -333,54 +323,35 @@ function buildPriorityFromAvailable(available) {
   const best = pickBestFlashModel(list);
   const flashLatest = list.find((n) => n.includes('gemini-flash-latest') || n.includes('flash-latest')) || '';
   const f20 = list.find((n) => n.includes('gemini-2.0-flash')) || '';
-  const f15 = list.find((n) => n.includes('gemini-1.5-flash')) || '';
+  const f25 = list.find((n) => n.includes('gemini-2.5-flash') || n.includes('2.5-flash')) || '';
+  const f3 = list.find((n) => n.includes('gemini-3') && n.includes('flash')) || '';
   const proLatest = list.find((n) => n.includes('gemini-pro-latest') || n.endsWith('pro-latest')) || '';
   const dedup = (arr) => Array.from(new Set(arr.map(normalizeModelName).filter(Boolean)));
-  return dedup([best, f20, flashLatest, f15, proLatest]);
+  return dedup([best, f3, f25, f20, flashLatest, proLatest]);
 }
 
 async function generateContentVertex({ prompt, modelName }) {
   const p = String(prompt || '');
   const m = String(modelName || VERTEX_MODEL).trim();
-  let lastErr = null;
-  for (const loc of VERTEX_LOCATIONS) {
-    try {
-      const model = getVertexModel({ modelName: m, location: loc });
-      const result = await model.generateContent({
-        contents: [{ role: 'user', parts: [{ text: p }] }],
-      });
-      const text =
-        result?.response?.candidates?.[0]?.content?.parts?.map((x) => x?.text).filter(Boolean).join('') ||
-        result?.response?.candidates?.[0]?.content?.parts?.[0]?.text ||
-        '';
-      return { text: String(text || ''), location: loc, modelName: m };
-    } catch (e) {
-      lastErr = e;
-      const status = getHttpStatusFromGeminiError(e);
-      const is404 = status === 404 || String(e?.message || '').includes('404');
-      if (is404) {
-        // eslint-disable-next-line no-console
-        console.error('[vertex][404] model alias not found in location; retry next', {
-          model: m,
-          project: VERTEX_PROJECT_ID,
-          location: loc,
-          message: String(e?.message || ''),
-        });
-        continue;
-      }
-      // 非 404：直接抛出（鉴权/配额/超时等）
-      break;
-    }
-  }
-
-  // 提示更友好的鉴权错误
-  const msg = String(lastErr?.message || '');
+  try {
+    const model = getVertexModel(m);
+    const result = await model.generateContent({
+      contents: [{ role: 'user', parts: [{ text: p }] }],
+    });
+    const text =
+      result?.response?.candidates?.[0]?.content?.parts?.map((x) => x?.text).filter(Boolean).join('') ||
+      result?.response?.candidates?.[0]?.content?.parts?.[0]?.text ||
+      '';
+    return { text: String(text || ''), modelName: m, location: VERTEX_LOCATION };
+  } catch (e) {
+    const msg = String(e?.message || '');
   if (!process.env.GOOGLE_APPLICATION_CREDENTIALS && !fse.existsSync(vertexKeyPath)) {
     const err = new Error(`Vertex AI 未配置鉴权：请在 server/ 放置 gcp-key.json 或设置 GOOGLE_APPLICATION_CREDENTIALS。原始错误：${msg}`);
-    err.cause = lastErr;
+    err.cause = e;
     throw err;
   }
-  throw lastErr;
+    throw e;
+  }
 }
 
 function sanitizeSqlForAi(sqlText) {
@@ -607,7 +578,7 @@ async function generateContentWithFallback({ prompt }) {
 
 async function listAvailableModels() {
   // Vertex AI：固定锁定企业版稳定模型
-  return [VERTEX_MODEL];
+  return [MODEL_PRIORITY[0]];
 }
 
 // NOTE: 模型优先级已锁定，不再在启动时自动改写，以避免线上抖动与不可控切换
@@ -891,6 +862,18 @@ app.get('/api/ai-status', async (_req, res) => {
   return res.json({ ok: true, ...currentAIStatus });
 });
 
+// 自动化测试：验证 Vertex 调用走 Gemini 3.x，并返回 2026
+app.get('/api/test-vertex-simple', async (_req, res) => {
+  try {
+    const prompt = '只返回一个 JSON：{"year":2026}（不要 Markdown，不要解释）。';
+    const out = await generateWithModelList({ modelNames: MODEL_PRIORITY, prompt, retries: 1 });
+    if (!out.ok) return res.status(502).json({ ok: false, error: out.error?.message || 'vertex failed' });
+    return res.json({ ok: true, modelTried: MODEL_PRIORITY, raw: String(out.text || '') });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
 // 启动时扫描 + 对外暴露扫描结果
 app.get('/api/assets', async (_req, res) => {
   // 为了 PoC 简化：请求时也刷新一次，确保上传后能立刻看到
@@ -1047,7 +1030,7 @@ app.post('/api/preview-mapping-row', async (req, res) => {
 app.post('/api/ai-parse-ddl', async (req, res) => {
   const sqlText = String(req.body?.sqlText || '');
   if (!sqlText.trim()) return res.status(400).json({ ok: false, error: 'sqlText is required' });
-  if (!vertexAi) return res.status(500).json({ ok: false, error: 'Vertex AI is not initialized' });
+  if (!vertexAI) return res.status(500).json({ ok: false, error: 'Vertex AI is not initialized' });
 
   try {
     clearEngineLogSync();
@@ -1445,7 +1428,7 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
     auditLineSync(text);
 
     // Vertex AI：固定锁定企业版稳定模型；失败则本地兜底
-    const modelList = [VERTEX_MODEL];
+    const modelList = MODEL_PRIORITY.map(normalizeModelName);
     const ddlSchemaCompact = ddlTables.map((t) => ({
       tableName: String(t?.tableName || '').trim(),
       columns: Array.isArray(t?.columns)
@@ -1707,7 +1690,7 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
       : null;
   const goldenExpectedMap = buildGoldenExpectedMap({ goldenBlocks, goldenSamples, reference });
   if (!sqlText.trim()) return res.status(400).json({ ok: false, error: 'sqlText is required' });
-  if (!vertexAi) return res.status(500).json({ ok: false, error: 'Vertex AI is not initialized' });
+  if (!vertexAI) return res.status(500).json({ ok: false, error: 'Vertex AI is not initialized' });
 
   try {
     // 新一轮 AI 建模开始：清空上一轮引擎 Trace 日志，便于用户直接看 engine.log
@@ -1878,6 +1861,99 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
         parsedCount: parsedNames.length,
         totalCount: total,
         parsedTables: parsedNames,
+      });
+    }
+
+    // ===========================
+    // 2026 Stack：Gemini 3.x 一次性全表推理（合并维度解析，释放大上下文能力）
+    // ===========================
+    {
+      const schemaCompact = parsedTables.map((t) => ({
+        tableName: t.tableName,
+        columns: (t.columns || []).slice(0, 200),
+      }));
+      const allDdlTableNames = parsedTables.map((t) => String(t.tableName || '').trim()).filter(Boolean);
+      const goldenSection =
+        goldenExpectedMap && goldenExpectedMap.size
+          ? [
+              '【黄金样本期望值（必须命中；禁止返回 ID）】',
+              ...Array.from(goldenExpectedMap.entries()).map(([k, v]) => `- ${k}: ${JSON.stringify(String(v || ''))}`),
+            ].join('\n')
+          : '【黄金样本期望值】（空）';
+
+      const oneShotPrompt = [
+        '你是 Gemini 3.x（超大上下文）。请一次性理解全部表结构，并为 7 个维度给出从主表到维表业务值列的完整 CHAIN 路径。',
+        masterTable ? `业务主表（Master Table）：${masterTable}` : '',
+        '',
+        '【硬性要求】',
+        '1) 必须输出 joinPathSuggestions，包含：styleCode, brand, lastCode, soleCode, colorCode, materialCode, status。',
+        '2) 每个维度必须输出 1 条 joinPath（结构化数组），允许 0~2 个中间表。',
+        '3) joinPath 末段必须是 { targetTable, valueField }，且 valueField 必须是业务可读列（code/name/brand_name...），严禁以 id 结尾。',
+        '4) 严禁输出“未找到”。',
+        '',
+        goldenSection,
+        '',
+        '【DDL 表名清单】',
+        allDdlTableNames.join(', '),
+        '',
+        '【表结构精简版 JSON】',
+        JSON.stringify(schemaCompact),
+        '',
+        '输出严格 JSON（不要 Markdown，不要解释），形如：',
+        '{ "smartSuggestions": [], "joinPathSuggestions": [ { "targetStandardKey":"brand", "joinPath":[ {"sourceTable":"...","sourceField":"...","targetTable":"...","targetField":"..."}, {"targetTable":"...","valueField":"..."} ] } ], "concatMappingSuggestions": [] }',
+      ]
+        .filter(Boolean)
+        .join('\n');
+
+      auditLineSync('[Audit][A] Prompt Snapshot (one-shot, gemini-3.x)');
+      auditLineSync(oneShotPrompt);
+      aiTraceLineSync('[现场 A] ===== one-shot Prompt Audit =====');
+      aiTraceLineSync(oneShotPrompt);
+
+      const oneShotOut = await generateWithModelList({ modelNames: modelList, prompt: oneShotPrompt, retries: 1 });
+      aiTraceLineSync('[现场 B] ===== one-shot Raw AI Output =====');
+      aiTraceLineSync(oneShotOut.ok ? String(oneShotOut.text || '') : `[FAILED] ${String(oneShotOut.error?.message || '')}`);
+      if (!oneShotOut.ok) {
+        return res.status(502).json({ ok: false, error: oneShotOut.error?.message || 'Vertex call failed' });
+      }
+
+      const obj = extractJsonObject(stripJsonFences(oneShotOut.text));
+      const smartSuggestions = Array.isArray(obj?.smartSuggestions) ? obj.smartSuggestions : [];
+      const jpRaw = Array.isArray(obj?.joinPathSuggestions) ? obj.joinPathSuggestions : [];
+      const concatMappingSuggestions = Array.isArray(obj?.concatMappingSuggestions) ? obj.concatMappingSuggestions : [];
+      const joinPathSuggestions = jpRaw
+        .map((j) => {
+          const targetStandardKey = typeof j?.targetStandardKey === 'string' ? j.targetStandardKey.trim() : '';
+          const rawJoin =
+            Array.isArray(j?.joinPath) && j.joinPath.length ? j.joinPath : Array.isArray(j?.path) ? j.path : [];
+          const pathArr = normalizeAiJoinPathToStringPath(rawJoin);
+          return targetStandardKey && pathArr.length >= 2 ? { targetStandardKey, path: pathArr } : null;
+        })
+        .filter(Boolean);
+
+      aiTraceLineSync('[Step 3] 物理回测验证...');
+      const latestDirForBacktest = DIRS.sandbox;
+      const targetStyleForBacktest = String(goldenExpectedMap.get('styleCode') || reference?.styleCode || '').trim();
+      const validated = await validateJoinPathSuggestionsWithGoldenXlsx({
+        joinPathSuggestions,
+        goldenByStandardKey: goldenExpectedMap,
+        folderPath: latestDirForBacktest,
+        smartSuggestions,
+        targetStyle: targetStyleForBacktest,
+      });
+
+      auditLineSync('[Audit][D] Validation result (one-shot)');
+      auditLineSync(JSON.stringify({ validatedCount: validated.length, validatedKeys: validated.map((x) => x.targetStandardKey) }, null, 2));
+      setAIStatus({ status: 'done', model: modelList[0] || '', message: `one-shot 建模完成：validated=${validated.length}` });
+      auditLineSync(`[Audit] ===== AI 逻辑建模结束(one-shot) ${new Date().toISOString()} =====`);
+
+      return res.json({
+        ok: true,
+        tables: parsedTables,
+        smartSuggestions,
+        joinPathSuggestions: validated,
+        concatMappingSuggestions,
+        _debug: { modelTried: modelList, mode: 'one-shot' },
       });
     }
 
