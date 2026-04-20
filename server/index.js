@@ -11,8 +11,12 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import {
   aggregateProjectData,
   buildStandardMap,
+  auditLineSync,
+  clearEngineAuditLogSync,
+  clearEngineLogSync,
   persistFinalDashboardData,
   processAllData,
+  readAllFilesFromFolder,
   resolveFirstActiveRowFromFolder,
   validateJoinPathSuggestionsWithGoldenXlsx,
 } from './dataEngine.js';
@@ -78,8 +82,8 @@ async function readFinalDashboardSnapshot() {
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const genAI = GEMINI_API_KEY ? new GoogleGenerativeAI(GEMINI_API_KEY) : null;
 // NOTE: This API key's available models are discoverable via /api/debug/gemini-models
-// Tier 1（New Users 权限限制）热修：锁定确权可用模型（不带 models/ 前缀）
-const MODEL_PRIORITY = ['gemini-1.5-flash', 'gemini-1.5-flash-latest', 'gemini-2.0-flash-exp'];
+// Tier 1（New Users 权限限制）热修：锁定确权可用模型（不带 models/ 前缀，禁止使用 -exp 实验模型）
+const MODEL_PRIORITY = ['gemini-1.5-flash', 'gemini-2.0-flash', 'gemini-pro-latest'];
 // 环境变量强制指定：若设置 GEMINI_MODEL，则仅使用该模型，跳过优先级列表
 const GEMINI_FORCED_MODEL = (process.env.GEMINI_MODEL || '').trim();
 const GEMINI_DISCOVERY_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
@@ -1063,13 +1067,36 @@ app.post('/api/preview-mapping-row', async (req, res) => {
     const mappingArr = Array.isArray(req.body?.mapping) ? req.body.mapping : null;
     if (!mappingArr?.length) return res.status(400).json({ ok: false, error: 'mapping array required' });
     const latestDir = await getLatestDataTablesDir();
+    if (!(await fse.pathExists(latestDir))) {
+      return res.status(404).json({
+        ok: false,
+        error: 'Latest data_tables directory not found',
+        code: 'DataDirMissing',
+      });
+    }
+    const preload = await readAllFilesFromFolder(latestDir);
+    if (!preload.xlsxTables?.length) {
+      return res.status(404).json({
+        ok: false,
+        error: 'No Excel files in latest data_tables snapshot',
+        code: 'NoExcelInDataDir',
+      });
+    }
     const standardMap = buildStandardMap(mappingArr);
     const resolved = await resolveFirstActiveRowFromFolder({
       folderPath: latestDir,
       standardMap,
       traceJoins: true,
+      preload,
+      previewStrict: true,
     });
-    if (!resolved.ok) return res.json({ ok: false, error: resolved.error || 'resolve failed' });
+    if (!resolved.ok) {
+      return res.status(404).json({
+        ok: false,
+        error: resolved.error || 'resolve failed',
+        code: 'PreviewResolveFailed',
+      });
+    }
     return res.json({
       ok: true,
       latestDir: path.basename(latestDir),
@@ -1077,6 +1104,7 @@ app.post('/api/preview-mapping-row', async (req, res) => {
       usedFallbackRow: resolved.usedFallbackRow,
       warning: resolved.warning,
       row: resolved.row || {},
+      previewFieldErrors: resolved.previewFieldErrors,
       engine: 'resolveRecursiveValue',
     });
   } catch (e) {
@@ -1091,6 +1119,7 @@ app.post('/api/ai-parse-ddl', async (req, res) => {
   if (!genAI) return res.status(500).json({ ok: false, error: 'GEMINI_API_KEY is not configured' });
 
   try {
+    clearEngineLogSync();
     setAIStatus({ status: 'running', model: '', message: '开始 AI 解析 DDL...' });
     const prompt = [
       '你是一个 SQL 专家。',
@@ -1169,6 +1198,28 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
   if (!genAI) return res.status(500).json({ ok: false, error: 'GEMINI_API_KEY is not configured' });
 
   try {
+    // 新一轮 AI 建模开始：清空上一轮引擎 Trace 日志，便于用户直接看 engine.log
+    clearEngineLogSync();
+    clearEngineAuditLogSync();
+    auditLineSync(`[Audit] ===== AI 逻辑建模开始 ${new Date().toISOString()} =====`);
+    auditLineSync('[Audit][A] Input Audit: /api/ai-parse-multi-sql request body');
+    try {
+      auditLineSync(
+        JSON.stringify(
+          {
+            masterTable,
+            sqlChars: sqlText.length,
+            goldenByDimension: goldenByDimRaw,
+            goldenSamples: req.body?.goldenSamples,
+            reference,
+          },
+          null,
+          2
+        )
+      );
+    } catch {
+      auditLineSync('[Audit][A] Input Audit JSON stringify failed');
+    }
     // 1) 正则拆分每个 CREATE TABLE
     const ddls = splitCreateTableStatements(sqlText);
     if (!ddls.length) return res.status(400).json({ ok: false, error: 'No CREATE TABLE statements found' });
@@ -1225,6 +1276,8 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
       ].join('\n');
 
       const out = await generateWithModelList({ modelNames: modelList, prompt, retries: 3 });
+      auditLineSync(`[Audit][B] AI Raw Output (single-table ddl parse) table=${nameHint}`);
+      auditLineSync(out.ok ? String(out.text || '') : `[Audit][B] FAILED: ${String(out.error?.message || '')}`);
       let normalized;
       if (!out.ok) {
         // 3) 终极 fallback：本地解析（不报错，保证字段目录可用）
@@ -1272,101 +1325,109 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
     let smartSuggestions = [];
     let joinPathSuggestions = [];
     let concatMappingSuggestions = [];
-    try {
-      setAIStatus({ status: 'running', model: modelList[0] || '', message: '开始推理 Join 链路与智能建议...' });
-      const schemaCompact = parsedTables.map((t) => ({
-        tableName: t.tableName,
-        columns: (t.columns || []).slice(0, 200), // 防止异常超大
-      }));
-      const chunkArray = (arr, size) => {
-        const out = [];
-        for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
-        return out;
-      };
 
-      const allDdlTableNames = parsedTables.map((t) => String(t.tableName || '').trim()).filter(Boolean);
-      const isNumericLike = (s) => {
-        const x = String(s ?? '').trim();
-        return Boolean(x) && /^[0-9]+$/.test(x);
-      };
-      const goldenKeysWithMultiRows =
-        goldenBlocks && goldenBlocks.length
-          ? goldenBlocks.filter((b) => b.rows.length > 1).map((b) => b.standardKey)
-          : (() => {
-              const goldenKeyCounts = new Map();
-              for (const g of goldenSamples) {
-                const k = String(g.standardKey || '').trim();
-                if (!k) continue;
-                goldenKeyCounts.set(k, (goldenKeyCounts.get(k) || 0) + 1);
-              }
-              return [...goldenKeyCounts.entries()].filter(([, n]) => n > 1).map(([k]) => k);
-            })();
+    const schemaCompact = parsedTables.map((t) => ({
+      tableName: t.tableName,
+      columns: (t.columns || []).slice(0, 200), // 防止异常超大
+    }));
+    const chunkArray = (arr, size) => {
+      const out = [];
+      for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+      return out;
+    };
 
-      let goldenSectionForPrompt = '';
-      if (goldenBlocks && goldenBlocks.length) {
-        goldenSectionForPrompt = [
-          '',
-          '【用户结构化线索 — 必须优先用于推理】',
-          '用户不仅提供了物理字段与样本值，还提供：',
-          '1) **维度目标值 (Target Goal)**：该标准维度在业务上要达成的最终值（例如材质维度目标为 LT04）。',
-          '2) **逻辑备注 (Context Notes)**：每一「样本行」旁的说明（例如「这是父类」「这是子类，需拼接」）。',
-          '请综合 Target Goal 与 notes，在全部 DDL 表中寻找完整 Join；若目标值由多段拼接而成，必须输出 operator: "CONCAT" 的 concatMappingSuggestions，parts 顺序与样本行顺序一致，且每段 joinPath 终点为值列（不得用 .id 作为最终展示列，见上文硬性约束）。',
-          '',
-          '【按标准维度分组的黄金样本】',
-          ...goldenBlocks.slice(0, 24).flatMap((b) => [
-            `### 维度 ${b.standardKey}`,
-            `- 目标期望值 (Target Goal): ${JSON.stringify(b.targetGoal || '')}`,
-            ...b.rows.map((row, idx) => {
-              const note = row.notes ? ` ｜ 逻辑备注: ${JSON.stringify(row.notes)}` : '';
-              const detail = row.segments
-                .map((s) => `${s.tableName}.${s.fieldName}=${JSON.stringify(String(s.value ?? ''))}`)
-                .join(' + ');
-              return `  - 样本行 ${idx + 1}${note} ｜ 分段：${detail}`;
-            }),
-          ]),
-          goldenBlocks.length > 24 ? `\n... 省略 ${goldenBlocks.length - 24} 个维度块` : '',
-          '',
-          '【复合维度】同一维度多行样本 + Target Goal 为合成值（如 LT04）时：为每一行分别推导 Join Path，concatMappingSuggestions.parts 与行数一致。',
-          goldenKeysWithMultiRows.length
-            ? `【多行样本维度】${goldenKeysWithMultiRows.join('、')} — CONCAT 的 parts 数量须等于该维度样本行数。`
-            : '',
-        ]
-          .filter(Boolean)
-          .join('\n');
-      } else if (goldenSamples.length) {
-        goldenSectionForPrompt = [
-          '',
-          '用户提供了“动态黄金样本”：每条绑定一个 standardKey（标准维度），内含一个或多个 (table.field = value) 分段。',
-          '【复合维度 / 拼接 CONCAT — 同组多分段】若同一条样本组含多个 segments，真实取值 = 各分段 value 按顺序直接连接（无分隔符），例如 "LT"+"04" -> "LT04"。请为每个分段分别推导 Join Path，在 concatMappingSuggestions 中输出 operator: "CONCAT" 与 parts[]，每一段对应 parts 中一项且含独立 joinPath（若该段在主表上直连则可仅用 sourceTable+sourceField）。',
-          goldenKeysWithMultiRows.length
-            ? [
-                '',
-                `【复合维度 — Step2 多行样本组】以下 standardKey 在用户界面中出现了多组黄金样本（每组可含一个或多个分段），表示 CONCAT 的多段来源：${goldenKeysWithMultiRows.join('、')}。`,
-                '你必须：① 为每一「样本组」分别寻找从主表可达、且终点为「值列」的 Join Path；② 在 concatMappingSuggestions 中为该 standardKey 返回 operator: "CONCAT"，parts 数组长度等于该维度的样本组数量，顺序与下方清单中该 standardKey 各组出现顺序一致；③ 最终业务上 path1 末端取值 + path2 末端取值 + … = 用户期望的合成编码（如 LT+04）。',
-              ].join('\n')
-            : '',
-          '若合成值在单表单列中不存在，请用多段路径 + CONCAT 解释。',
-          '【parent_id 父子编码】若分段值所在行 parent_id 指向另一行 id，另一分段在父行 category_code 等字段，请输出完整多跳路径（可自关联）。',
-          '样本清单：',
-          ...goldenSamples.slice(0, 40).map((g) => {
-            const sk = g.standardKey || '(legacy 未标注)';
-            const joined = g.segments.map((s) => String(s.value ?? '')).join('');
-            const detail = g.segments
+    const allDdlTableNames = parsedTables.map((t) => String(t.tableName || '').trim()).filter(Boolean);
+    const isNumericLike = (s) => {
+      const x = String(s ?? '').trim();
+      return Boolean(x) && /^[0-9]+$/.test(x);
+    };
+    const goldenKeysWithMultiRows =
+      goldenBlocks && goldenBlocks.length
+        ? goldenBlocks.filter((b) => b.rows.length > 1).map((b) => b.standardKey)
+        : (() => {
+            const goldenKeyCounts = new Map();
+            for (const g of goldenSamples) {
+              const k = String(g.standardKey || '').trim();
+              if (!k) continue;
+              goldenKeyCounts.set(k, (goldenKeyCounts.get(k) || 0) + 1);
+            }
+            return [...goldenKeyCounts.entries()].filter(([, n]) => n > 1).map(([k]) => k);
+          })();
+
+    let goldenSectionForPrompt = '';
+    if (goldenBlocks && goldenBlocks.length) {
+      goldenSectionForPrompt = [
+        '',
+        '【用户结构化线索 — 必须优先用于推理】',
+        '用户不仅提供了物理字段与样本值，还提供：',
+        '1) **维度目标值 (Target Goal)**：该标准维度在业务上要达成的最终值（例如材质维度目标为 LT04）。',
+        '2) **逻辑备注 (Context Notes)**：每一「样本行」旁的说明（例如「这是父类」「这是子类，需拼接」）。',
+        '请综合 Target Goal 与 notes，在全部 DDL 表中寻找完整 Join；若目标值由多段拼接而成，必须输出 operator: "CONCAT" 的 concatMappingSuggestions，parts 顺序与样本行顺序一致，且每段 joinPath 终点为值列（不得用 .id 作为最终展示列，见上文硬性约束）。',
+        '',
+        '【按标准维度分组的黄金样本】',
+        ...goldenBlocks.slice(0, 24).flatMap((b) => [
+          `### 维度 ${b.standardKey}`,
+          `- 目标期望值 (Target Goal): ${JSON.stringify(b.targetGoal || '')}`,
+          ...b.rows.map((row, idx) => {
+            const note = row.notes ? ` ｜ 逻辑备注: ${JSON.stringify(row.notes)}` : '';
+            const detail = row.segments
               .map((s) => `${s.tableName}.${s.fieldName}=${JSON.stringify(String(s.value ?? ''))}`)
               .join(' + ');
-            return `- [${sk}] 合成≈ ${JSON.stringify(joined)} ｜ 分段：${detail}`;
+            return `  - 样本行 ${idx + 1}${note} ｜ 分段：${detail}`;
           }),
-          goldenSamples.length > 40 ? `- ... 省略 ${goldenSamples.length - 40} 条样本组` : '',
-        ]
-          .filter(Boolean)
-          .join('\n');
-      }
+        ]),
+        goldenBlocks.length > 24 ? `\n... 省略 ${goldenBlocks.length - 24} 个维度块` : '',
+        '',
+        '【复合维度】同一维度多行样本 + Target Goal 为合成值（如 LT04）时：为每一行分别推导 Join Path，concatMappingSuggestions.parts 与行数一致。',
+        goldenKeysWithMultiRows.length
+          ? `【多行样本维度】${goldenKeysWithMultiRows.join('、')} — CONCAT 的 parts 数量须等于该维度样本行数。`
+          : '',
+      ]
+        .filter(Boolean)
+        .join('\n');
+    } else if (goldenSamples.length) {
+      goldenSectionForPrompt = [
+        '',
+        '用户提供了“动态黄金样本”：每条绑定一个 standardKey（标准维度），内含一个或多个 (table.field = value) 分段。',
+        '【复合维度 / 拼接 CONCAT — 同组多分段】若同一条样本组含多个 segments，真实取值 = 各分段 value 按顺序直接连接（无分隔符），例如 "LT"+"04" -> "LT04"。请为每个分段分别推导 Join Path，在 concatMappingSuggestions 中输出 operator: "CONCAT" 与 parts[]，每一段对应 parts 中一项且含独立 joinPath（若该段在主表上直连则可仅用 sourceTable+sourceField）。',
+        goldenKeysWithMultiRows.length
+          ? [
+              '',
+              `【复合维度 — Step2 多行样本组】以下 standardKey 在用户界面中出现了多组黄金样本（每组可含一个或多个分段），表示 CONCAT 的多段来源：${goldenKeysWithMultiRows.join('、')}。`,
+              '你必须：① 为每一「样本组」分别寻找从主表可达、且终点为「值列」的 Join Path；② 在 concatMappingSuggestions 中为该 standardKey 返回 operator: "CONCAT"，parts 数组长度等于该维度的样本组数量，顺序与下方清单中该 standardKey 各组出现顺序一致；③ 最终业务上 path1 末端取值 + path2 末端取值 + … = 用户期望的合成编码（如 LT+04）。',
+            ].join('\n')
+          : '',
+        '若合成值在单表单列中不存在，请用多段路径 + CONCAT 解释。',
+        '【parent_id 父子编码】若分段值所在行 parent_id 指向另一行 id，另一分段在父行 category_code 等字段，请输出完整多跳路径（可自关联）。',
+        '样本清单：',
+        ...goldenSamples.slice(0, 40).map((g) => {
+          const sk = g.standardKey || '(legacy 未标注)';
+          const joined = g.segments.map((s) => String(s.value ?? '')).join('');
+          const detail = g.segments
+            .map((s) => `${s.tableName}.${s.fieldName}=${JSON.stringify(String(s.value ?? ''))}`)
+            .join(' + ');
+          return `- [${sk}] 合成≈ ${JSON.stringify(joined)} ｜ 分段：${detail}`;
+        }),
+        goldenSamples.length > 40 ? `- ... 省略 ${goldenSamples.length - 40} 条样本组` : '',
+      ]
+        .filter(Boolean)
+        .join('\n');
+    }
 
-      const buildDetectivePrompt = ({ schemaPart, partIndex, partTotal }) => {
+    const buildDetectivePrompt = ({ schemaPart, partIndex, partTotal }) => {
         return [
           `你现在是一个数据专家/数据侦探。请解析以下提供的所有 SQL DDL 表结构信息。用户共提供了 ${total} 张表。`,
           partTotal > 1 ? `为性能考虑，本次是第 ${partIndex + 1}/${partTotal} 批（每批最多 5 张表）。请在本批次内尽可能推断 Join 关系与映射。` : '',
           masterTable ? `用户已手动指定 ${masterTable} 为业务主表（Master Table）。请以该表为起点寻找到其它表的 Join Path。` : '',
+          '',
+          '【强制连线（指定目标）— 你的唯一任务】',
+          '你不是在“猜字段”，你是在“强制连线”。用户已经在 Step2 明确选定了每个维度的终点字段（targetTable.targetField）及其期望值（targetValue）。',
+          '你必须为每个维度输出一条从【主表】到【目标表.目标字段】的可执行 CHAIN 路径（结构化 joinPath）：',
+          '- 起点：主表中的某个 *_id / associated_* 等外键字段',
+          '- 中间：允许 0~2 个中间表转接（主表.mid_id -> 中间表.id；中间表.target_id -> 目标表.id）',
+          '- 终点：必须严格落在用户指定的 targetTable.targetField（禁止改终点字段）',
+          '你严禁返回“未找到”。只要 DDL 里存在任何可用关联，你必须给出最合理的一条链。',
+          '判真标准：把路径执行到终点后得到的值必须与 targetValue 字符串完全一致；若你算出的仍是数字 ID，而 targetValue 是业务码/名称字符串，则路径错误，必须继续往下跳到 code/name/category_code 等业务列。',
           '',
           '【User-Defined First — 用户指定优先（绝对硬性规则）】',
           '当用户在 Step2 的黄金样本中明确选择了 tableName 与 fieldName（即某个具体的 目标表.目标字段），你严禁改选其它字段作为终点（尤其禁止把 *.id 替换为 *.code 或其它列）。',
@@ -1390,6 +1451,18 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
           '3) 路径完整性：主表外键 → 维表定位键 → … → 维表业务值列，每一跳都写入 joinPath，不得跳步。',
           '4) 表名严格对齐：smartSuggestions 与 joinPath 内所有 table 名须与「DDL 表名清单」100% 一致，禁止臆造缩写。',
           '5) 【品牌 brand — 数字主表 vs 字符串黄金样本】若黄金样本中品牌为**可读名称**（如 Bruno Marc），而主表 `brand`（或 smartSuggestions 中映射列）在业务上存的是**数值 ID**（如 1），则**必须**输出 targetStandardKey=brand 的 joinPath：主表该列 → 品牌维表（DDL 中如 ods_wms_base_brand_df 或含 base_brand / wms+brand 的表）的 id（或主键）→ **品牌展示列**（优先 brand_name，其次 name）。禁止把可执行路径的终点留在主表数字列上。结构化 joinPath 示例末项 valueField 须为 brand_name（或与 COMMENT 一致之展示列）。Legacy CHAIN 等价示例：CHAIN|ods_pdm_pdm_product_info_df.brand->ods_wms_base_brand_df.id->ods_wms_base_brand_df.brand_name（表名以 DDL 为准，勿臆造）。',
+          '',
+          '【强迫学习（必须照抄范式）】',
+          'brand 已被证明可执行且正确：主表.brand -> 品牌表.id -> 品牌表.brand_name。',
+          '你必须把它当成“模板模式”：其它维度（lastCode/soleCode/colorCode/materialCode）必须同样遵循「主表外键/关联列(可能是数字ID) -> 目标维表定位键(id/parent_id/...) -> 目标维表业务值列(code/name/...)」。',
+          '如果你算出的终点仍是纯数字（例如 1695）而黄金样本是业务号（例如 L-B26097M），说明路径没有走到最后一公里，你必须继续往下跳到 code/name 等字段，直到与黄金样本字符串严格一致。',
+          '',
+          '【楦/底维度硬性线索（必须优先尝试）】',
+          '1) 楦编号 lastCode：起点通常在主表的 associated_last_type（或 associated_last/last_id/last_type_id 等），终点必须是 ods_pdm_pdm_base_last_df.code。',
+          '   - 允许中间多跳（<=3表），但最后一项必须是 { targetTable: "ods_pdm_pdm_base_last_df", valueField: "code" }。',
+          '2) 大底编号 soleCode：起点通常在主表的 associated_sole_info（或 sole_id/associated_sole 等），终点必须是 ods_pdm_pdm_base_heel_df.code。',
+          '   - 允许中间多跳（<=3表），但最后一项必须是 { targetTable: "ods_pdm_pdm_base_heel_df", valueField: "code" }。',
+          '注意：上述表名与字段名必须与 DDL 清单一致；若 DDL 中确无该表/字段，则在 joinPathSuggestions 中明确留空并说明原因（不要编造）。',
           '',
           '【DDL 表名清单（唯一合法表名来源）】',
           allDdlTableNames.join(', '),
@@ -1464,11 +1537,13 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
         ].join('\n');
       };
 
-      const schemaBatches = total > 20 ? chunkArray(schemaCompact, 5) : [schemaCompact];
+    const schemaBatches = total > 20 ? chunkArray(schemaCompact, 5) : [schemaCompact];
       const smartByKey = new Map();
       const joinByKey = new Map();
       const concatByKey = new Map();
 
+    try {
+      setAIStatus({ status: 'running', model: modelList[0] || '', message: '开始推理 Join 链路与智能建议...' });
       for (let bi = 0; bi < schemaBatches.length; bi++) {
         setAIStatus({
           status: 'running',
@@ -1476,7 +1551,11 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
           message: schemaBatches.length > 1 ? `正在推理 Join（批次 ${bi + 1}/${schemaBatches.length}）...` : '正在推理 Join...',
         });
         const detective = buildDetectivePrompt({ schemaPart: schemaBatches[bi], partIndex: bi, partTotal: schemaBatches.length });
+        auditLineSync(`[Audit][A] Prompt Snapshot (detective) batch=${bi + 1}/${schemaBatches.length}`);
+        auditLineSync(detective);
         const out2 = await generateWithModelList({ modelNames: modelList, prompt: detective, retries: 3 });
+        auditLineSync(`[Audit][B] AI Raw Output (detective) batch=${bi + 1}/${schemaBatches.length}`);
+        auditLineSync(out2.ok ? String(out2.text || '') : `[Audit][B] FAILED: ${String(out2.error?.message || '')}`);
         if (!out2.ok) continue;
         const obj2 = extractJsonObject(stripJsonFences(out2.text));
         const ss = Array.isArray(obj2?.smartSuggestions) ? obj2.smartSuggestions : [];
@@ -1555,12 +1634,74 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
     }
 
     const latestDirForBacktest = await getLatestDataTablesDir();
-    joinPathSuggestions = await validateJoinPathSuggestionsWithGoldenXlsx({
+    auditLineSync('[Audit][C] Join Execution Trace: start backtest on latest XLSX');
+    auditLineSync(JSON.stringify({ latestDirForBacktest, joinPathCount: joinPathSuggestions.length }, null, 2));
+    const validatedFirst = await validateJoinPathSuggestionsWithGoldenXlsx({
       joinPathSuggestions,
       goldenByStandardKey: goldenExpectedMap,
       folderPath: latestDirForBacktest,
       smartSuggestions,
     });
+    joinPathSuggestions = validatedFirst;
+    auditLineSync('[Audit][D] Validation & Retry Logic: first validation result');
+    auditLineSync(JSON.stringify({ validatedCount: validatedFirst.length, validatedKeys: validatedFirst.map((x) => x.targetStandardKey) }, null, 2));
+
+    // 若关键维度仍无法通过“物理执行+黄金值”校验，则给 AI 一次明确反馈重试机会（最多 1 次）
+    const mustKeys = ['brand', 'lastCode', 'soleCode', 'colorCode', 'materialCode'];
+    const missing = mustKeys.filter((k) => {
+      const expected = goldenExpectedMap.get(k) || '';
+      if (!expected) return false;
+      return !validatedFirst.some((x) => x.targetStandardKey === k);
+    });
+    if (missing.length) {
+      auditLineSync('[Audit][D] FAIL detected: missing validated keys => retry once');
+      auditLineSync(JSON.stringify({ missing, expected: Object.fromEntries(missing.map((k) => [k, goldenExpectedMap.get(k) || ''])) }, null, 2));
+      // eslint-disable-next-line no-console
+      console.warn('[ai-parse-multi-sql] joinPath backtest failed, retry once for keys:', missing);
+      setAIStatus({ status: 'running', model: modelList[0] || '', message: `回测失败：${missing.join('、')}，正在要求 AI 重新强制连线...` });
+      const retryFeedback = [
+        '',
+        '【系统回测反馈（必须修正）】',
+        `下列维度的 joinPath 在最新 Excel 快照上执行后未能得到黄金值，请你换一条链路：${missing.join('、')}`,
+        ...missing.map((k) => `- ${k}: 期望值 = ${JSON.stringify(String(goldenExpectedMap.get(k) || ''))}`),
+        '你必须重新寻找不同的外键/中间表/终点值列，直到执行结果与黄金值严格一致。',
+        '输出仍需为严格 JSON（不要解释、不要 Markdown）。',
+      ].join('\n');
+      auditLineSync('[Audit][D] Retry feedback sent to AI:');
+      auditLineSync(retryFeedback);
+      const detectiveRetry = `${buildDetectivePrompt({ schemaPart: schemaBatches[0], partIndex: 0, partTotal: schemaBatches.length })}\n${retryFeedback}`;
+      auditLineSync('[Audit][A] Full Prompt (detective retry):');
+      auditLineSync(detectiveRetry);
+      const outRetry = await generateWithModelList({ modelNames: modelList, prompt: detectiveRetry, retries: 2 });
+      auditLineSync('[Audit][B] AI Raw Output (detective retry)');
+      auditLineSync(outRetry.ok ? String(outRetry.text || '') : `[Audit][B] FAILED: ${String(outRetry.error?.message || '')}`);
+      if (outRetry.ok) {
+        const objRetry = extractJsonObject(stripJsonFences(outRetry.text));
+        const jpRetry = Array.isArray(objRetry?.joinPathSuggestions) ? objRetry.joinPathSuggestions : [];
+        const joinByKeyRetry = new Map();
+        for (const j of jpRetry) {
+          const targetStandardKey = typeof j?.targetStandardKey === 'string' ? j.targetStandardKey.trim() : '';
+          const rawJoin =
+            Array.isArray(j?.joinPath) && j.joinPath.length ? j.joinPath : Array.isArray(j?.path) ? j.path : [];
+          const pathArr = normalizeAiJoinPathToStringPath(rawJoin);
+          if (!targetStandardKey || pathArr.length < 2) continue;
+          if (!joinByKeyRetry.has(targetStandardKey)) joinByKeyRetry.set(targetStandardKey, { targetStandardKey, path: pathArr });
+        }
+        const validatedRetry = await validateJoinPathSuggestionsWithGoldenXlsx({
+          joinPathSuggestions: Array.from(joinByKeyRetry.values()),
+          goldenByStandardKey: goldenExpectedMap,
+          folderPath: latestDirForBacktest,
+          smartSuggestions,
+        });
+        auditLineSync('[Audit][D] Retry validation result');
+        auditLineSync(JSON.stringify({ validatedRetryCount: validatedRetry.length, validatedRetryKeys: validatedRetry.map((x) => x.targetStandardKey) }, null, 2));
+        // 合并：以通过校验的为准补齐缺失项
+        const merged = new Map(validatedFirst.map((x) => [x.targetStandardKey, x]));
+        for (const x of validatedRetry) merged.set(x.targetStandardKey, x);
+        joinPathSuggestions = Array.from(merged.values());
+      }
+    }
+    auditLineSync(`[Audit] ===== AI 逻辑建模结束 ${new Date().toISOString()} =====`);
 
     setAIStatus({ status: 'done', model: modelList[0] || '', message: `分批解析完成：${parsedNames.length}/${total}`, parsedCount: parsedNames.length, totalCount: total, parsedTables: parsedNames });
     return res.json({
@@ -1582,7 +1723,22 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
       responseData: e?.response?.data,
     });
     setAIStatus({ status: 'error', model: currentAIStatus.model, message: e instanceof Error ? e.message : 'AI parse failed' });
+    auditLineSync(`[Audit] ===== AI 逻辑建模异常 ${new Date().toISOString()} =====`);
+    auditLineSync(String(e instanceof Error ? e.stack || e.message : String(e)));
     return res.status(500).json({ ok: false, error: e instanceof Error ? e.message : 'AI parse failed' });
+  }
+});
+
+// 下载/查看完整逻辑审计日志
+app.get('/api/engine-audit-log', async (_req, res) => {
+  await ensureStorageDirs();
+  try {
+    const p = path.join(__dirname, 'storage', 'engine_audit.log');
+    if (!(await fse.pathExists(p))) return res.status(404).json({ ok: false, error: 'engine_audit.log not found' });
+    const text = await fse.readFile(p, 'utf8');
+    return res.json({ ok: true, text });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e instanceof Error ? e.message : 'read audit log failed' });
   }
 });
 
