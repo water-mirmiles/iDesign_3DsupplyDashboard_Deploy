@@ -107,7 +107,7 @@ export interface InventoryItem {
   has3DLast?: boolean; // 是否命中 3D 楦头物理文件（对账结果）
   soleCode?: string; // 大底编号
   soleStatus: 'matched' | 'missing'; // 3D大底状态
-  data_status: 'active' | 'draft' | 'obsolete'; // 状态
+  data_status: 'active' | 'draft' | 'obsolete' | 'other'; // 状态（other=未命中词库的兜底类）
   lastUpdated: string; // 最后更新
   updatedBy: string; // 更新人
   sourceTable: string; // 数据源说明

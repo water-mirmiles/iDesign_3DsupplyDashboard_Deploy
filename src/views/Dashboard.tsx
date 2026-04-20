@@ -49,6 +49,7 @@ type DashboardStatsResponse = {
     effective?: { kpis?: any; lastDigitizationStats?: any[]; soleDigitizationStats?: any[] };
     draft?: { kpis?: any; lastDigitizationStats?: any[]; soleDigitizationStats?: any[] };
     obsolete?: { kpis?: any; lastDigitizationStats?: any[]; soleDigitizationStats?: any[] };
+    other?: { kpis?: any; lastDigitizationStats?: any[]; soleDigitizationStats?: any[] };
   };
   brandCoverage: Array<{ brand: string; linked: number; unlinked: number }>;
   brandBindingStats?: Array<{
@@ -140,6 +141,18 @@ export default function Dashboard() {
     return audit.map((x) => x.value).join(', ');
   }, [stats?.rawStatusAudit, stats?.meta?.rawStatusAudit]);
 
+  /** 入库款号按归一化状态计数（与 Tab 求和一致；无分桶快照时回落 scopeKPIs） */
+  const invStatusCounts = useMemo(() => {
+    const sd: any = stats?.statusBuckets?.total?.kpis?.statusDist ?? stats?.kpis?.statusDist;
+    if (!sd) return null;
+    return {
+      effective: Number(sd.active ?? 0),
+      draft: Number(sd.draft ?? 0),
+      obsolete: Number(sd.obsolete ?? 0),
+      other: Number(sd.other ?? 0),
+    };
+  }, [stats?.statusBuckets?.total?.kpis?.statusDist, stats?.kpis?.statusDist]);
+
   const brandTotalAll = useMemo(() => {
     const inv = stats?.inventory || [];
     const set = new Set<string>();
@@ -219,13 +232,21 @@ export default function Dashboard() {
     return fallback;
   }, [stats, statusScope]);
 
+  const tabStyleTotalCount = useMemo(() => {
+    const c = invStatusCounts;
+    if (!c) return Number(scopeKPIs?.styles?.totalAll ?? scopeKPIs?.totalStyles ?? 0);
+    if (statusScope === 'effective') return c.effective;
+    if (statusScope === 'includeDraft') return c.effective + c.draft;
+    return c.effective + c.draft + c.obsolete + c.other;
+  }, [invStatusCounts, statusScope, scopeKPIs]);
+
   const digitizationStats = useCallback(
     (dim: 'last' | 'sole') => {
       const inv = stats?.inventory || [];
       const want = (s: string) => {
         if (statusScope === 'effective') return s === 'active';
         if (statusScope === 'includeDraft') return s === 'active' || s === 'draft';
-        return true;
+        return true; // 全量池：含作废 + 其他
       };
       const codeField = dim === 'last' ? 'lastCode' : 'soleCode';
       const statusField = dim === 'last' ? 'lastStatus' : 'soleStatus';
@@ -518,9 +539,7 @@ export default function Dashboard() {
           </div>
           <div className="mt-4">
             <div className="flex items-end gap-2">
-              <span className="text-3xl font-bold text-slate-900">
-                {(scopeKPIs?.styles?.totalAll ?? scopeKPIs?.totalStyles ?? 0).toLocaleString()}
-              </span>
+              <span className="text-3xl font-bold text-slate-900">{(tabStyleTotalCount || 0).toLocaleString()}</span>
               {getTrendBadge(stats?.kpis?.deltaActiveStyles || 0)}
             </div>
             <div className="mt-1 text-xs text-slate-500">
@@ -530,7 +549,7 @@ export default function Dashboard() {
                   ? '仅生效'
                   : statusScope === 'includeDraft'
                     ? '生效+草稿'
-                    : '所有状态（含作废）'}
+                    : '所有状态（含作废及其他）'}
               </span>
             </div>
             {rawStatusCategoriesDebug ? (

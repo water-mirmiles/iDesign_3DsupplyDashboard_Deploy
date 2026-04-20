@@ -19,6 +19,8 @@ const DataStatusBadge = ({ status }: { status: InventoryItem['data_status'] }) =
       return <span className="px-2 py-1 bg-slate-100 text-slate-600 border border-slate-200 rounded-md text-xs font-medium">草稿</span>;
     case 'obsolete':
       return <span className="px-2 py-1 bg-red-50 text-red-700 border border-red-200 rounded-md text-xs font-medium">作废</span>;
+    case 'other':
+      return <span className="px-2 py-1 bg-amber-50 text-amber-800 border border-amber-200 rounded-md text-xs font-medium">其他</span>;
     default:
       return null;
   }
@@ -260,7 +262,7 @@ export default function InventoryList() {
     }
 
     // 默认排序：生效在前，其次草稿，最后作废
-    const pri: Record<string, number> = { active: 0, draft: 1, obsolete: 2 };
+    const pri: Record<string, number> = { active: 0, draft: 1, other: 2, obsolete: 3 };
     out = [...out].sort((a, b) => {
       const pa = pri[String(a?.data_status || '')] ?? 9;
       const pb = pri[String(b?.data_status || '')] ?? 9;
@@ -374,7 +376,11 @@ export default function InventoryList() {
                   key={item.id}
                   className={cn(
                     'transition-colors group',
-                    item.data_status === 'draft' ? 'bg-blue-50/10 hover:bg-blue-50/20' : 'hover:bg-slate-50/50'
+                    item.data_status === 'draft'
+                      ? 'bg-blue-50/10 hover:bg-blue-50/20'
+                      : item.data_status === 'other'
+                        ? 'bg-amber-50/20 hover:bg-amber-50/30'
+                        : 'hover:bg-slate-50/50'
                   )}
                 >
                   <td className="px-5 py-4 font-medium text-slate-900">{item.style_wms}</td>

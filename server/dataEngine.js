@@ -94,33 +94,46 @@ export function isTruthyActiveStatus(v) {
 }
 
 /**
- * 将主表 data_status 规范为 inventory 三态：active | draft | obsolete
- * 注意顺序：先识别作废码，避免 "9"、invalid 等被误判为草稿。
+ * 将主表 data_status 规范为四态：active | draft | obsolete | other
+ * 采用「模糊包含 + 多词库」，顺序：作废 → 草稿 → 生效 → 其他（兜底）。
  */
 function normalizeInventoryStatus(v) {
   const raw = normalize(v);
   const s = raw.toLowerCase();
 
-  // 作废（显式编码 + 关键字，含「已作废」等含「作废」的写法）
-  if (s === '9' || s === '99' || s === '-1') return 'obsolete';
+  const isNum01 = (x) => /^0(\.0+)?$/.test(x);
+  const isNum1 = (x) => /^1(\.0+)?$/.test(x);
+  const isNum9 = (x) => /^9(\.0+)?$/.test(x);
+
+  // —— Obsolete：作废 / 取消 / 无效 / 显式 9 码等
+  if (isNum9(s) || s === '99' || s === '-1') return 'obsolete';
   if (
     s.includes('obsolete') ||
     s.includes('invalid') ||
     s.includes('作废') ||
+    s.includes('取消') ||
     s.includes('失效') ||
-    s.includes('废弃')
+    s.includes('废弃') ||
+    s.includes('inactive')
   ) {
     return 'obsolete';
   }
+  // 用户要求「包含 9」：仅当单独为 9 或整格为纯 9，避免把含 9 的款号串误杀；纯数字 9 已覆盖
 
-  // 生效：与 isTruthyActiveStatus 对齐（含 生效/ effective / active / 1 等）
+  // —— Draft：草稿 / 待审 / 编辑中等
+  if (isNum01(s)) return 'draft';
+  if (s.includes('草稿') || s.includes('draft') || s.includes('pending') || s.includes('编辑中')) {
+    return 'draft';
+  }
+
+  // —— Effective：生效 / 有效 / active（排除 inactive）/ 显式 1 码等
+  if (isNum1(s) || s === '1') return 'active';
   if (isTruthyActiveStatus(v)) return 'active';
+  if (s.includes('生效') || s.includes('effective')) return 'active';
+  if (s.includes('active') && !s.includes('inactive')) return 'active';
 
-  // 草稿
-  if (s === '0' || s.includes('draft') || s.includes('草稿')) return 'draft';
-
-  // 未命中生效且未命中草稿 → 作废/其他（含空值、未知码），保证三态完备、不丢弃分类
-  return 'obsolete';
+  // —— 兜底：其他（仍计入全量池，与作废分列）
+  return 'other';
 }
 
 /** 主表状态列原始值普查（不限于有款号的行） */
@@ -149,18 +162,16 @@ function printRawStatusAuditTable(rawStatusAudit, main, statusCol) {
   const physical = main?.rows?.length || 0;
   let sum = 0;
   // eslint-disable-next-line no-console
-  console.log('--- 原始状态对账单 ---');
+  console.log('[Status Audit] 发现以下原始状态值：');
   // eslint-disable-next-line no-console
-  console.log(
-    `主表：${main?.fileName || '(unknown)'} ｜ 物理行数：${physical} ｜ 状态列：${statusCol || '(未映射)'}`
-  );
+  console.log(`（主表 ${main?.fileName || '(unknown)'} ｜ 物理行 ${physical} ｜ 列 ${statusCol || '(未映射)'}）`);
   for (const { value, rowCount } of rawStatusAudit) {
     sum += rowCount;
     // eslint-disable-next-line no-console
-    console.log(`[${value}] -> ${rowCount} 行`);
+    console.log(`- "${value}": ${rowCount} 行`);
   }
   // eslint-disable-next-line no-console
-  console.log('--------------------');
+  console.log('---------------------------');
   if (sum !== physical) {
     // eslint-disable-next-line no-console
     console.warn(`[Engine] 原始状态计数合计 ${sum} 与物理行 ${physical} 不一致`);
@@ -1794,7 +1805,7 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
   printRawStatusAuditTable(rawStatusAudit, main, statusCol);
 
   const inventory = [];
-  const statusDist = { active: 0, draft: 0, obsolete: 0 };
+  const statusDist = { active: 0, draft: 0, obsolete: 0, other: 0 };
   let traceFailCount = 0;
   let lastCodeLinked = 0;
   let soleCodeLinked = 0;
@@ -1975,11 +1986,13 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
   const bucketEffective = inventory.filter((x) => x.data_status === 'active');
   const bucketDraft = inventory.filter((x) => x.data_status === 'draft');
   const bucketObsolete = inventory.filter((x) => x.data_status === 'obsolete');
+  const bucketOther = inventory.filter((x) => x.data_status === 'other');
 
   const kpisTotal = computeBucketKPIs(bucketTotal);
   const kpisEffective = computeBucketKPIs(bucketEffective);
   const kpisDraft = computeBucketKPIs(bucketDraft);
   const kpisObsolete = computeBucketKPIs(bucketObsolete);
+  const kpisOther = computeBucketKPIs(bucketOther);
 
   const buildBucket = (rows, kpis) => ({
     kpis,
@@ -1992,6 +2005,7 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
     effective: buildBucket(bucketEffective, kpisEffective),
     draft: buildBucket(bucketDraft, kpisDraft),
     obsolete: buildBucket(bucketObsolete, kpisObsolete),
+    other: buildBucket(bucketOther, kpisOther),
   };
 
   // 各品牌 3D 覆盖（为了兼容老 UI：仍默认返回“生效款”口径）
@@ -2010,6 +2024,7 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
       effective: statusBuckets.effective,
       draft: statusBuckets.draft,
       obsolete: statusBuckets.obsolete,
+      other: statusBuckets.other,
     },
     // 兼容字段：默认等价于 effective
     kpis: {
@@ -2132,10 +2147,11 @@ export async function processAllData({ storageRoot }) {
     const a = Number(sd.active || 0);
     const d = Number(sd.draft || 0);
     const o = Number(sd.obsolete || 0);
-    const sum = a + d + o;
+    const ot = Number(sd.other || 0);
+    const sum = a + d + o + ot;
     const invN = Array.isArray(payload.inventory) ? payload.inventory.length : 0;
     // eslint-disable-next-line no-console
-    console.log(`[Engine] 统计结果：生效(${a}) + 草稿(${d}) + 作废(${o}) = 总数(${sum})`);
+    console.log(`[Engine] 统计结果：生效(${a}) + 草稿(${d}) + 作废(${o}) + 其他(${ot}) = 总数(${sum})`);
     if (sum !== invN) {
       // eslint-disable-next-line no-console
       console.warn(`[Engine] 状态合计 ${sum} 与 inventory 行数 ${invN} 不一致`);
