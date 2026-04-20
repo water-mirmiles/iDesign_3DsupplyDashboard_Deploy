@@ -995,6 +995,36 @@ function computeBrandCoverage(activeRows, brandKey, has3dAnyKey) {
   return Array.from(map.values()).sort((a, b) => (b.linked + b.unlinked) - (a.linked + a.unlinked));
 }
 
+function computeBrand3DCoverageStats(activeRows) {
+  const map = new Map();
+  const isLinkedCode = (v) => {
+    const s = String(v ?? '').trim();
+    return s !== '' && s !== '-' && s !== '0';
+  };
+  for (const r of activeRows || []) {
+    const brand = normalize(r?.brand ?? 'Unknown') || 'Unknown';
+    const cur =
+      map.get(brand) || {
+        brand,
+        totalActive: 0,
+        linked: 0,
+        unlinked: 0,
+        lastLinkedCount: 0,
+        last3DMatchedCount: 0,
+      };
+    cur.totalActive += 1;
+    const hasAny3D = Boolean(r?.__has3DAny);
+    if (hasAny3D) cur.linked += 1;
+    else cur.unlinked += 1;
+    if (isLinkedCode(r?.lastCode)) cur.lastLinkedCount += 1;
+    if (Boolean(r?.__has3DLast)) cur.last3DMatchedCount += 1;
+    map.set(brand, cur);
+  }
+  return Array.from(map.values())
+    .sort((a, b) => b.totalActive - a.totalActive)
+    .slice(0, 30);
+}
+
 function computeBrandBindingStats(activeRows) {
   const map = new Map();
   const isLinkedCode = (v) => {
@@ -1003,22 +1033,26 @@ function computeBrandBindingStats(activeRows) {
   };
   for (const r of activeRows || []) {
     const brand = normalize(r?.brand ?? 'Unknown') || 'Unknown';
-    const cur = map.get(brand) || { brand, total: 0, lastLinked: 0, soleLinked: 0 };
-    cur.total += 1;
-    if (isLinkedCode(r?.lastCode)) cur.lastLinked += 1;
-    if (isLinkedCode(r?.soleCode)) cur.soleLinked += 1;
+    const cur =
+      map.get(brand) || { brand, totalActive: 0, lastLinkedCount: 0, soleLinkedCount: 0, last3DMatchedCount: 0 };
+    cur.totalActive += 1;
+    if (isLinkedCode(r?.lastCode)) cur.lastLinkedCount += 1;
+    if (isLinkedCode(r?.soleCode)) cur.soleLinkedCount += 1;
+    if (Boolean(r?.__has3DLast)) cur.last3DMatchedCount += 1;
     map.set(brand, cur);
   }
   return Array.from(map.values())
     .map((x) => ({
       brand: x.brand,
-      lastBindingRate: x.total > 0 ? Math.round((x.lastLinked / x.total) * 100) : 0,
-      soleBindingRate: x.total > 0 ? Math.round((x.soleLinked / x.total) * 100) : 0,
-      __total: x.total,
+      lastBindingRate: x.totalActive > 0 ? Math.round((x.lastLinkedCount / x.totalActive) * 1000) / 10 : 0,
+      soleBindingRate: x.totalActive > 0 ? Math.round((x.soleLinkedCount / x.totalActive) * 1000) / 10 : 0,
+      totalActive: x.totalActive,
+      lastLinkedCount: x.lastLinkedCount,
+      soleLinkedCount: x.soleLinkedCount,
+      last3DMatchedCount: x.last3DMatchedCount,
     }))
-    .sort((a, b) => b.__total - a.__total)
-    .slice(0, 30)
-    .map(({ __total, ...rest }) => rest);
+    .sort((a, b) => b.totalActive - a.totalActive)
+    .slice(0, 30);
 }
 
 function computeDelta(current, previous) {
@@ -1730,16 +1764,8 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
   const lastCodeLinkRate = activeStyles > 0 ? Math.round((lastCodeLinked / activeStyles) * 1000) / 10 : 0;
   const soleCodeLinkRate = activeStyles > 0 ? Math.round((soleCodeLinked / activeStyles) * 1000) / 10 : 0;
 
-  // Dashboard 先要看到“各品牌真实款号总量”；3D 覆盖后续再细分，因此这里先把 linked=0，unlinked=total
-  const brandTotals = new Map();
-  for (const it of inventory) {
-    const b = normalize(it.brand) || '(空)';
-    brandTotals.set(b, (brandTotals.get(b) || 0) + 1);
-  }
-  const brandCoverage = Array.from(brandTotals.entries())
-    .map(([brand, total]) => ({ brand, linked: 0, unlinked: total }))
-    .sort((a, b) => b.unlinked - a.unlinked)
-    .slice(0, 30);
+  // 各品牌 3D 覆盖（生效款）：linked=命中任一3D，unlinked=未命中
+  const brandCoverage = computeBrand3DCoverageStats(activeRows);
 
   const brandBindingStats = computeBrandBindingStats(activeRows);
 

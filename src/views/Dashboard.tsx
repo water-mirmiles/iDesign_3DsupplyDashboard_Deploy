@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { 
-  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, Legend, ResponsiveContainer, Cell,
+  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, Legend, ResponsiveContainer, LabelList,
   AreaChart, Area
 } from 'recharts';
 import { Box, Layers, Hash, Factory, Loader2, Activity, TrendingUp, AlertCircle } from 'lucide-react';
@@ -38,7 +38,15 @@ type DashboardStatsResponse = {
     deltaMatched3DSoles: number;
   };
   brandCoverage: Array<{ brand: string; linked: number; unlinked: number }>;
-  brandBindingStats?: Array<{ brand: string; lastBindingRate: number; soleBindingRate: number }>;
+  brandBindingStats?: Array<{
+    brand: string;
+    lastBindingRate: number;
+    soleBindingRate: number;
+    totalActive: number;
+    lastLinkedCount: number;
+    soleLinkedCount: number;
+    last3DMatchedCount: number;
+  }>;
   trends?: { assetTrend?: AssetTrendStats[] };
   error?: string;
 };
@@ -110,12 +118,6 @@ export default function Dashboard() {
     if (percent >= 80) return 'bg-emerald-500';
     if (percent >= 50) return 'bg-amber-500';
     return 'bg-red-500';
-  };
-
-  const getBindingColor = (rate: number) => {
-    if (rate < 30) return '#ef4444'; // red-500
-    if (rate <= 70) return '#f59e0b'; // amber-500
-    return '#10b981'; // emerald-500
   };
 
   const handleBrandBindingClick = (brand: string) => {
@@ -345,24 +347,42 @@ export default function Dashboard() {
               <h3 className="text-base font-semibold text-slate-900">各品牌 3D 覆盖统计</h3>
               <span className="text-xs text-slate-500">按款号数量统计</span>
             </div>
-            <div className="flex-1 min-h-[320px] w-full">
+          <div className="flex-1 min-h-[400px] w-full">
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={stats?.brandCoverage || []} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
-                  <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
-                  <XAxis dataKey="brand" axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} dy={10} />
-                  <YAxis axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
-                  <RechartsTooltip
-                    cursor={{ fill: '#f8fafc' }}
-                    contentStyle={{
-                      borderRadius: '8px',
-                      border: '1px solid #e2e8f0',
-                      boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)',
-                    }}
-                  />
-                  <Legend iconType="circle" wrapperStyle={{ fontSize: '13px', paddingTop: '20px' }} />
-                  <Bar dataKey="linked" name="已关联 3D 资产" stackId="a" fill="#10b981" radius={[0, 0, 4, 4]} maxBarSize={40} />
-                  <Bar dataKey="unlinked" name="未关联/缺失" stackId="a" fill="#f59e0b" radius={[4, 4, 0, 0]} maxBarSize={40} />
-                </BarChart>
+              <BarChart
+                data={stats?.brandCoverage || []}
+                layout="vertical"
+                margin={{ top: 10, right: 10, left: 20, bottom: 0 }}
+              >
+                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
+                <XAxis type="number" axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
+                <YAxis
+                  type="category"
+                  dataKey="brand"
+                  axisLine={false}
+                  tickLine={false}
+                  width={150}
+                  tick={{ fill: '#64748b', fontSize: 12, textAnchor: 'end' }}
+                />
+                <RechartsTooltip
+                  cursor={{ fill: '#f8fafc' }}
+                  content={({ active, payload }) => {
+                    if (!active || !payload?.length) return null;
+                    const p: any = payload?.[0]?.payload || {};
+                    return (
+                      <div className="rounded-lg border border-slate-200 bg-white shadow-sm px-3 py-2 text-xs text-slate-700">
+                        <div className="font-medium text-slate-900 mb-1">{p.brand}</div>
+                        <div>该品牌总生效款：{p.totalActive ?? (p.linked + p.unlinked)}</div>
+                        <div>已绑定楦：{p.lastLinkedCount ?? '-'}</div>
+                        <div>已匹配 3D：{p.last3DMatchedCount ?? p.linked}</div>
+                      </div>
+                    );
+                  }}
+                />
+                <Legend iconType="circle" wrapperStyle={{ fontSize: '13px', paddingTop: '12px' }} />
+                <Bar dataKey="linked" name="已关联 3D" stackId="a" fill="#10b981" maxBarSize={18} />
+                <Bar dataKey="unlinked" name="未关联/缺失" stackId="a" fill="#f59e0b" maxBarSize={18} />
+              </BarChart>
               </ResponsiveContainer>
             </div>
           </div>
@@ -373,39 +393,59 @@ export default function Dashboard() {
               <h3 className="text-base font-semibold text-slate-900">各品牌基础数据绑定率 (Data Completeness)</h3>
               <span className="text-xs text-slate-500">点击品牌跳转清单</span>
             </div>
-            <div className="flex-1 min-h-[320px] w-full">
+            <div className="flex-1 min-h-[400px] w-full">
               <ResponsiveContainer width="100%" height="100%">
                 <BarChart
                   data={stats?.brandBindingStats || []}
                   layout="vertical"
                   margin={{ top: 10, right: 10, left: 20, bottom: 0 }}
-                  onClick={(e: any) => {
-                    const brand = e?.activeLabel;
+                  onClick={(state: any) => {
+                    const brand = state?.activePayload?.[0]?.payload?.brand;
                     if (brand) handleBrandBindingClick(String(brand));
                   }}
                 >
                   <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
                   <XAxis type="number" domain={[0, 100]} axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
-                  <YAxis type="category" dataKey="brand" axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} width={110} />
+                  <YAxis
+                    type="category"
+                    dataKey="brand"
+                    axisLine={false}
+                    tickLine={false}
+                    width={150}
+                    tick={{ fill: '#64748b', fontSize: 12, textAnchor: 'end' }}
+                  />
                   <RechartsTooltip
                     cursor={{ fill: '#f8fafc' }}
-                    formatter={(v: any) => [`${v}%`, '']}
-                    contentStyle={{
-                      borderRadius: '8px',
-                      border: '1px solid #e2e8f0',
-                      boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)',
+                    content={({ active, payload }) => {
+                      if (!active || !payload?.length) return null;
+                      const p: any = payload?.[0]?.payload || {};
+                      return (
+                        <div className="rounded-lg border border-slate-200 bg-white shadow-sm px-3 py-2 text-xs text-slate-700">
+                          <div className="font-medium text-slate-900 mb-1">{p.brand}</div>
+                          <div>该品牌总生效款：{p.totalActive ?? '-'}</div>
+                          <div>已绑定楦：{p.lastLinkedCount ?? '-'}</div>
+                          <div>已匹配 3D：{p.last3DMatchedCount ?? '-'}</div>
+                        </div>
+                      );
                     }}
                   />
-                  <Legend iconType="circle" wrapperStyle={{ fontSize: '13px', paddingTop: '12px' }} />
-                  <Bar dataKey="lastBindingRate" name="楦头绑定率" radius={[4, 4, 4, 4]} maxBarSize={18}>
-                    {(stats?.brandBindingStats || []).map((row, idx) => (
-                      <Cell key={`last-${idx}`} fill={getBindingColor(Number(row?.lastBindingRate || 0))} />
-                    ))}
+                  <Legend
+                    iconType="circle"
+                    verticalAlign="bottom"
+                    wrapperStyle={{ fontSize: '13px', paddingTop: '10px' }}
+                    formatter={(value) =>
+                      value === 'lastBindingRate'
+                        ? '楦头绑定率 (Last ID Linked)'
+                        : value === 'soleBindingRate'
+                          ? '大底绑定率 (Sole ID Linked)'
+                          : value
+                    }
+                  />
+                  <Bar dataKey="lastBindingRate" name="lastBindingRate" fill="#0ea5e9" radius={[4, 4, 4, 4]} maxBarSize={16}>
+                    <LabelList dataKey="lastBindingRate" position="right" formatter={(v: any) => `${v}%`} />
                   </Bar>
-                  <Bar dataKey="soleBindingRate" name="大底绑定率" radius={[4, 4, 4, 4]} maxBarSize={18}>
-                    {(stats?.brandBindingStats || []).map((row, idx) => (
-                      <Cell key={`sole-${idx}`} fill={getBindingColor(Number(row?.soleBindingRate || 0))} />
-                    ))}
+                  <Bar dataKey="soleBindingRate" name="soleBindingRate" fill="#6366f1" radius={[4, 4, 4, 4]} maxBarSize={16}>
+                    <LabelList dataKey="soleBindingRate" position="right" formatter={(v: any) => `${v}%`} />
                   </Bar>
                 </BarChart>
               </ResponsiveContainer>
