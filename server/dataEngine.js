@@ -683,9 +683,89 @@ function readSheetRows(fullPath) {
   if (!sheetName) return { headers: [], rows: [] };
   const sheet = wb.Sheets[sheetName];
   if (!sheet) return { headers: [], rows: [] };
-  const headerRows = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, defval: '' });
-  const headers = Array.isArray(headerRows?.[0]) ? headerRows[0].map((h) => normalize(h)).filter(Boolean) : [];
-  const rows = XLSX.utils.sheet_to_json(sheet, { header: headers, raw: false, defval: '', range: 1 });
+  const grid = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, defval: '' });
+
+  const normHeader = (v) => String(v ?? '').trim().toLowerCase();
+  const rowCharScore = (arr) => {
+    if (!Array.isArray(arr) || !arr.length) return 0;
+    let s = 0;
+    for (const c of arr) {
+      const t = String(c ?? '').trim();
+      s += t.length;
+    }
+    return s;
+  };
+  const rowAllEmpty = (arr) => {
+    if (!Array.isArray(arr) || !arr.length) return true;
+    return arr.every((c) => String(c ?? '').trim() === '');
+  };
+
+  // 精准定位表头：若第一行为空，向下扫描选“字符总量最高”的那一行作为真实表头
+  let headerRowIndex = 0;
+  let bestScore = -1;
+  const scanN = Math.min(Array.isArray(grid) ? grid.length : 0, 50);
+  for (let i = 0; i < scanN; i++) {
+    const r = grid[i];
+    if (rowAllEmpty(r)) continue;
+    const score = rowCharScore(r);
+    if (score > bestScore) {
+      bestScore = score;
+      headerRowIndex = i;
+    }
+  }
+
+  const rawHeaderRow = Array.isArray(grid?.[headerRowIndex]) ? grid[headerRowIndex] : [];
+  const used = new Map();
+  const headers = rawHeaderRow.map((h, idx) => {
+    let name = normHeader(h);
+    if (!name) name = `col_${idx + 1}`;
+    const k = name;
+    const seen = used.get(k) || 0;
+    used.set(k, seen + 1);
+    if (seen > 0) name = `${name}_${seen + 1}`;
+    return name;
+  });
+
+  // 数据行从表头下一行开始
+  let rows = XLSX.utils.sheet_to_json(sheet, { header: headers, raw: false, defval: '', range: headerRowIndex + 1 });
+
+  const styleKey = headers.includes('style_wms') ? 'style_wms' : '';
+  const normalizeCellForRow = (v) => {
+    const s = String(v ?? '');
+    const t = s.trim();
+    // JSON 字符串自动脱壳：形如 ["SBOX26008M"] -> ["SBOX26008M"] (Array)
+    if (t.startsWith('["')) {
+      const candidates = [t, t.replace(/\\"/g, '"').replace(/\\\\/g, '\\')];
+      for (const c of candidates) {
+        try {
+          const parsed = JSON.parse(c);
+          if (Array.isArray(parsed)) return parsed;
+        } catch {
+          // ignore
+        }
+      }
+    }
+    return t;
+  };
+
+  rows = (Array.isArray(rows) ? rows : [])
+    .map((r) => {
+      const out = {};
+      for (const [k, v] of Object.entries(r || {})) out[String(k)] = normalizeCellForRow(v);
+      return out;
+    })
+    // 过滤脏数据：全空行跳过；若存在款号列 style_wms 且为空则跳过
+    .filter((r) => {
+      const vals = Object.values(r || {});
+      const allEmpty = vals.every((v) => {
+        if (Array.isArray(v)) return v.length === 0;
+        return String(v ?? '').trim() === '';
+      });
+      if (allEmpty) return false;
+      if (styleKey && String(r?.[styleKey] ?? '').trim() === '') return false;
+      return true;
+    });
+
   return { headers, rows };
 }
 
@@ -886,6 +966,12 @@ export async function loadExcelFolderAsTablesMap(folderPath) {
   const xlsxTables = excelFiles.map((fileName) => {
     const fullPath = path.join(folderPath, fileName);
     const { headers, rows } = readSheetRows(fullPath);
+    // eslint-disable-next-line no-console
+    console.log(`[Excel] 加载表: ${fileName}`);
+    // eslint-disable-next-line no-console
+    console.log(`[Excel] 识别到表头: ${(headers || []).slice(0, 5).join(', ')}...`);
+    // eslint-disable-next-line no-console
+    console.log(`[Excel] 数据行数: ${(rows || []).length} 行`);
     return { fileName, fullPath, headers, rows };
   });
   return { xlsxTables, tablesMap: buildTablesMap(xlsxTables) };
