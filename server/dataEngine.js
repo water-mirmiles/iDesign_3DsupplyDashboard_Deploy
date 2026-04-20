@@ -1394,7 +1394,7 @@ export async function validateJoinPathSuggestionsWithGoldenXlsx({
   return validated;
 }
 
-async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap }) {
+async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, forceSyncLog = false }) {
   const dataTablesDir = path.join(storageRoot, 'data_tables');
   const dateDir = dateDirName ? path.join(dataTablesDir, dateDirName) : dataTablesDir;
 
@@ -1525,6 +1525,9 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap }) {
   let traceFailCount = 0;
   let lastCodeLinked = 0;
   let soleCodeLinked = 0;
+  let last3DMatchedCount = 0;
+  let sole3DMatchedCount = 0;
+  let activeSeen = 0;
   for (let i = 0; i < main.rows.length; i++) {
     const row = main.rows[i] || {};
     const styleVal = styleCol ? normalize(row?.[styleCol]) : '';
@@ -1626,8 +1629,17 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap }) {
 
     // 编号绑定口径：仅统计生效款中，“FK 非空且在维表能命中 code” 的数量
     if (invStatus === 'active') {
+      activeSeen += 1;
       if (lastResolved?.linked) lastCodeLinked += 1;
       if (soleResolved?.linked) soleCodeLinked += 1;
+      if (has3DLast) last3DMatchedCount += 1;
+      if (has3DSole) sole3DMatchedCount += 1;
+      if (forceSyncLog && activeSeen % 200 === 0) {
+        // eslint-disable-next-line no-console
+        console.log(`[ForceSync] 正在处理生产表，当前已绑定编号：${lastCodeLinked} 行`);
+        // eslint-disable-next-line no-console
+        console.log(`[ForceSync] 正在比对 3D 文件，当前已匹配：${last3DMatchedCount} 个`);
+      }
     }
 
     inventory.push({
@@ -1698,6 +1710,15 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap }) {
       soleCodeLinkRate,
       sole3DCount: matchedSoles,
       sole3DCoverage,
+      // force-sync 实时计数（对账用）
+      __forceSync: forceSyncLog
+        ? {
+            lastCodeLinkedCount: lastCodeLinked,
+            last3DMatchedCount,
+            soleCodeLinkedCount: soleCodeLinked,
+            sole3DMatchedCount,
+          }
+        : undefined,
     },
     brandCoverage,
     inventory: inventoryOut,
@@ -2077,5 +2098,26 @@ export async function aggregateProjectData({ storageRoot }) {
       matchedLasts: deltaLastMatched,
       matchedSoles: deltaSoleMatched,
     },
+  };
+}
+
+/**
+ * 强制生产重算（仅最新日期目录），用于 /api/force-sync-dashboard。
+ * 会在遍历生效款时打印 ForceSync 进度日志。
+ */
+export async function forceSyncLatestProduction({ storageRoot }) {
+  const mappingConfigPath = path.join(storageRoot, 'mapping_config.json');
+  const mappingConfig = safeJsonRead(mappingConfigPath);
+  const mappingArr = pickMappingArray(mappingConfig);
+  const standardMap = buildStandardMap(mappingArr || []);
+
+  const dataTablesDir = path.join(storageRoot, 'data_tables');
+  const dateDirs = await getDateDirsSorted(dataTablesDir);
+  const latest = dateDirs.length ? dateDirs[dateDirs.length - 1] : '';
+  const latestAgg = await aggregateForDateRoot({ storageRoot, dateDirName: latest, standardMap, forceSyncLog: true });
+  return {
+    dates: { latest, prev: dateDirs.length >= 2 ? dateDirs[dateDirs.length - 2] : '' },
+    mapping: { hasConfig: Boolean(mappingArr && mappingArr.length), configPath: mappingConfigPath },
+    latest: latestAgg,
   };
 }

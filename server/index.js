@@ -18,6 +18,7 @@ import {
   clearAiTraceLogSync,
   clearEngineAuditLogSync,
   clearEngineLogSync,
+  forceSyncLatestProduction,
   inferMainTableFromSmartSuggestions,
   isTruthyActiveStatus,
   parseJoinPathFromConfig,
@@ -75,6 +76,7 @@ const DIRS = {
 };
 const MAPPING_CONFIG_PATH = path.join(STORAGE_ROOT, 'mapping_config.json');
 const FINAL_DASHBOARD_PATH = path.join(STORAGE_ROOT, 'final_dashboard_data.json');
+const FINAL_RESULTS_PATH = path.join(STORAGE_ROOT, 'final_results.json');
 
 async function readFinalDashboardSnapshot() {
   try {
@@ -85,6 +87,41 @@ async function readFinalDashboardSnapshot() {
   } catch {
     return null;
   }
+}
+
+async function purgeOldSnapshots() {
+  await ensureStorageDirs();
+  const removed = [];
+  const tryRemove = async (p) => {
+    try {
+      if (await fse.pathExists(p)) {
+        await fse.remove(p);
+        removed.push(path.relative(STORAGE_ROOT, p).split(path.sep).join('/'));
+      }
+    } catch {
+      // ignore
+    }
+  };
+  await tryRemove(FINAL_RESULTS_PATH);
+  await tryRemove(FINAL_DASHBOARD_PATH);
+
+  // 删除任何包含 snapshot 关键字的缓存文件（仅 storage 根下递归）
+  const walk = async (dir) => {
+    const entries = await fse.readdir(dir, { withFileTypes: true });
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        await walk(full);
+      } else if (e.isFile()) {
+        const nameLower = e.name.toLowerCase();
+        if (nameLower.includes('snapshot')) {
+          await tryRemove(full);
+        }
+      }
+    }
+  };
+  await walk(STORAGE_ROOT);
+  return removed;
 }
 
 // ============================
@@ -3240,6 +3277,39 @@ app.get('/api/dashboard-stats', async (req, res) => {
     // eslint-disable-next-line no-console
     console.error('[dataEngine] dashboard-stats failed', e);
     return res.status(500).json({ ok: false, error: e instanceof Error ? e.message : 'dashboard-stats failed' });
+  }
+});
+
+// 强制全量生产重算：先清缓存，再从 data_tables 最新日期目录全量聚合并落盘
+app.post('/api/force-sync-dashboard', async (_req, res) => {
+  try {
+    const removed = await purgeOldSnapshots();
+    // eslint-disable-next-line no-console
+    console.log('[ForceSync] purge removed:', removed.length ? removed.join(', ') : '(none)');
+
+    // 先跑一次带进度日志的生产聚合（只最新日期目录），用于终端可视化
+    const agg = await forceSyncLatestProduction({ storageRoot: STORAGE_ROOT });
+    const latest = agg.latest;
+
+    // 再生成与 Dashboard 一致的最终快照（包含 KPI / trends / inventory）
+    const payload = await processAllData({ storageRoot: STORAGE_ROOT });
+    const outPath = await persistFinalDashboardData(STORAGE_ROOT, payload);
+
+    return res.json({
+      ok: true,
+      removed,
+      path: outPath,
+      dates: payload.dates,
+      meta: payload.meta,
+      kpis: payload.kpis,
+      brandCoverage: payload.brandCoverage || [],
+      // 额外回传 forceSync 的实时计数（便于前端 toast/调试）
+      forceSync: latest?.kpis?.__forceSync || null,
+    });
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.error('[ForceSync] failed', e);
+    return res.status(500).json({ ok: false, error: e instanceof Error ? e.message : 'force sync failed' });
   }
 });
 

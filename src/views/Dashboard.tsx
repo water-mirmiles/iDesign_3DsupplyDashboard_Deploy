@@ -48,6 +48,7 @@ export default function Dashboard() {
   const [stats, setStats] = useState<DashboardStatsResponse | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [isForceSyncing, setIsForceSyncing] = useState(false);
 
   const [trendPeriod, setTrendPeriod] = useState<TimePeriod>('week');
   const [chartData, setChartData] = useState<AssetTrendStats[]>([]);
@@ -76,6 +77,27 @@ export default function Dashboard() {
       cancelled = true;
     };
   }, []);
+
+  const handleForceSync = async () => {
+    if (isForceSyncing) return;
+    setIsForceSyncing(true);
+    setError(null);
+    try {
+      const resp = await fetch('/api/force-sync-dashboard', { method: 'POST' });
+      const json = await resp.json().catch(() => null);
+      if (!resp.ok || !json?.ok) throw new Error(json?.error || `重算失败（HTTP ${resp.status}）`);
+      // 重算后强制拉取最新 stats（避免仍读旧快照）
+      const resp2 = await fetch('/api/dashboard-stats?refresh=1');
+      const json2 = (await resp2.json()) as DashboardStatsResponse;
+      if (!resp2.ok || !json2.ok) throw new Error(json2.error || `刷新失败（HTTP ${resp2.status}）`);
+      setStats(json2);
+      setChartData(json2.trends?.assetTrend || []);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '重算失败');
+    } finally {
+      setIsForceSyncing(false);
+    }
+  };
 
   const handlePeriodChange = (period: TimePeriod) => {
     // 真实趋势后续由数据引擎生成；当前先保留切换控件但不做假异步
@@ -117,14 +139,29 @@ export default function Dashboard() {
   return (
     <div className="space-y-6 animate-in fade-in duration-500 pb-10">
       {/* Header */}
-      <div>
-        <h1 className="text-2xl font-semibold text-slate-900">概览看板</h1>
-        <p className="text-sm text-slate-500 mt-1">全局 3D 资产覆盖率与新增趋势</p>
-        {stats?.source === 'final_dashboard_data' && stats.generatedAt && (
-          <p className="text-xs text-emerald-700 mt-1">
-            数据来自认证快照 · {new Date(stats.generatedAt).toLocaleString('zh-CN')}
-          </p>
-        )}
+      <div className="flex items-start justify-between gap-4">
+        <div className="min-w-0">
+          <h1 className="text-2xl font-semibold text-slate-900">概览看板</h1>
+          <p className="text-sm text-slate-500 mt-1">全局 3D 资产覆盖率与新增趋势</p>
+          {stats?.source === 'final_dashboard_data' && stats.generatedAt && (
+            <p className="text-xs text-emerald-700 mt-1">
+              数据来自认证快照 · {new Date(stats.generatedAt).toLocaleString('zh-CN')}
+            </p>
+          )}
+        </div>
+        <button
+          onClick={() => void handleForceSync()}
+          disabled={isForceSyncing}
+          className={cn(
+            'shrink-0 inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium border shadow-sm transition-colors',
+            isForceSyncing
+              ? 'bg-slate-100 text-slate-500 border-slate-200 cursor-not-allowed'
+              : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+          )}
+        >
+          {isForceSyncing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Activity className="w-4 h-4" />}
+          一键重算看板数据
+        </button>
       </div>
 
       {!isLoading && stats && (!stats.mapping?.hasConfig || !stats.meta?.mainTable) && (
