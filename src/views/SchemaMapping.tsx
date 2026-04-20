@@ -609,6 +609,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
   const [isUploadingSandbox, setIsUploadingSandbox] = useState(false);
   const [sandboxFiles, setSandboxFiles] = useState<string[]>([]);
   const [isSyncingSandboxFiles, setIsSyncingSandboxFiles] = useState(false);
+  const [uploadCounter, setUploadCounter] = useState(0);
 
   const [authSyncing, setAuthSyncing] = useState(false);
   const [certifyEngineRunning, setCertifyEngineRunning] = useState(false);
@@ -933,6 +934,8 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
       if (!json?.ok) throw new Error(json?.error || '获取沙盒列表失败');
       const files = Array.isArray(json.files) ? json.files.map((x) => String(x || '').trim()).filter(Boolean) : [];
       setSandboxFiles(files);
+      // 绕过缓存：强制 React 重建列表 DOM
+      setUploadCounter((c) => c + 1);
       setSelectedFile((prev) => {
         if (prev && files.includes(prev)) return prev;
         return files[0] || '';
@@ -1053,7 +1056,8 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
     if (!files?.length) return;
     const all = Array.from(files) as File[];
     const fd = new FormData();
-    for (const f of all) fd.append('files', f);
+    // 强制对账：与后端 upload-sandbox 的字段名保持一致
+    for (const f of all) fd.append('file', f);
     try {
       setIsUploadingSandbox(true);
       const resp = await fetch(`${API_BASE}/api/upload-sandbox`, { method: 'POST', body: fd });
@@ -1489,7 +1493,10 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                   <span className="mx-2 text-slate-300">|</span>
                   文件数：<span className="font-mono text-slate-800">{sandboxFiles.length}</span>
                 </div>
-                <div className="max-h-[260px] overflow-y-auto border border-slate-200 rounded-lg bg-white">
+                <div
+                  key={`sandbox_list_${uploadCounter}`}
+                  className="max-h-[260px] overflow-y-auto border border-slate-200 rounded-lg bg-white"
+                >
                   {isUploadingSandbox || isSyncingSandboxFiles ? (
                     <div className="p-3 text-[11px] text-slate-600">正在同步文件列表...</div>
                   ) : sandboxFiles.length ? (
@@ -2375,7 +2382,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                       <div className="px-3 py-2 border-b border-slate-200 text-[11px] text-slate-600 bg-slate-50">
                         表（{sandboxFiles.length}）
                       </div>
-                      <div className="max-h-[240px] overflow-y-auto p-2 space-y-1">
+                      <div key={`sandbox_pick_${uploadCounter}`} className="max-h-[240px] overflow-y-auto p-2 space-y-1">
                         {isUploadingSandbox || isSyncingSandboxFiles ? (
                           <div className="text-[11px] text-slate-600 p-2">正在同步文件列表...</div>
                         ) : sandboxFiles.length ? (

@@ -91,6 +91,9 @@ async function readFinalDashboardSnapshot() {
 // ============================
 const VERTEX_PROJECT_ID = 'idesign-3dsupplydashboard';
 const VERTEX_LOCATION = 'us-central1';
+// 404 兜底：部分项目/区域配额未下发时，切换 region 重试
+const VERTEX_LOCATION_FALLBACKS = ['us-east1', 'asia-northeast1'];
+const VERTEX_LOCATIONS = [VERTEX_LOCATION, ...VERTEX_LOCATION_FALLBACKS];
 const VERTEX_MODEL = 'gemini-1.5-flash';
 // 优先使用“别名”模型；若项目无权限/404，则自动降级到可用版本（仍会打印完整资源路径便于核对）
 const MODEL_PRIORITY = [VERTEX_MODEL, 'gemini-1.5-flash-002', 'gemini-1.5-pro'];
@@ -104,9 +107,19 @@ function ensureVertexCredentialsEnv() {
 }
 
 const vertexKeyPath = ensureVertexCredentialsEnv();
-const vertexAI = new VertexAI({ project: VERTEX_PROJECT_ID, location: VERTEX_LOCATION });
-function getVertexModel(modelName) {
-  return vertexAI.getGenerativeModel({ model: String(modelName || '').trim() });
+// 标准 SDK 模式：仅使用 model alias（不手动拼接 projects/.../models/... 长路径）
+const _vertexClientByLocation = new Map();
+function getVertexClient(location) {
+  const loc = String(location || '').trim() || VERTEX_LOCATION;
+  if (_vertexClientByLocation.has(loc)) return _vertexClientByLocation.get(loc);
+  const c = new VertexAI({ project: VERTEX_PROJECT_ID, location: loc });
+  _vertexClientByLocation.set(loc, c);
+  return c;
+}
+function getVertexModel({ modelName, location }) {
+  const m = String(modelName || '').trim();
+  const loc = String(location || '').trim() || VERTEX_LOCATION;
+  return getVertexClient(loc).getGenerativeModel({ model: m });
 }
 
 let currentAIStatus = {
@@ -325,47 +338,45 @@ function buildPriorityFromAvailable(available) {
 async function generateContentVertex({ prompt, modelName }) {
   const p = String(prompt || '');
   const m = String(modelName || VERTEX_MODEL).trim();
-  const resourcePublisherPath = `projects/${VERTEX_PROJECT_ID}/locations/${VERTEX_LOCATION}/publishers/google/models/${m}`;
-  const resourceModelsPath = `projects/${VERTEX_PROJECT_ID}/locations/${VERTEX_LOCATION}/models/${m}`;
-  if (!generateContentVertex._printedVertexModelPath) {
-    generateContentVertex._printedVertexModelPath = true;
-    // eslint-disable-next-line no-console
-    console.log('[vertex] model resource path check:', resourcePublisherPath);
-    // eslint-disable-next-line no-console
-    console.log('[vertex] alt resource path (for verification):', resourceModelsPath);
-  }
-  try {
-    const model = getVertexModel(m);
-    const result = await model.generateContent({
-      contents: [{ role: 'user', parts: [{ text: p }] }],
-    });
-    const text =
-      result?.response?.candidates?.[0]?.content?.parts?.map((x) => x?.text).filter(Boolean).join('') ||
-      result?.response?.candidates?.[0]?.content?.parts?.[0]?.text ||
-      '';
-    return { text: String(text || '') };
-  } catch (e) {
-    const status = getHttpStatusFromGeminiError(e);
-    if (status === 404 || String(e?.message || '').includes('404')) {
-      // eslint-disable-next-line no-console
-      console.error('[vertex][404] model not found', {
-        model: m,
-        project: VERTEX_PROJECT_ID,
-        location: VERTEX_LOCATION,
-        resourcePublisherPath,
-        resourceModelsPath,
-        message: String(e?.message || ''),
+  let lastErr = null;
+  for (const loc of VERTEX_LOCATIONS) {
+    try {
+      const model = getVertexModel({ modelName: m, location: loc });
+      const result = await model.generateContent({
+        contents: [{ role: 'user', parts: [{ text: p }] }],
       });
+      const text =
+        result?.response?.candidates?.[0]?.content?.parts?.map((x) => x?.text).filter(Boolean).join('') ||
+        result?.response?.candidates?.[0]?.content?.parts?.[0]?.text ||
+        '';
+      return { text: String(text || ''), location: loc, modelName: m };
+    } catch (e) {
+      lastErr = e;
+      const status = getHttpStatusFromGeminiError(e);
+      const is404 = status === 404 || String(e?.message || '').includes('404');
+      if (is404) {
+        // eslint-disable-next-line no-console
+        console.error('[vertex][404] model alias not found in location; retry next', {
+          model: m,
+          project: VERTEX_PROJECT_ID,
+          location: loc,
+          message: String(e?.message || ''),
+        });
+        continue;
+      }
+      // 非 404：直接抛出（鉴权/配额/超时等）
+      break;
     }
-    // 提示更友好的鉴权错误
-    const msg = String(e?.message || '');
-    if (!process.env.GOOGLE_APPLICATION_CREDENTIALS && !fse.existsSync(vertexKeyPath)) {
-      const err = new Error(`Vertex AI 未配置鉴权：请在 server/ 放置 gcp-key.json 或设置 GOOGLE_APPLICATION_CREDENTIALS。原始错误：${msg}`);
-      err.cause = e;
-      throw err;
-    }
-    throw e;
   }
+
+  // 提示更友好的鉴权错误
+  const msg = String(lastErr?.message || '');
+  if (!process.env.GOOGLE_APPLICATION_CREDENTIALS && !fse.existsSync(vertexKeyPath)) {
+    const err = new Error(`Vertex AI 未配置鉴权：请在 server/ 放置 gcp-key.json 或设置 GOOGLE_APPLICATION_CREDENTIALS。原始错误：${msg}`);
+    err.cause = lastErr;
+    throw err;
+  }
+  throw lastErr;
 }
 
 function sanitizeSqlForAi(sqlText) {
@@ -1455,6 +1466,13 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
       '- status (状态)',
       '',
       '【强制匹配规则（必须遵守）】',
+      '【物理特征强约束（最高优先级；严禁语义发散）】',
+      'A) 凡是以 "ods_" 开头的字符串，100% 视为 tableName（不要改写/不要归并到主表）。',
+      'B) 凡是紧跟在 tableName 后面的单词（形如 ods_xxx_yyy_df.brand_name），100% 视为 fieldName。',
+      'C) 凡是以 "SBOX" 开头的值，100% 视为 styleCode 的 value。',
+      'D) 凡是以 "L-B" 开头的值，100% 视为 lastCode 的 value。',
+      'E) 凡是材质提到 "LT/04" 或 "LT + 04" 或 "LT04"：你必须拆成 materialCode 的两个 segments（"LT" 与 "04"），targetGoal 必须为 "LT04"。',
+      '',
       '【编号列表逐条解析（严禁漏项）】若用户用 1. 2. 3. 或 (1)(2)(3) 的序号逐条描述，你必须逐条解析并覆盖所有条目，严禁漏掉任何一条。',
       '特别提醒：即便某表名在 DDL 清单靠后（例如 ods_wms_base_brand_df），只要用户明确写出，你必须提取并输出对应 tableName，禁止忽略。',
       '1) 若用户提到了具体表名（例如 ods_wms_base_brand_df），你必须优先使用该表名；若该表名与 DDL 清单不一致（例如漏字符 ods_pdm_product_info_df），你必须对比 DDL 清单做“模糊纠错”，自动修正为最接近且存在的表名（例如 ods_pdm_pdm_product_info_df）。',
@@ -2727,15 +2745,25 @@ app.post('/api/save-schema-draft', async (req, res) => {
 
 async function handleSandboxUploadXlsx(req, res) {
   await ensureStorageDirs();
+  // 物理级日志：请求入口
+  // eslint-disable-next-line no-console
+  console.log('--- 收到上传请求 ---');
   const files = req.files;
   if (!files || !Array.isArray(files) || files.length === 0) {
+    // eslint-disable-next-line no-console
+    console.log('文件名:', '未检测到文件');
     return res.status(400).json({ ok: false, error: 'No files uploaded' });
   }
+  // eslint-disable-next-line no-console
+  console.log('文件名:', files?.[0]?.originalname || '未检测到文件');
   const out = [];
   for (const f of files) {
     if (!isExcelFileName(f.originalname)) continue;
     const fullPath = path.join(f.destination, f.filename);
     try {
+      const checkFile = fs.existsSync(fullPath);
+      // eslint-disable-next-line no-console
+      console.log('物理写入结果:', checkFile ? '✅ 成功' : '❌ 失败', '=>', fullPath);
       const wb = XLSX.readFile(fullPath, { cellText: false, cellDates: true });
       const sheet = readFirstSheet(wb);
       if (!sheet) {
@@ -2765,10 +2793,11 @@ async function handleSandboxUploadXlsx(req, res) {
 }
 
 // 上传逻辑沙盒样本 XLSX（专用接口；强制存入 storage/sandbox；保留原文件名便于物理对账）
-app.post('/api/upload-sandbox', sandboxUpload.array('files', 50), handleSandboxUploadXlsx);
+// 强制对账：字段名必须为 'file'（与前端 FormData.append('file', ...) 保持一致）
+app.post('/api/upload-sandbox', sandboxUpload.array('file', 50), handleSandboxUploadXlsx);
 
 // 兼容旧接口名
-app.post('/api/upload-sandbox-xlsx', sandboxUpload.array('files', 50), handleSandboxUploadXlsx);
+app.post('/api/upload-sandbox-xlsx', sandboxUpload.array('file', 50), handleSandboxUploadXlsx);
 
 // 沙盒校验：对 storage/sandbox 下 XLSX 套用映射，与期望 Golden 值比对
 app.post('/api/sandbox-validate-mapping', async (req, res) => {
@@ -3019,6 +3048,12 @@ app.use((err, _req, res, _next) => {
 
 async function start() {
   await ensureStorageDirs();
+  // 自动化环境清理：启动时强制确保 sandbox 目录存在
+  try {
+    fse.ensureDirSync(path.join(__dirname, 'storage', 'sandbox'));
+  } catch {
+    // ignore
+  }
   await refreshAssetsCache();
 
   const port = 3001;

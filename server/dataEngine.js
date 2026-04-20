@@ -1191,9 +1191,38 @@ export async function resolveFirstActiveRowFromFolder({
   const materialCol = columnNameForMainRow(standardMap.get('materialCode'));
 
   const required = [styleCol, brandCol, statusCol].filter(Boolean);
-  const main = required.length ? guessStyleMainTable(xlsxTables, required) : null;
+  // 全表搜索：优先用 targetStyle 在所有表全列暴力定位“样本行所在表”（不信任 fieldName）
+  const pickMainByTargetStyle = () => {
+    if (!targetStyleNorm) return null;
+    const candidates = [];
+    for (const t of xlsxTables || []) {
+      const rows = Array.isArray(t?.rows) ? t.rows : [];
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i] || {};
+        if (rowContainsTarget(row, targetStyleNorm)) {
+          candidates.push({ table: t, rowIndex: i });
+          break;
+        }
+      }
+    }
+    if (!candidates.length) return null;
+    // 若 required 可用：优先挑“表头包含 required 字段最多”的那张
+    if (required.length) {
+      const score = (tt) => {
+        const headers = Array.isArray(tt?.headers) ? tt.headers.map((h) => String(h)) : [];
+        const set = new Set(headers.map((h) => normalize(h)));
+        let s = 0;
+        for (const r of required) if (set.has(normalize(r))) s += 1;
+        return s;
+      };
+      candidates.sort((a, b) => score(b.table) - score(a.table));
+    }
+    return candidates[0]?.table || null;
+  };
+
+  const main = (required.length ? guessStyleMainTable(xlsxTables, required) : null) || pickMainByTargetStyle();
   if (!main) {
-    return { ok: false, error: '无法识别主表（需映射款号/品牌/状态且沙盒表头匹配）', row: null, mainTable: null };
+    return { ok: false, error: '无法识别主表（未能通过表头或全表搜索定位样本行）', row: null, mainTable: null };
   }
 
   const mainTableName = buildTableNameIndex(main.fileName);
