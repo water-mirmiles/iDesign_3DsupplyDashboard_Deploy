@@ -1375,6 +1375,22 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap }) {
   const solesSet = await loadAssetsBaseNames(path.join(storageRoot, 'assets', 'soles'));
 
   const mainTableName = buildTableNameIndex(main.fileName);
+  // 强制接通：lastCode 固定路径（跳过配置）
+  // 主表 ods_pdm_pdm_product_info_df.associated_last_type -> 维表 ods_pdm_pdm_base_last_df.id -> code
+  const forcedLastTbl = getTableFromMap('ods_pdm_pdm_base_last_df', tablesMap);
+  const forcedLastIndex = (() => {
+    if (!forcedLastTbl?.rows?.length) return null;
+    const idx = new Map();
+    for (const r of forcedLastTbl.rows) {
+      const idv = getRowFieldLoose(r, 'id', forcedLastTbl.headers);
+      const codev = getRowFieldLoose(r, 'code', forcedLastTbl.headers);
+      const k = String(idv ?? '').trim().toLowerCase();
+      const code = codev == null ? '' : normalize(codev);
+      if (!k || !code) continue;
+      if (!idx.has(k)) idx.set(k, code);
+    }
+    return idx;
+  })();
   // Join 性能优化：为常见维表构建 (table,targetField) -> Map<key,row> 的 O(1) 索引
   const joinIndexes = new Map();
   for (const entry of [standardMap.get('brand'), standardMap.get('lastCode'), standardMap.get('soleCode')].filter(Boolean)) {
@@ -1437,7 +1453,22 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap }) {
     const invStatus = normalizeInventoryStatus(rawStatusVal);
     statusDist[invStatus] += 1;
 
-    const lastCodeVal = resolveFast(standardMap.get('lastCode'), row, lastCol);
+    const lastCodeVal = (() => {
+      // 强制路径：优先直接取 associated_last_type；若列名在生产快照中变体，则自动探测 FK 列
+      let fk = getRowFieldLoose(row, 'associated_last_type', main.headers);
+      if (fk == null || normalize(fk) === '') {
+        const fkCol = guessFkColumnFromMainRow(row, 'lastCode');
+        if (fkCol) fk = row?.[fkCol];
+      }
+      const fkKey = String(fk ?? '').trim().toLowerCase();
+      if (fkKey && forcedLastIndex) {
+        const code = forcedLastIndex.get(fkKey);
+        if (code) return code;
+      }
+      // 兜底：如果维表缺失/无法命中，再尝试映射配置
+      const v = resolveFast(standardMap.get('lastCode'), row, lastCol);
+      return v;
+    })();
     const soleCodeVal = resolveFast(standardMap.get('soleCode'), row, soleCol);
     const colorCodeVal = resolveFast(standardMap.get('colorCode'), row, colorCol);
     const materialCodeVal = resolveStandardMappedValue(
@@ -1462,6 +1493,7 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap }) {
       materialCode: materialCodeVal,
       lastCode: lastCodeVal || undefined,
       lastStatus: has3DLast ? 'matched' : 'missing',
+      has3DLast,
       soleCode: soleCodeVal || undefined,
       soleStatus: has3DSole ? 'matched' : 'missing',
       data_status: invStatus,
@@ -1481,6 +1513,7 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap }) {
   const matchedSoles = activeRows.filter((x) => x.__has3DSole).length;
   const stylesWithAny3D = activeRows.filter((x) => x.__has3DAny).length;
   const lastCoverage = activeStyles > 0 ? Math.round((matchedLasts / activeStyles) * 100) : 0;
+  const last3DCoverage = activeStyles > 0 ? Math.round((matchedLasts / activeStyles) * 1000) / 10 : 0;
   const soleCoverage = activeStyles > 0 ? Math.round((matchedSoles / activeStyles) * 100) : 0;
   const any3DCoveragePercent = activeStyles > 0 ? Math.round((stylesWithAny3D / activeStyles) * 100) : 0;
 
@@ -1509,6 +1542,8 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap }) {
       stylesWithAny3D,
       any3DCoveragePercent,
       statusDist,
+      last3DCount: matchedLasts,
+      last3DCoverage,
     },
     brandCoverage,
     inventory: inventoryOut,
@@ -1539,6 +1574,8 @@ export async function processAllData({ storageRoot }) {
       matched3DSoles: kpis.matchedSoles,
       lastCoverage: kpis.lastCoverage,
       soleCoverage: kpis.soleCoverage,
+      last3DCount: kpis.last3DCount ?? kpis.matchedLasts,
+      last3DCoverage: kpis.last3DCoverage ?? kpis.lastCoverage,
       stylesWithAny3D: kpis.stylesWithAny3D,
       any3DCoveragePercent: kpis.any3DCoveragePercent,
       statusDist: kpis.statusDist || undefined,

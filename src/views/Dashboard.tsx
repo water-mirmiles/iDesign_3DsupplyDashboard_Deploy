@@ -20,6 +20,8 @@ type DashboardStatsResponse = {
     matched3DSoles: number;
     lastCoverage: number;
     soleCoverage: number;
+    last3DCount?: number;
+    last3DCoverage?: number;
     /** 生效款中至少命中楦或底之一 */
     stylesWithAny3D?: number;
     /** (生效款且 has3D) / 生效款总数 · 百分比 */
@@ -176,11 +178,16 @@ export default function Dashboard() {
           </div>
           <div className="mt-4">
             <div className="flex items-end gap-2">
-              <span className="text-3xl font-bold text-slate-900">{(stats?.kpis?.matched3DLasts || 0).toLocaleString()}</span>
+              <span className="text-3xl font-bold text-slate-900">
+                {(stats?.kpis?.last3DCount ?? stats?.kpis?.matched3DLasts ?? 0).toLocaleString()}
+              </span>
               {getTrendBadge(stats?.kpis?.deltaMatched3DLasts || 0)}
             </div>
             <div className="mt-1 text-xs text-slate-500">
-              覆盖率: <span className="font-medium text-slate-700">{stats?.kpis?.lastCoverage ?? 0}%</span>
+              覆盖率:{' '}
+              <span className="font-medium text-slate-700">
+                {stats?.kpis?.last3DCoverage ?? stats?.kpis?.lastCoverage ?? 0}%
+              </span>
             </div>
           </div>
         </div>

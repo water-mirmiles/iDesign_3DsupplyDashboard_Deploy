@@ -161,6 +161,7 @@ export default function InventoryList() {
   const [previewModal, setPreviewModal] = useState<{isOpen: boolean, assetCode: string, type: 'last'|'sole'}>({ isOpen: false, assetCode: '', type: 'last' });
   const [has3DFilter, setHas3DFilter] = useState<string>('all');
   const [brandFilter, setBrandFilter] = useState<string>('all');
+  const [searchTerm, setSearchTerm] = useState<string>('');
   const [items, setItems] = useState<InventoryItem[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -205,10 +206,18 @@ export default function InventoryList() {
   const filteredItems = useMemo(() => {
     let out = items;
     if (brandFilter !== 'all') out = out.filter((x) => (x.brand || '').trim() === brandFilter);
+    const q = searchTerm.trim().toLowerCase();
+    if (q) {
+      out = out.filter((item) => {
+        const style = String(item.style_wms || '').toLowerCase();
+        const brand = String(item.brand || '').toLowerCase();
+        return style.includes(q) || brand.includes(q);
+      });
+    }
     if (has3DFilter === 'all') return out;
     if (has3DFilter === 'yes') return out.filter((x) => x.lastStatus === 'matched' || x.soleStatus === 'matched');
     return out.filter((x) => x.lastStatus !== 'matched' && x.soleStatus !== 'matched');
-  }, [brandFilter, has3DFilter, items]);
+  }, [brandFilter, has3DFilter, items, searchTerm]);
 
   return (
     <div className="space-y-6 animate-in fade-in duration-500 pb-10">
@@ -238,6 +247,8 @@ export default function InventoryList() {
               <input 
                 type="text" 
                 placeholder="搜索款号或品牌..." 
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
                 className="pl-9 pr-4 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent w-64"
               />
             </div>

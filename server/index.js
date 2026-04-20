@@ -3191,49 +3191,49 @@ app.get('/api/history', async (_req, res) => {
 });
 
 // 真实看板统计：优先读认证落盘的 final_dashboard_data.json，否则实时聚合
-app.get('/api/dashboard-stats', async (_req, res) => {
+app.get('/api/dashboard-stats', async (req, res) => {
   try {
     const snap = await readFinalDashboardSnapshot();
-    if (snap) {
+    const forceRefresh = String(req.query?.refresh || '') === '1';
+    const latestProdDir = await getLatestDataTablesDir();
+    const latestProdDate = isDateDirName(path.basename(latestProdDir)) ? path.basename(latestProdDir) : '';
+    const snapLatestDate = snap?.dates?.latest ? String(snap.dates.latest) : '';
+    const snapIsStale = Boolean(snap && latestProdDate && snapLatestDate && latestProdDate !== snapLatestDate);
+    const shouldRebuild = forceRefresh || !snap || snapIsStale;
+
+    if (shouldRebuild) {
+      // eslint-disable-next-line no-console
+      console.log(
+        `[Prod-Engine] dashboard-stats refresh=${forceRefresh ? '1' : '0'} snap=${
+          snap ? 'yes' : 'no'
+        } stale=${snapIsStale ? 'yes' : 'no'} snap.latest=${snapLatestDate || '(none)'} prod.latest=${latestProdDate || '(none)'}`
+      );
+      const payload = await processAllData({ storageRoot: STORAGE_ROOT });
+      await persistFinalDashboardData(STORAGE_ROOT, payload);
       return res.json({
         ok: true,
         source: 'final_dashboard_data',
-        generatedAt: snap.generatedAt,
-        dates: snap.dates,
-        mapping: snap.mapping,
-        meta: snap.meta,
-        kpis: snap.kpis,
-        brandCoverage: snap.brandCoverage || [],
+        generatedAt: payload.generatedAt,
+        dates: payload.dates,
+        mapping: payload.mapping,
+        meta: payload.meta,
+        kpis: payload.kpis,
+        brandCoverage: payload.brandCoverage || [],
       });
     }
 
-    const agg = await aggregateProjectData({ storageRoot: STORAGE_ROOT });
-    const latest = agg.latest;
-    // eslint-disable-next-line no-console
-    console.log(
-      `[Prod-Engine] 正在为看板聚合生产数据，主表行数：${Number(latest?.meta?.mainRowCount || 0)} 行`
-    );
-
+    // snap exists and not stale
     return res.json({
       ok: true,
-      source: 'live',
-      dates: agg.dates,
-      mapping: agg.mapping,
-      meta: latest.meta,
-      kpis: {
-        activeStyles: latest.kpis.activeStyles,
-        matched3DLasts: latest.kpis.matchedLasts,
-        matched3DSoles: latest.kpis.matchedSoles,
-        lastCoverage: latest.kpis.lastCoverage,
-        soleCoverage: latest.kpis.soleCoverage,
-        stylesWithAny3D: latest.kpis.stylesWithAny3D,
-        any3DCoveragePercent: latest.kpis.any3DCoveragePercent,
-        deltaActiveStyles: agg.deltas.activeStyles.delta,
-        deltaMatched3DLasts: agg.deltas.matchedLasts.delta,
-        deltaMatched3DSoles: agg.deltas.matchedSoles.delta,
-      },
-      brandCoverage: latest.brandCoverage,
+      source: 'final_dashboard_data',
+      generatedAt: snap.generatedAt,
+      dates: snap.dates,
+      mapping: snap.mapping,
+      meta: snap.meta,
+      kpis: snap.kpis,
+      brandCoverage: snap.brandCoverage || [],
     });
+
   } catch (e) {
     // eslint-disable-next-line no-console
     console.error('[dataEngine] dashboard-stats failed', e);
@@ -3290,6 +3290,11 @@ app.get('/api/inventory-real', async (_req, res) => {
   try {
     const snap = await readFinalDashboardSnapshot();
     if (snap?.inventory) {
+      const items = (snap.inventory || []).map((it) => ({
+        ...it,
+        brand_name: it.brand,
+        status: it.data_status,
+      }));
       return res.json({
         ok: true,
         source: 'final_dashboard_data',
@@ -3297,17 +3302,22 @@ app.get('/api/inventory-real', async (_req, res) => {
         dates: snap.dates,
         mapping: snap.mapping,
         meta: snap.meta,
-        items: snap.inventory,
+        items,
       });
     }
     const agg = await aggregateProjectData({ storageRoot: STORAGE_ROOT });
+    const items = (agg.latest.inventory || []).map((it) => ({
+      ...it,
+      brand_name: it.brand,
+      status: it.data_status,
+    }));
     return res.json({
       ok: true,
       source: 'live',
       dates: agg.dates,
       mapping: agg.mapping,
       meta: agg.latest.meta,
-      items: agg.latest.inventory,
+      items,
     });
   } catch (e) {
     // eslint-disable-next-line no-console

@@ -104,6 +104,7 @@ export interface InventoryItem {
   materialThumb?: string; // 材质缩略图
   lastCode?: string; // 楦头编号
   lastStatus: 'matched' | 'missing'; // 3D楦头状态
+  has3DLast?: boolean; // 是否命中 3D 楦头物理文件（对账结果）
   soleCode?: string; // 大底编号
   soleStatus: 'matched' | 'missing'; // 3D大底状态
   data_status: 'active' | 'draft' | 'obsolete'; // 状态
