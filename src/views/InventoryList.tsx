@@ -254,9 +254,20 @@ export default function InventoryList() {
       }
     }
 
-    if (has3DFilter === 'all') return out;
-    if (has3DFilter === 'yes') return out.filter((x) => x.lastStatus === 'matched' || x.soleStatus === 'matched');
-    return out.filter((x) => x.lastStatus !== 'matched' && x.soleStatus !== 'matched');
+    if (has3DFilter !== 'all') {
+      if (has3DFilter === 'yes') out = out.filter((x) => x.lastStatus === 'matched' || x.soleStatus === 'matched');
+      else out = out.filter((x) => x.lastStatus !== 'matched' && x.soleStatus !== 'matched');
+    }
+
+    // 默认排序：生效在前，其次草稿，最后作废
+    const pri: Record<string, number> = { active: 0, draft: 1, obsolete: 2 };
+    out = [...out].sort((a, b) => {
+      const pa = pri[String(a?.data_status || '')] ?? 9;
+      const pb = pri[String(b?.data_status || '')] ?? 9;
+      if (pa !== pb) return pa - pb;
+      return String(a?.style_wms || '').localeCompare(String(b?.style_wms || ''), 'en', { numeric: true });
+    });
+    return out;
   }, [brandFilter, has3DFilter, items, searchTerm, drilldown]);
 
   return (
@@ -359,7 +370,13 @@ export default function InventoryList() {
             </thead>
             <tbody className="divide-y divide-slate-100">
               {filteredItems.map((item) => (
-                <tr key={item.id} className="hover:bg-slate-50/50 transition-colors group">
+                <tr
+                  key={item.id}
+                  className={cn(
+                    'transition-colors group',
+                    item.data_status === 'draft' ? 'bg-blue-50/10 hover:bg-blue-50/20' : 'hover:bg-slate-50/50'
+                  )}
+                >
                   <td className="px-5 py-4 font-medium text-slate-900">{item.style_wms}</td>
                   <td className="px-5 py-4 text-slate-600">
                     <span className="bg-slate-100 px-2.5 py-1 rounded-md text-xs font-medium">{item.brand}</span>

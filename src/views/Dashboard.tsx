@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { 
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, Legend, ResponsiveContainer, LabelList,
   AreaChart, Area
@@ -37,6 +37,12 @@ type DashboardStatsResponse = {
     deltaMatched3DLasts: number;
     deltaMatched3DSoles: number;
   };
+  statusBuckets?: {
+    total?: { kpis?: any };
+    effective?: { kpis?: any };
+    draft?: { kpis?: any };
+    obsolete?: { kpis?: any };
+  };
   brandCoverage: Array<{ brand: string; linked: number; unlinked: number }>;
   brandBindingStats?: Array<{
     brand: string;
@@ -68,6 +74,7 @@ type DashboardStatsResponse = {
     completionRate: number;
   }>;
   trends?: { assetTrend?: AssetTrendStats[] };
+  inventory?: Array<any>;
   error?: string;
 };
 
@@ -78,9 +85,134 @@ export default function Dashboard() {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [isForceSyncing, setIsForceSyncing] = useState(false);
+  const [statusScope, setStatusScope] = useState<'effective' | 'includeDraft' | 'total'>('effective');
 
   const [trendPeriod, setTrendPeriod] = useState<TimePeriod>('week');
   const [chartData, setChartData] = useState<AssetTrendStats[]>([]);
+
+  const brandTotalAll = useMemo(() => {
+    const inv = stats?.inventory || [];
+    const set = new Set<string>();
+    for (const it of inv) {
+      const b = String(it?.brand || '').trim();
+      if (b) set.add(b);
+    }
+    return set.size;
+  }, [stats?.inventory]);
+
+  const scopeKPIs = useMemo(() => {
+    const sb: any = stats?.statusBuckets || null;
+    const fallback = stats?.kpis || null;
+    const eff = sb?.effective?.kpis || null;
+    const dra = sb?.draft?.kpis || null;
+    const tot = sb?.total?.kpis || null;
+
+    const merge = (a: any, b: any) => {
+      const A = a || {};
+      const B = b || {};
+      const totalStyles = Number(A.totalStyles || 0) + Number(B.totalStyles || 0);
+      const matchedLasts = Number(A.matchedLasts || A.last3DCount || 0) + Number(B.matchedLasts || B.last3DCount || 0);
+      const matchedSoles = Number(A.matchedSoles || A.sole3DCount || 0) + Number(B.matchedSoles || B.sole3DCount || 0);
+      const stylesWithAny3D = Number(A.stylesWithAny3D || 0) + Number(B.stylesWithAny3D || 0);
+      const lastCodeLinked = Number(A.lastCodeLinked || 0) + Number(B.lastCodeLinked || 0);
+      const soleCodeLinked = Number(A.soleCodeLinked || 0) + Number(B.soleCodeLinked || 0);
+
+      const last3DCoverage = totalStyles > 0 ? Math.round((matchedLasts / totalStyles) * 1000) / 10 : 0;
+      const sole3DCoverage = totalStyles > 0 ? Math.round((matchedSoles / totalStyles) * 1000) / 10 : 0;
+      const any3DCoveragePercent = totalStyles > 0 ? Math.round((stylesWithAny3D / totalStyles) * 100) : 0;
+      const lastCodeLinkRate = totalStyles > 0 ? Math.round((lastCodeLinked / totalStyles) * 1000) / 10 : 0;
+      const soleCodeLinkRate = totalStyles > 0 ? Math.round((soleCodeLinked / totalStyles) * 1000) / 10 : 0;
+
+      return {
+        styles: { totalAll: totalStyles, totalEffective: totalStyles },
+        totalStyles,
+        activeStyles: totalStyles,
+        matched3DLasts: matchedLasts,
+        matched3DSoles: matchedSoles,
+        last3DCount: matchedLasts,
+        sole3DCount: matchedSoles,
+        stylesWithAny3D,
+        any3DCoveragePercent,
+        last3DCoverage,
+        sole3DCoverage,
+        lastCodeLinked,
+        soleCodeLinked,
+        lastCodeLinkRate,
+        soleCodeLinkRate,
+        deltaActiveStyles: 0,
+        deltaMatched3DLasts: 0,
+        deltaMatched3DSoles: 0,
+      };
+    };
+
+    if (!sb) return fallback;
+    if (statusScope === 'effective') return eff || fallback;
+    if (statusScope === 'includeDraft') return merge(eff, dra);
+    return tot || fallback;
+  }, [stats, statusScope]);
+
+  const digitizationStats = useCallback(
+    (dim: 'last' | 'sole') => {
+      const inv = stats?.inventory || [];
+      const want = (s: string) => {
+        if (statusScope === 'effective') return s === 'active';
+        if (statusScope === 'includeDraft') return s === 'active' || s === 'draft';
+        return true;
+      };
+      const codeField = dim === 'last' ? 'lastCode' : 'soleCode';
+      const statusField = dim === 'last' ? 'lastStatus' : 'soleStatus';
+      const isLinkedCode = (v: any) => {
+        const t = String(v ?? '').trim();
+        return t !== '' && t !== '-' && t !== '0';
+      };
+
+      const byBrand = new Map<string, { brand: string; total: number; hasCode: number; has3D: number }>();
+      for (const it of inv) {
+        const s = String(it?.data_status || '').trim();
+        if (!want(s)) continue;
+        const brand = String(it?.brand || 'Unknown').trim() || 'Unknown';
+        const cur = byBrand.get(brand) || { brand, total: 0, hasCode: 0, has3D: 0 };
+        cur.total += 1;
+        const hasCode = isLinkedCode(it?.[codeField]);
+        if (hasCode) cur.hasCode += 1;
+        const has3D = hasCode && String(it?.[statusField] || '') === 'matched';
+        if (has3D) cur.has3D += 1;
+        byBrand.set(brand, cur);
+      }
+
+      // 品牌全集：从全量 inventory 扫一遍，确保切换状态时品牌不“消失”
+      const allBrands = (() => {
+        const set = new Set<string>();
+        for (const it of inv) {
+          const b = String(it?.brand || '').trim();
+          if (b) set.add(b);
+        }
+        return Array.from(set.values());
+      })();
+
+      return allBrands
+        .map((b) => byBrand.get(b) || { brand: b, total: 0, hasCode: 0, has3D: 0 })
+        .map((x) => {
+          const segment_no_code = Math.max(0, x.total - x.hasCode);
+          const segment_has_code_no_3d = Math.max(0, x.hasCode - x.has3D);
+          const segment_completed_3d = Math.max(0, x.has3D);
+          const completionRate = x.total > 0 ? Math.round((x.has3D / x.total) * 1000) / 10 : 0;
+          return {
+            brand: x.brand,
+            totalEffective: x.total,
+            hasCode: x.hasCode,
+            has3D: x.has3D,
+            segment_no_code,
+            segment_has_code_no_3d,
+            segment_completed_3d,
+            completionRate,
+          };
+        })
+        .sort((a, b) => (b.totalEffective || 0) - (a.totalEffective || 0))
+        .slice(0, 30);
+    },
+    [stats?.inventory, statusScope]
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -191,6 +323,8 @@ export default function Dashboard() {
     noCodeStroke: '#cbd5e1', // slate-300
     label: '#475569', // slate-600
   };
+  const lastChartRows = useMemo(() => digitizationStats('last'), [digitizationStats]);
+  const soleChartRows = useMemo(() => digitizationStats('sole'), [digitizationStats]);
 
   return (
     <div className="space-y-6 animate-in fade-in duration-500 pb-10">
@@ -205,19 +339,51 @@ export default function Dashboard() {
             </p>
           )}
         </div>
-        <button
-          onClick={() => void handleForceSync()}
-          disabled={isForceSyncing}
-          className={cn(
-            'shrink-0 inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium border shadow-sm transition-colors',
-            isForceSyncing
-              ? 'bg-slate-100 text-slate-500 border-slate-200 cursor-not-allowed'
-              : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
-          )}
-        >
-          {isForceSyncing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Activity className="w-4 h-4" />}
-          一键重算看板数据
-        </button>
+        <div className="shrink-0 flex items-center gap-3">
+          <div className="inline-flex items-center rounded-lg border border-slate-200 bg-white shadow-sm overflow-hidden">
+            <button
+              className={cn(
+                'px-3 py-2 text-sm font-medium transition-colors',
+                statusScope === 'effective' ? 'bg-slate-900 text-white' : 'bg-white text-slate-700 hover:bg-slate-50'
+              )}
+              onClick={() => setStatusScope('effective')}
+            >
+              仅生效款
+            </button>
+            <button
+              className={cn(
+                'px-3 py-2 text-sm font-medium transition-colors border-l border-slate-200',
+                statusScope === 'includeDraft' ? 'bg-slate-900 text-white' : 'bg-white text-slate-700 hover:bg-slate-50'
+              )}
+              onClick={() => setStatusScope('includeDraft')}
+            >
+              包含草稿
+            </button>
+            <button
+              className={cn(
+                'px-3 py-2 text-sm font-medium transition-colors border-l border-slate-200',
+                statusScope === 'total' ? 'bg-slate-900 text-white' : 'bg-white text-slate-700 hover:bg-slate-50'
+              )}
+              onClick={() => setStatusScope('total')}
+            >
+              全量池
+            </button>
+          </div>
+
+          <button
+            onClick={() => void handleForceSync()}
+            disabled={isForceSyncing}
+            className={cn(
+              'inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium border shadow-sm transition-colors',
+              isForceSyncing
+                ? 'bg-slate-100 text-slate-500 border-slate-200 cursor-not-allowed'
+                : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+            )}
+          >
+            {isForceSyncing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Activity className="w-4 h-4" />}
+            一键重算看板数据
+          </button>
+        </div>
       </div>
 
       {!isLoading && stats && (!stats.mapping?.hasConfig || !stats.meta?.mainTable) && (
@@ -249,7 +415,7 @@ export default function Dashboard() {
             </div>
           </div>
           <div className="mt-4">
-            <span className="text-3xl font-bold text-slate-900">{(stats?.brandCoverage?.length || 0).toLocaleString()}</span>
+            <span className="text-3xl font-bold text-slate-900">{(brandTotalAll || 0).toLocaleString()}</span>
           </div>
         </div>
 
@@ -264,12 +430,14 @@ export default function Dashboard() {
           <div className="mt-4">
             <div className="flex items-end gap-2">
               <span className="text-3xl font-bold text-slate-900">
-                {(stats?.kpis?.styles?.totalAll ?? stats?.kpis?.totalStyles ?? 0).toLocaleString()}
+                {(scopeKPIs?.styles?.totalAll ?? scopeKPIs?.totalStyles ?? 0).toLocaleString()}
               </span>
               {getTrendBadge(stats?.kpis?.deltaActiveStyles || 0)}
             </div>
             <div className="mt-1 text-xs text-slate-500">
-              其中生效款：<span className="font-medium text-slate-700">{(stats?.kpis?.styles?.totalEffective ?? stats?.kpis?.activeStyles ?? 0).toLocaleString()}</span>
+              当前口径：<span className="font-medium text-slate-700">
+                {statusScope === 'effective' ? '仅生效' : statusScope === 'includeDraft' ? '生效+草稿' : '全量池'}
+              </span>
             </div>
           </div>
         </div>
@@ -285,20 +453,20 @@ export default function Dashboard() {
           <div className="mt-4">
             <div className="flex items-end gap-2">
               <span className="text-3xl font-bold text-slate-900">
-                {(stats?.kpis?.last3DCount ?? stats?.kpis?.matched3DLasts ?? 0).toLocaleString()}
+                {(scopeKPIs?.last3DCount ?? scopeKPIs?.matched3DLasts ?? 0).toLocaleString()}
               </span>
               {getTrendBadge(stats?.kpis?.deltaMatched3DLasts || 0)}
             </div>
             <div className="mt-1 text-xs text-slate-500">
               编号绑定率：{' '}
               <span className="font-medium text-slate-700">
-                {stats?.kpis?.lastCodeLinkRate ?? 0}%
+                {scopeKPIs?.lastCodeLinkRate ?? 0}%
               </span>
             </div>
             <div className="mt-1 text-xs text-slate-500">
               3D 覆盖率：{' '}
               <span className="font-medium text-slate-700">
-                {stats?.kpis?.last3DCoverage ?? stats?.kpis?.lastCoverage ?? 0}%
+                {scopeKPIs?.last3DCoverage ?? scopeKPIs?.lastCoverage ?? 0}%
               </span>
             </div>
           </div>
@@ -315,15 +483,15 @@ export default function Dashboard() {
           <div className="mt-4">
             <div className="flex items-end gap-2">
               <span className="text-3xl font-bold text-slate-900">
-                {(stats?.kpis?.sole3DCount ?? stats?.kpis?.matched3DSoles ?? 0).toLocaleString()}
+                {(scopeKPIs?.sole3DCount ?? scopeKPIs?.matched3DSoles ?? 0).toLocaleString()}
               </span>
               {getTrendBadge(stats?.kpis?.deltaMatched3DSoles || 0)}
             </div>
             <div className="mt-1 text-xs text-slate-500">
-              编号绑定率: <span className="font-medium text-slate-700">{stats?.kpis?.soleCodeLinkRate ?? 0}%</span>
+              编号绑定率: <span className="font-medium text-slate-700">{scopeKPIs?.soleCodeLinkRate ?? 0}%</span>
             </div>
             <div className="mt-1 text-xs text-slate-500">
-              3D 覆盖率: <span className="font-medium text-slate-700">{stats?.kpis?.sole3DCoverage ?? stats?.kpis?.soleCoverage ?? 0}%</span>
+              3D 覆盖率: <span className="font-medium text-slate-700">{scopeKPIs?.sole3DCoverage ?? scopeKPIs?.soleCoverage ?? 0}%</span>
             </div>
           </div>
         </div>
@@ -339,16 +507,16 @@ export default function Dashboard() {
           <div className="mt-4">
             <div className="flex items-end gap-2">
               <span className="text-3xl font-bold text-slate-900">
-                {stats?.kpis?.any3DCoveragePercent != null
-                  ? stats.kpis.any3DCoveragePercent
-                  : Math.round((((stats?.kpis?.lastCoverage ?? 0) + (stats?.kpis?.soleCoverage ?? 0)) / 2))}
+                {scopeKPIs?.any3DCoveragePercent != null
+                  ? scopeKPIs.any3DCoveragePercent
+                  : Math.round((((scopeKPIs?.lastCoverage ?? 0) + (scopeKPIs?.soleCoverage ?? 0)) / 2))}
                 %
               </span>
               {getTrendBadge(0, true)}
             </div>
             <div className="mt-1 text-xs text-slate-500">
-              {stats?.kpis?.stylesWithAny3D != null
-                ? `生效款中任一 3D 命中：${stats.kpis.stylesWithAny3D} / ${stats?.kpis?.activeStyles ?? 0}`
+              {scopeKPIs?.stylesWithAny3D != null
+                ? `当前口径任一 3D 命中：${scopeKPIs.stylesWithAny3D} / ${scopeKPIs?.activeStyles ?? scopeKPIs?.totalStyles ?? 0}`
                 : '楦/底覆盖率均值（无快照细分时）'}
             </div>
             <div className="mt-2 h-1.5 w-full bg-slate-100 rounded-full overflow-hidden">
@@ -356,16 +524,16 @@ export default function Dashboard() {
                 className={cn(
                   'h-full rounded-full transition-all duration-1000',
                   getProgressColor(
-                    stats?.kpis?.any3DCoveragePercent != null
-                      ? stats.kpis.any3DCoveragePercent
-                      : Math.round((((stats?.kpis?.lastCoverage ?? 0) + (stats?.kpis?.soleCoverage ?? 0)) / 2))
+                    scopeKPIs?.any3DCoveragePercent != null
+                      ? scopeKPIs.any3DCoveragePercent
+                      : Math.round((((scopeKPIs?.lastCoverage ?? 0) + (scopeKPIs?.soleCoverage ?? 0)) / 2))
                   )
                 )}
                 style={{
                   width: `${
-                    stats?.kpis?.any3DCoveragePercent != null
-                      ? stats.kpis.any3DCoveragePercent
-                      : Math.round((((stats?.kpis?.lastCoverage ?? 0) + (stats?.kpis?.soleCoverage ?? 0)) / 2))
+                    scopeKPIs?.any3DCoveragePercent != null
+                      ? scopeKPIs.any3DCoveragePercent
+                      : Math.round((((scopeKPIs?.lastCoverage ?? 0) + (scopeKPIs?.soleCoverage ?? 0)) / 2))
                   }%`,
                 }}
               />
@@ -384,7 +552,7 @@ export default function Dashboard() {
           </div>
           <div className="flex-1 min-h-[420px] w-full">
             <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={stats?.lastDigitizationStats || []} layout="vertical" margin={{ top: 10, right: 16, left: 20, bottom: 0 }}>
+              <BarChart data={lastChartRows || []} layout="vertical" margin={{ top: 10, right: 16, left: 20, bottom: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
                 <XAxis type="number" axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
                 <YAxis type="category" dataKey="brand" axisLine={false} tickLine={false} width={160} tick={{ fill: '#64748b', fontSize: 12, textAnchor: 'end' }} />
@@ -425,7 +593,7 @@ export default function Dashboard() {
                   fill={COLORS.completed3D}
                   maxBarSize={18}
                   onClick={(_, idx) => {
-                    const row: any = (stats?.lastDigitizationStats || [])[idx];
+                    const row: any = (lastChartRows || [])[idx];
                     if (row?.brand) drilldownToInventory(String(row.brand), 'last', 'completed_3d');
                   }}
                 >
@@ -445,7 +613,7 @@ export default function Dashboard() {
                   fill={COLORS.hasCodeNo3D}
                   maxBarSize={18}
                   onClick={(_, idx) => {
-                    const row: any = (stats?.lastDigitizationStats || [])[idx];
+                    const row: any = (lastChartRows || [])[idx];
                     if (row?.brand) drilldownToInventory(String(row.brand), 'last', 'has_code_no_3d');
                   }}
                 />
@@ -458,7 +626,7 @@ export default function Dashboard() {
                   strokeWidth={0.5}
                   maxBarSize={18}
                   onClick={(_, idx) => {
-                    const row: any = (stats?.lastDigitizationStats || [])[idx];
+                    const row: any = (lastChartRows || [])[idx];
                     if (row?.brand) drilldownToInventory(String(row.brand), 'last', 'no_code');
                   }}
                 />
@@ -475,7 +643,7 @@ export default function Dashboard() {
           </div>
           <div className="flex-1 min-h-[420px] w-full">
             <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={stats?.soleDigitizationStats || []} layout="vertical" margin={{ top: 10, right: 16, left: 20, bottom: 0 }}>
+              <BarChart data={soleChartRows || []} layout="vertical" margin={{ top: 10, right: 16, left: 20, bottom: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
                 <XAxis type="number" axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
                 <YAxis type="category" dataKey="brand" axisLine={false} tickLine={false} width={160} tick={{ fill: '#64748b', fontSize: 12, textAnchor: 'end' }} />
@@ -516,7 +684,7 @@ export default function Dashboard() {
                   fill={COLORS.completed3D}
                   maxBarSize={18}
                   onClick={(_, idx) => {
-                    const row: any = (stats?.soleDigitizationStats || [])[idx];
+                    const row: any = (soleChartRows || [])[idx];
                     if (row?.brand) drilldownToInventory(String(row.brand), 'sole', 'completed_3d');
                   }}
                 >
@@ -536,7 +704,7 @@ export default function Dashboard() {
                   fill={COLORS.hasCodeNo3D}
                   maxBarSize={18}
                   onClick={(_, idx) => {
-                    const row: any = (stats?.soleDigitizationStats || [])[idx];
+                    const row: any = (soleChartRows || [])[idx];
                     if (row?.brand) drilldownToInventory(String(row.brand), 'sole', 'has_code_no_3d');
                   }}
                 />
@@ -549,7 +717,7 @@ export default function Dashboard() {
                   strokeWidth={0.5}
                   maxBarSize={18}
                   onClick={(_, idx) => {
-                    const row: any = (stats?.soleDigitizationStats || [])[idx];
+                    const row: any = (soleChartRows || [])[idx];
                     if (row?.brand) drilldownToInventory(String(row.brand), 'sole', 'no_code');
                   }}
                 />

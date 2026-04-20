@@ -1025,7 +1025,7 @@ function computeBrand3DCoverageStats(activeRows) {
     .slice(0, 30);
 }
 
-function computeBrandDigitizationStats(activeRows, dim) {
+function computeBrandDigitizationStats(activeRows, dim, allBrands = null) {
   const map = new Map();
   const isLinkedCode = (v) => {
     const s = String(v ?? '').trim();
@@ -1044,7 +1044,14 @@ function computeBrandDigitizationStats(activeRows, dim) {
     map.set(brand, cur);
   }
 
-  return Array.from(map.values())
+  // 关键：先锁定品牌全集，再按状态分桶补零，避免“品牌失踪”
+  const brands =
+    Array.isArray(allBrands) && allBrands.length
+      ? allBrands
+      : Array.from(map.keys()).filter(Boolean);
+
+  return brands
+    .map((b) => map.get(b) || { brand: b, total: 0, hasCode: 0, has3D: 0 })
     .map((x) => {
       const segment_no_code = Math.max(0, x.total - x.hasCode);
       const segment_has_code_no_3d = Math.max(0, x.hasCode - x.has3D);
@@ -1063,6 +1070,54 @@ function computeBrandDigitizationStats(activeRows, dim) {
     })
     .sort((a, b) => (b.totalEffective || 0) - (a.totalEffective || 0))
     .slice(0, 30);
+}
+
+function uniqBrandsFromInventoryRows(rows) {
+  const set = new Set();
+  for (const r of rows || []) {
+    const b = normalize(r?.brand ?? 'Unknown') || 'Unknown';
+    if (b) set.add(b);
+  }
+  return Array.from(set.values());
+}
+
+function computeBucketKPIs(rows) {
+  const isLinkedCode = (v) => {
+    const s = String(v ?? '').trim();
+    return s !== '' && s !== '-' && s !== '0';
+  };
+  const totalStyles = rows.length;
+  const matchedLasts = rows.filter((x) => Boolean(x.__has3DLast)).length;
+  const matchedSoles = rows.filter((x) => Boolean(x.__has3DSole)).length;
+  const stylesWithAny3D = rows.filter((x) => Boolean(x.__has3DAny)).length;
+  const lastCodeLinked = rows.filter((x) => isLinkedCode(x?.lastCode)).length;
+  const soleCodeLinked = rows.filter((x) => isLinkedCode(x?.soleCode)).length;
+
+  const lastCoverage = totalStyles > 0 ? Math.round((matchedLasts / totalStyles) * 100) : 0;
+  const last3DCoverage = totalStyles > 0 ? Math.round((matchedLasts / totalStyles) * 1000) / 10 : 0;
+  const soleCoverage = totalStyles > 0 ? Math.round((matchedSoles / totalStyles) * 100) : 0;
+  const sole3DCoverage = totalStyles > 0 ? Math.round((matchedSoles / totalStyles) * 1000) / 10 : 0;
+  const any3DCoveragePercent = totalStyles > 0 ? Math.round((stylesWithAny3D / totalStyles) * 100) : 0;
+  const lastCodeLinkRate = totalStyles > 0 ? Math.round((lastCodeLinked / totalStyles) * 1000) / 10 : 0;
+  const soleCodeLinkRate = totalStyles > 0 ? Math.round((soleCodeLinked / totalStyles) * 1000) / 10 : 0;
+
+  return {
+    totalStyles,
+    matchedLasts,
+    matchedSoles,
+    lastCoverage,
+    soleCoverage,
+    stylesWithAny3D,
+    any3DCoveragePercent,
+    last3DCount: matchedLasts,
+    last3DCoverage,
+    lastCodeLinked,
+    lastCodeLinkRate,
+    soleCodeLinked,
+    soleCodeLinkRate,
+    sole3DCount: matchedSoles,
+    sole3DCoverage,
+  };
 }
 
 function computeBrandBindingStats(activeRows) {
@@ -1842,49 +1897,69 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
   }
 
   const totalStyles = inventory.length;
-  const activeRows = inventory.filter((x) => x.data_status === 'active');
-  const activeStyles = activeRows.length;
-  const matchedLasts = activeRows.filter((x) => x.__has3DLast).length;
-  const matchedSoles = activeRows.filter((x) => x.__has3DSole).length;
-  const stylesWithAny3D = activeRows.filter((x) => x.__has3DAny).length;
-  const lastCoverage = activeStyles > 0 ? Math.round((matchedLasts / activeStyles) * 100) : 0;
-  const last3DCoverage = activeStyles > 0 ? Math.round((matchedLasts / activeStyles) * 1000) / 10 : 0;
-  const soleCoverage = activeStyles > 0 ? Math.round((matchedSoles / activeStyles) * 100) : 0;
-  const sole3DCoverage = activeStyles > 0 ? Math.round((matchedSoles / activeStyles) * 1000) / 10 : 0;
-  const any3DCoveragePercent = activeStyles > 0 ? Math.round((stylesWithAny3D / activeStyles) * 100) : 0;
-  const lastCodeLinkRate = activeStyles > 0 ? Math.round((lastCodeLinked / activeStyles) * 1000) / 10 : 0;
-  const soleCodeLinkRate = activeStyles > 0 ? Math.round((soleCodeLinked / activeStyles) * 1000) / 10 : 0;
 
-  // 各品牌 3D 覆盖（生效款）：linked=命中任一3D，unlinked=未命中
-  const brandCoverage = computeBrand3DCoverageStats(activeRows);
+  // 分桶：effective(active) / draft / obsolete / total
+  const allBrands = uniqBrandsFromInventoryRows(inventory);
+  const bucketTotal = inventory;
+  const bucketEffective = inventory.filter((x) => x.data_status === 'active');
+  const bucketDraft = inventory.filter((x) => x.data_status === 'draft');
+  const bucketObsolete = inventory.filter((x) => x.data_status === 'obsolete');
 
-  const brandBindingStats = computeBrandBindingStats(activeRows);
-  const lastDigitizationStats = computeBrandDigitizationStats(activeRows, 'last');
-  const soleDigitizationStats = computeBrandDigitizationStats(activeRows, 'sole');
+  const kpisTotal = computeBucketKPIs(bucketTotal);
+  const kpisEffective = computeBucketKPIs(bucketEffective);
+  const kpisDraft = computeBucketKPIs(bucketDraft);
+  const kpisObsolete = computeBucketKPIs(bucketObsolete);
+
+  const buildBucket = (rows, kpis) => ({
+    kpis,
+    lastDigitizationStats: computeBrandDigitizationStats(rows, 'last', allBrands),
+    soleDigitizationStats: computeBrandDigitizationStats(rows, 'sole', allBrands),
+  });
+
+  const statusBuckets = {
+    total: buildBucket(bucketTotal, { ...kpisTotal, statusDist }),
+    effective: buildBucket(bucketEffective, kpisEffective),
+    draft: buildBucket(bucketDraft, kpisDraft),
+    obsolete: buildBucket(bucketObsolete, kpisObsolete),
+  };
+
+  // 各品牌 3D 覆盖（为了兼容老 UI：仍默认返回“生效款”口径）
+  const brandCoverage = computeBrand3DCoverageStats(bucketEffective);
+  const brandBindingStats = computeBrandBindingStats(bucketEffective);
+  const lastDigitizationStats = statusBuckets.effective.lastDigitizationStats;
+  const soleDigitizationStats = statusBuckets.effective.soleDigitizationStats;
 
   const inventoryOut = inventory.map(({ __has3DAny, __has3DLast, __has3DSole, ...rest }) => rest);
 
   return {
     dateDirName,
+    // 新结构：按状态分组（Dashboard Tabs 直接切换）
+    statusBuckets: {
+      total: statusBuckets.total,
+      effective: statusBuckets.effective,
+      draft: statusBuckets.draft,
+      obsolete: statusBuckets.obsolete,
+    },
+    // 兼容字段：默认等价于 effective
     kpis: {
       totalStyles,
-      activeStyles,
-      matchedLasts,
-      matchedSoles,
-      lastCoverage,
-      soleCoverage,
-      stylesWithAny3D,
-      any3DCoveragePercent,
+      activeStyles: kpisEffective.totalStyles,
+      matchedLasts: kpisEffective.matchedLasts,
+      matchedSoles: kpisEffective.matchedSoles,
+      lastCoverage: kpisEffective.lastCoverage,
+      soleCoverage: kpisEffective.soleCoverage,
+      stylesWithAny3D: kpisEffective.stylesWithAny3D,
+      any3DCoveragePercent: kpisEffective.any3DCoveragePercent,
       statusDist,
-      last3DCount: matchedLasts,
-      last3DCoverage,
-      lastCodeLinked,
-      lastCodeLinkRate,
-      soleCodeLinked,
-      soleCodeLinkRate,
-      sole3DCount: matchedSoles,
-      sole3DCoverage,
-      // force-sync 实时计数（对账用）
+      last3DCount: kpisEffective.last3DCount,
+      last3DCoverage: kpisEffective.last3DCoverage,
+      lastCodeLinked: kpisEffective.lastCodeLinked,
+      lastCodeLinkRate: kpisEffective.lastCodeLinkRate,
+      soleCodeLinked: kpisEffective.soleCodeLinked,
+      soleCodeLinkRate: kpisEffective.soleCodeLinkRate,
+      sole3DCount: kpisEffective.sole3DCount,
+      sole3DCoverage: kpisEffective.sole3DCoverage,
+      // force-sync 实时计数（对账用）：仍沿用全循环累计值（便于排查）
       __forceSync: forceSyncLog
         ? {
             lastCodeLinkedCount: lastCodeLinked,
@@ -1913,6 +1988,7 @@ export async function processAllData({ storageRoot }) {
   const agg = await aggregateProjectData({ storageRoot });
   const latest = agg.latest;
   const kpis = latest.kpis;
+  const statusBuckets = latest.statusBuckets || null;
 
   const payload = {
     generatedAt: new Date().toISOString(),
@@ -1949,6 +2025,8 @@ export async function processAllData({ storageRoot }) {
       deltaMatched3DLasts: agg.deltas.matchedLasts.delta,
       deltaMatched3DSoles: agg.deltas.matchedSoles.delta,
     },
+    // 新口径：按状态分桶的 KPI + 品牌进度榜（前端 Tabs 切换直接用）
+    statusBuckets: statusBuckets || undefined,
     brandCoverage: latest.brandCoverage,
     brandBindingStats: latest.brandBindingStats || [],
     lastDigitizationStats: latest.lastDigitizationStats || [],
