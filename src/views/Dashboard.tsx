@@ -183,6 +183,15 @@ export default function Dashboard() {
     }
   };
 
+  const LEGEND_TEXT_STYLE = { color: '#334155' }; // slate-700
+  const COLORS = {
+    completed3D: '#059669', // emerald-600
+    hasCodeNo3D: '#0ea5e9', // sky-500
+    noCode: '#e2e8f0', // slate-200
+    noCodeStroke: '#cbd5e1', // slate-300
+    label: '#475569', // slate-600
+  };
+
   return (
     <div className="space-y-6 animate-in fade-in duration-500 pb-10">
       {/* Header */}
@@ -391,6 +400,9 @@ export default function Dashboard() {
                         <div className="text-white/90">已绑编号：{p.hasCode}</div>
                         <div className="text-white/90">已完成 3D：{p.has3D}</div>
                         <div className="text-white/90">完成率：{p.completionRate}%</div>
+                        <div className="text-white/90">
+                          总缺口：{Math.max(0, Number(p.totalEffective || 0) - Number(p.has3D || 0))} 款
+                        </div>
                       </div>
                     );
                   }}
@@ -398,31 +410,39 @@ export default function Dashboard() {
                 <Legend
                   iconType="circle"
                   verticalAlign="bottom"
-                  wrapperStyle={{ fontSize: '13px', paddingTop: '10px' }}
+                  wrapperStyle={{ fontSize: '13px', paddingTop: '10px', ...LEGEND_TEXT_STYLE }}
+                  formatter={(value) => <span style={LEGEND_TEXT_STYLE}>{String(value)}</span>}
                   payload={[
-                    { value: '已匹配 3D', type: 'circle', color: '#10b981' },
-                    { value: '已绑编号 (待 3D)', type: 'circle', color: '#38bdf8' },
-                    { value: '基础信息缺失 (未绑编号)', type: 'circle', color: '#e2e8f0' },
+                    { value: '已匹配 3D', type: 'circle', color: COLORS.completed3D },
+                    { value: '已绑编号 (待 3D)', type: 'circle', color: COLORS.hasCodeNo3D },
+                    { value: '基础信息缺失 (未绑编号)', type: 'circle', color: COLORS.noCode },
                   ]}
                 />
                 <Bar
                   dataKey="segment_completed_3d"
                   name="已匹配 3D"
                   stackId="a"
-                  fill="#10b981"
+                  fill={COLORS.completed3D}
                   maxBarSize={18}
                   onClick={(_, idx) => {
                     const row: any = (stats?.lastDigitizationStats || [])[idx];
                     if (row?.brand) drilldownToInventory(String(row.brand), 'last', 'completed_3d');
                   }}
                 >
-                  <LabelList dataKey="completionRate" position="right" formatter={(v: any) => `${v}%`} />
+                  <LabelList
+                    dataKey="completionRate"
+                    position="right"
+                    formatter={(v: any) => `${v}%`}
+                    fill={COLORS.label}
+                    fontSize={12}
+                    fontWeight={700}
+                  />
                 </Bar>
                 <Bar
                   dataKey="segment_has_code_no_3d"
                   name="已绑编号 (待 3D)"
                   stackId="a"
-                  fill="#38bdf8"
+                  fill={COLORS.hasCodeNo3D}
                   maxBarSize={18}
                   onClick={(_, idx) => {
                     const row: any = (stats?.lastDigitizationStats || [])[idx];
@@ -433,7 +453,9 @@ export default function Dashboard() {
                   dataKey="segment_no_code"
                   name="基础信息缺失 (未绑编号)"
                   stackId="a"
-                  fill="#e2e8f0"
+                  fill={COLORS.noCode}
+                  stroke={COLORS.noCodeStroke}
+                  strokeWidth={0.5}
                   maxBarSize={18}
                   onClick={(_, idx) => {
                     const row: any = (stats?.lastDigitizationStats || [])[idx];
@@ -469,6 +491,9 @@ export default function Dashboard() {
                         <div className="text-white/90">已绑编号：{p.hasCode}</div>
                         <div className="text-white/90">已完成 3D：{p.has3D}</div>
                         <div className="text-white/90">完成率：{p.completionRate}%</div>
+                        <div className="text-white/90">
+                          总缺口：{Math.max(0, Number(p.totalEffective || 0) - Number(p.has3D || 0))} 款
+                        </div>
                       </div>
                     );
                   }}
@@ -476,31 +501,39 @@ export default function Dashboard() {
                 <Legend
                   iconType="circle"
                   verticalAlign="bottom"
-                  wrapperStyle={{ fontSize: '13px', paddingTop: '10px' }}
+                  wrapperStyle={{ fontSize: '13px', paddingTop: '10px', ...LEGEND_TEXT_STYLE }}
+                  formatter={(value) => <span style={LEGEND_TEXT_STYLE}>{String(value)}</span>}
                   payload={[
-                    { value: '已匹配 3D', type: 'circle', color: '#10b981' },
-                    { value: '已绑编号 (待 3D)', type: 'circle', color: '#38bdf8' },
-                    { value: '基础信息缺失 (未绑编号)', type: 'circle', color: '#e2e8f0' },
+                    { value: '已匹配 3D', type: 'circle', color: COLORS.completed3D },
+                    { value: '已绑编号 (待 3D)', type: 'circle', color: COLORS.hasCodeNo3D },
+                    { value: '基础信息缺失 (未绑编号)', type: 'circle', color: COLORS.noCode },
                   ]}
                 />
                 <Bar
                   dataKey="segment_completed_3d"
                   name="已匹配 3D"
                   stackId="a"
-                  fill="#10b981"
+                  fill={COLORS.completed3D}
                   maxBarSize={18}
                   onClick={(_, idx) => {
                     const row: any = (stats?.soleDigitizationStats || [])[idx];
                     if (row?.brand) drilldownToInventory(String(row.brand), 'sole', 'completed_3d');
                   }}
                 >
-                  <LabelList dataKey="completionRate" position="right" formatter={(v: any) => `${v}%`} />
+                  <LabelList
+                    dataKey="completionRate"
+                    position="right"
+                    formatter={(v: any) => `${v}%`}
+                    fill={COLORS.label}
+                    fontSize={12}
+                    fontWeight={700}
+                  />
                 </Bar>
                 <Bar
                   dataKey="segment_has_code_no_3d"
                   name="已绑编号 (待 3D)"
                   stackId="a"
-                  fill="#38bdf8"
+                  fill={COLORS.hasCodeNo3D}
                   maxBarSize={18}
                   onClick={(_, idx) => {
                     const row: any = (stats?.soleDigitizationStats || [])[idx];
@@ -511,7 +544,9 @@ export default function Dashboard() {
                   dataKey="segment_no_code"
                   name="基础信息缺失 (未绑编号)"
                   stackId="a"
-                  fill="#e2e8f0"
+                  fill={COLORS.noCode}
+                  stroke={COLORS.noCodeStroke}
+                  strokeWidth={0.5}
                   maxBarSize={18}
                   onClick={(_, idx) => {
                     const row: any = (stats?.soleDigitizationStats || [])[idx];
