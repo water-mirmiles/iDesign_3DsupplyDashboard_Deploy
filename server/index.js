@@ -1751,7 +1751,17 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
   let goldenBlocks = null;
   let goldenSamples = [];
   let dimensionSamplesSeed = null;
-  if (goldenByDimRaw && typeof goldenByDimRaw === 'object' && !Array.isArray(goldenByDimRaw)) {
+  const isGoldenByDimEmpty =
+    goldenByDimRaw &&
+    typeof goldenByDimRaw === 'object' &&
+    !Array.isArray(goldenByDimRaw) &&
+    Object.values(goldenByDimRaw).every((b) => {
+      const tg = String(b?.targetGoal || '').trim();
+      const rows = Array.isArray(b?.rows) ? b.rows : [];
+      return !tg && rows.length === 0;
+    });
+
+  if (goldenByDimRaw && typeof goldenByDimRaw === 'object' && !Array.isArray(goldenByDimRaw) && !isGoldenByDimEmpty) {
     goldenBlocks = normalizeGoldenByDimensionForAi(goldenByDimRaw);
     goldenSamples = expandGoldenBlocksToFlatSamples(goldenBlocks);
   } else {
@@ -1790,8 +1800,10 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
     } catch {
       auditLineSync('[Audit][A] Input Audit JSON stringify failed');
     }
-    // conversationalInput 的解析必须走“DDL+描述”的动态语义抽取（禁止关键词硬匹配/预设表名）
-    // 解析将在 DDL 本地解析完成后进行，以便 Gemini 可以基于真实 DDL 做坐标锁定与轻微纠错。
+    // 强制检查：若 goldenByDimension 为空但 conversationalInput 不为空，必须先完成 chat-to-samples 提取，严禁直接进入建模回测
+    if (isGoldenByDimEmpty && conversationalInput) {
+      aiTraceLineSync('[Gate] goldenByDimension empty but conversationalInput present; will force chat-to-samples before modeling');
+    }
 
     aiTraceLineSync('[Step 2] 开始根据实体推导 SQL 关联路径...');
 
@@ -1846,6 +1858,21 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
         totalCount: total,
         parsedTables: parsedNames,
       });
+    }
+
+    // 持久化 DDL schema（供 dataEngine 在 sandbox XLSX 读取时强制对齐列名，防止把数据当表头）
+    try {
+      const schemaCachePath = path.join(__dirname, 'storage', 'ddl_schema_cache.json');
+      const tables = {};
+      for (const t of parsedTables) {
+        const tn = String(t?.tableName || '').trim();
+        const cols = Array.isArray(t?.columns) ? t.columns.map((c) => String(c?.name || '').trim()).filter(Boolean) : [];
+        if (tn) tables[tn] = cols;
+      }
+      await fse.ensureDir(path.dirname(schemaCachePath));
+      await fse.writeJson(schemaCachePath, { savedAt: new Date().toISOString(), tables }, { spaces: 2 });
+    } catch {
+      // ignore
     }
 
     // Step 1.5：基于“DDL+业务描述”的动态语义抽取（废除硬编码/关键词硬匹配）
@@ -1954,6 +1981,11 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
       } catch (e) {
         aiTraceLineSync(`[AI_REASONING] 业务描述解析异常：${e instanceof Error ? e.message : String(e)}`);
       }
+    }
+
+    if (isGoldenByDimEmpty && conversationalInput && (!goldenExpectedMap || !goldenExpectedMap.size)) {
+      aiTraceLineSync('[Gate][FAIL] conversationalInput provided but goldenExpectedMap is still empty after chat-to-samples');
+      return res.status(400).json({ ok: false, error: 'Chat-to-samples failed: cannot build goldenExpectedMap from conversationalInput' });
     }
 
     // ===========================

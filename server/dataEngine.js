@@ -686,6 +686,45 @@ function readSheetRows(fullPath) {
   const grid = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, defval: '' });
 
   const normHeader = (v) => String(v ?? '').trim().toLowerCase();
+  const looksNumericLike = (s) => {
+    const t = String(s ?? '').trim();
+    if (!t) return false;
+    return /^-?\d+(\.\d+)?$/.test(t);
+  };
+  const loadDdlSchemaCacheSync = (() => {
+    let loaded = false;
+    let cache = null;
+    return () => {
+      if (loaded) return cache;
+      loaded = true;
+      try {
+        const __filename = fileURLToPath(import.meta.url);
+        const __dirname = path.dirname(__filename);
+        const p = path.join(__dirname, 'storage', 'ddl_schema_cache.json');
+        if (!fse.existsSync(p)) return (cache = null);
+        const obj = fse.readJsonSync(p);
+        if (!obj || typeof obj !== 'object') return (cache = null);
+        return (cache = obj);
+      } catch {
+        return (cache = null);
+      }
+    };
+  })();
+
+  const isSandboxFile = (() => {
+    const p = String(fullPath || '').replace(/\\/g, '/');
+    return p.includes('/storage/sandbox/');
+  })();
+
+  const ddlColumnsForThisTable = (() => {
+    if (!isSandboxFile) return [];
+    const c = loadDdlSchemaCacheSync();
+    const logical = normalize(getLogicalTableName(path.basename(fullPath)));
+    const cols = c?.tables?.[logical];
+    if (!Array.isArray(cols)) return [];
+    return cols.map((x) => normHeader(x)).filter(Boolean);
+  })();
+
   const rowCharScore = (arr) => {
     if (!Array.isArray(arr) || !arr.length) return 0;
     let s = 0;
@@ -700,8 +739,60 @@ function readSheetRows(fullPath) {
     return arr.every((c) => String(c ?? '').trim() === '');
   };
 
-  // 精准定位表头：若第一行为空，向下扫描选“字符总量最高”的那一行作为真实表头
+  // 读取第一行判定是否为真实表头：
+  // - 若第一行包含 DDL 字段名（如 id/code/style_wms），视为表头
+  // - 否则（像数据：纯数字/中文名/Bruno Marc 等），sandbox 下强制使用 DDL 字段顺序作为表头，并将第一行归还给 rows
   let headerRowIndex = 0;
+  const firstRow = Array.isArray(grid?.[0]) ? grid[0] : [];
+  const firstRowNorm = firstRow.map(normHeader).filter(Boolean);
+  const ddlSet = new Set((ddlColumnsForThisTable || []).map(normHeader).filter(Boolean));
+  const commonKeys = new Set(['id', 'code', 'style_wms', 'brand_name', 'data_status']);
+  const ddlHit = firstRowNorm.filter((x) => ddlSet.has(x)).length;
+  const commonHit = firstRowNorm.filter((x) => commonKeys.has(x)).length;
+  const numericCells = firstRowNorm.filter((x) => looksNumericLike(x)).length;
+  const firstLooksLikeHeader = (ddlHit >= 2 || commonHit >= 2) && numericCells <= Math.max(2, Math.floor(firstRowNorm.length / 2));
+
+  // 若 sandbox 且第一行不像表头：强制 DDL 列顺序
+  if (isSandboxFile && ddlColumnsForThisTable.length && !firstLooksLikeHeader) {
+    const headers = ddlColumnsForThisTable;
+    let rows = XLSX.utils.sheet_to_json(sheet, { header: headers, raw: false, defval: '', range: 0 });
+    const styleKey = headers.includes('style_wms') ? 'style_wms' : '';
+    const normalizeCellForRow = (v) => {
+      const s = String(v ?? '');
+      const t = s.trim();
+      if (t.startsWith('["')) {
+        const candidates = [t, t.replace(/\\"/g, '"').replace(/\\\\/g, '\\')];
+        for (const c of candidates) {
+          try {
+            const parsed = JSON.parse(c);
+            if (Array.isArray(parsed)) return parsed;
+          } catch {
+            // ignore
+          }
+        }
+      }
+      return t;
+    };
+    rows = (Array.isArray(rows) ? rows : [])
+      .map((r) => {
+        const out = {};
+        for (const [k, v] of Object.entries(r || {})) out[String(k)] = normalizeCellForRow(v);
+        return out;
+      })
+      .filter((r) => {
+        const vals = Object.values(r || {});
+        const allEmpty = vals.every((v) => {
+          if (Array.isArray(v)) return v.length === 0;
+          return String(v ?? '').trim() === '';
+        });
+        if (allEmpty) return false;
+        if (styleKey && String(r?.[styleKey] ?? '').trim() === '') return false;
+        return true;
+      });
+    return { headers, rows };
+  }
+
+  // 非强制 DDL：仍采用“空行下探 + 字符总量最高”策略
   let bestScore = -1;
   const scanN = Math.min(Array.isArray(grid) ? grid.length : 0, 50);
   for (let i = 0; i < scanN; i++) {
@@ -1563,7 +1654,8 @@ export async function resolveFirstActiveRowFromFolder({
 
   // 唯一合法寻行：只允许 style_wms == targetStyle（例如 SBOX26008M）
   if (targetStyleNorm) {
-    const hit = (main.rows || []).find((r) => eqLoose(r?.[styleCol], targetStyleNorm)) || null;
+    const rowsAll = main.rows || [];
+    const hit = rowsAll.find((r) => eqLoose(r?.[styleCol], targetStyleNorm)) || rowsAll.find((r) => rowContainsTarget(r, targetStyleNorm)) || null;
     if (!hit) {
       aiTraceLineSync(`[FAIL] 无法在主表 ods_pdm_pdm_product_info_df 的 style_wms 列找到 ${targetStyleNorm}`);
       return {
