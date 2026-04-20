@@ -58,12 +58,25 @@ function buildIdToCodeIndex(tbl) {
   for (const r of tbl.rows) {
     const idv = getRowFieldLoose(r, 'id', tbl.headers);
     const codev = getRowFieldLoose(r, 'code', tbl.headers);
-    const k = String(idv ?? '').trim().toLowerCase();
+    const k = normalizeJoinIdKey(idv);
     const code = codev == null ? '' : normalize(codev);
     if (!k || !code) continue;
     if (!idx.has(k)) idx.set(k, code);
   }
   return idx;
+}
+
+function normalizeJoinIdKey(v) {
+  const raw = String(v ?? '').trim();
+  if (!raw) return '';
+  if (raw === '0') return '';
+  // 统一数字/字符串/1695.0/科学计数法等
+  const n = Number(raw);
+  if (Number.isFinite(n)) {
+    if (Math.floor(n) === n) return String(n);
+    return String(n);
+  }
+  return raw;
 }
 
 export function isTruthyActiveStatus(v) {
@@ -1528,6 +1541,7 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
   let last3DMatchedCount = 0;
   let sole3DMatchedCount = 0;
   let activeSeen = 0;
+  let matchSamplePrinted = 0;
   for (let i = 0; i < main.rows.length; i++) {
     const row = main.rows[i] || {};
     const styleVal = styleCol ? normalize(row?.[styleCol]) : '';
@@ -1547,7 +1561,11 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
         const fkCol = guessFkColumnFromMainRow(row, 'lastCode');
         if (fkCol) fk = row?.[fkCol];
       }
-      const fkKey = String(fk ?? '').trim().toLowerCase();
+      const fkRaw = String(fk ?? '').trim();
+      const fkKey = normalizeJoinIdKey(fk);
+      if (!fkKey && (fkRaw === '' || fkRaw === '0')) {
+        traceDim(`楦头空值容错：style=${styleUpper} associated_last_type=${fkRaw === '' ? '(空)' : '0'}`);
+      }
       if (wantTrace) {
         traceDim(
           `楦头处理：style=${styleUpper} 主表字段 associated_last_type=${fkKey || '(空)'}；last维表=${forcedLastTbl?.fileName || '(null)'}`
@@ -1557,14 +1575,14 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
         const code = forcedLastIndex.get(fkKey);
         if (code) {
           if (wantTrace) traceDim(`楦头处理：主表 ID ${fkKey} -> 在 base_last_df 找到行 -> 提取 code = ${code}`);
-          return { code, linked: true, fkKey };
+          return { code, linked: true, fkKey, fkRaw: fkKey };
         }
         if (wantTrace) traceDim(`楦头处理：主表 ID ${fkKey} -> 在 base_last_df 未找到行`);
       }
       // 兜底：如果维表缺失/无法命中，再尝试映射配置
       const v = resolveFast(standardMap.get('lastCode'), row, lastCol);
       if (wantTrace) traceDim(`楦头处理：fallback resolveFast => ${v || '(空)'}`);
-      return { code: v, linked: false, fkKey };
+      return { code: v, linked: false, fkKey, fkRaw: fkKey };
     })();
     const lastCodeVal = lastResolved?.code || '';
 
@@ -1574,7 +1592,11 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
         const fkCol = guessFkColumnFromMainRow(row, 'soleCode');
         if (fkCol) fk = row?.[fkCol];
       }
-      const fkKey = String(fk ?? '').trim().toLowerCase();
+      const fkRaw = String(fk ?? '').trim();
+      const fkKey = normalizeJoinIdKey(fk);
+      if (!fkKey && (fkRaw === '' || fkRaw === '0')) {
+        traceDim(`大底空值容错：style=${styleUpper} associated_sole_info=${fkRaw === '' ? '(空)' : '0'}`);
+      }
       if (wantTrace) {
         traceDim(
           `大底处理：style=${styleUpper} 主表字段 associated_sole_info=${fkKey || '(空)'}；sole维表=${forcedSoleTbl?.fileName || '(null)'}`
@@ -1584,13 +1606,13 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
         const code = forcedSoleIndex.get(fkKey);
         if (code) {
           if (wantTrace) traceDim(`大底处理：主表 ID ${fkKey} -> 在 base_mold/heel 找到行 -> 提取 code = ${code}`);
-          return { code, linked: true, fkKey };
+          return { code, linked: true, fkKey, fkRaw: fkKey };
         }
         if (wantTrace) traceDim(`大底处理：主表 ID ${fkKey} -> 在 base_mold/heel 未找到行`);
       }
       const v = resolveFast(standardMap.get('soleCode'), row, soleCol);
       if (wantTrace) traceDim(`大底处理：fallback resolveFast => ${v || '(空)'}`);
-      return { code: v, linked: false, fkKey };
+      return { code: v, linked: false, fkKey, fkRaw: fkKey };
     })();
     const soleCodeVal = soleResolved?.code || '';
     const colorCodeVal = resolveFast(standardMap.get('colorCode'), row, colorCol);
@@ -1634,6 +1656,11 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
       if (soleResolved?.linked) soleCodeLinked += 1;
       if (has3DLast) last3DMatchedCount += 1;
       if (has3DSole) sole3DMatchedCount += 1;
+      if (forceSyncLog && lastResolved?.linked && matchSamplePrinted < 5) {
+        matchSamplePrinted += 1;
+        // eslint-disable-next-line no-console
+        console.log(`Match Success: ${String(lastResolved.fkRaw || lastResolved.fkKey || '').trim()} -> ${String(lastResolved.code || '').trim()}`);
+      }
       if (forceSyncLog && activeSeen % 200 === 0) {
         // eslint-disable-next-line no-console
         console.log(`[ForceSync] 正在处理生产表，当前已绑定编号：${lastCodeLinked} 行`);

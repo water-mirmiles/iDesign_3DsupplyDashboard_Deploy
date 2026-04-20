@@ -211,7 +211,9 @@ export default function InventoryList() {
       out = out.filter((item) => {
         const style = String(item.style_wms || '').toLowerCase();
         const brand = String(item.brand || '').toLowerCase();
-        return style.includes(q) || brand.includes(q);
+        const lastCode = String(item.lastCode || '').toLowerCase();
+        const soleCode = String(item.soleCode || '').toLowerCase();
+        return style.includes(q) || brand.includes(q) || lastCode.includes(q) || soleCode.includes(q);
       });
     }
     if (has3DFilter === 'all') return out;

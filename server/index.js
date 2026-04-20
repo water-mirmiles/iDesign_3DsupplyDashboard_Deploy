@@ -3399,6 +3399,40 @@ app.get('/api/inventory-real', async (req, res) => {
       brand_name: it.brand,
       status: it.data_status,
     }));
+
+    // 若 lastCode 命中率过低（<5%），自动触发一次强制重算（并输出 Match Success 前 5 条）
+    const noAuto = String(req.query?.noAuto || '') === '1';
+    if (!noAuto) {
+      const act = items.filter((x) => x?.data_status === 'active');
+      const linked = act.filter((x) => {
+        const v = String(x?.lastCode ?? '').trim();
+        return v !== '' && v !== '-';
+      }).length;
+      const rate = act.length > 0 ? linked / act.length : 0;
+      if (act.length > 0 && rate < 0.05) {
+        // eslint-disable-next-line no-console
+        console.log(`[Prod-Engine] inventory-real detected low lastCode link rate ${(rate * 100).toFixed(2)}% (${linked}/${act.length}); auto force recalc...`);
+        await forceSyncLatestProduction({ storageRoot: STORAGE_ROOT });
+        const payload = await processAllData({ storageRoot: STORAGE_ROOT });
+        await persistFinalDashboardData(STORAGE_ROOT, payload);
+        const rebuilt = (payload.inventory || []).map((it) => ({
+          ...it,
+          brand_name: it.brand,
+          status: it.data_status,
+        }));
+        return res.json({
+          ok: true,
+          source: 'final_dashboard_data',
+          generatedAt: payload.generatedAt,
+          dates: payload.dates,
+          mapping: payload.mapping,
+          meta: payload.meta,
+          items: rebuilt,
+          autoRecalculated: true,
+        });
+      }
+    }
+
     return res.json({
       ok: true,
       source: 'final_dashboard_data',
