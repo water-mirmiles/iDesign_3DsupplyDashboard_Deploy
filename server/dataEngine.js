@@ -100,9 +100,8 @@ export function isTruthyActiveStatus(v) {
 function normalizeInventoryStatus(v) {
   const raw = normalize(v);
   const s = raw.toLowerCase();
-  if (!s) return 'draft';
 
-  // 作废（显式编码 + 关键字）
+  // 作废（显式编码 + 关键字，含「已作废」等含「作废」的写法）
   if (s === '9' || s === '99' || s === '-1') return 'obsolete';
   if (
     s.includes('obsolete') ||
@@ -120,8 +119,52 @@ function normalizeInventoryStatus(v) {
   // 草稿
   if (s === '0' || s.includes('draft') || s.includes('草稿')) return 'draft';
 
-  // 未知默认草稿（避免误算为生效）
-  return 'draft';
+  // 未命中生效且未命中草稿 → 作废/其他（含空值、未知码），保证三态完备、不丢弃分类
+  return 'obsolete';
+}
+
+/** 主表状态列原始值普查（不限于有款号的行） */
+function formatRawStatusLabel(v) {
+  if (v === undefined || v === null) return '(null)';
+  const t = String(v).trim();
+  return t === '' ? '(空)' : t;
+}
+
+function auditMainTableRawStatusDistribution(main, statusCol) {
+  const counts = new Map();
+  const rows = main?.rows || [];
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i] || {};
+    const raw = statusCol ? row[statusCol] : undefined;
+    const label = formatRawStatusLabel(raw);
+    counts.set(label, (counts.get(label) || 0) + 1);
+  }
+  const rawStatusAudit = Array.from(counts.entries())
+    .map(([value, rowCount]) => ({ value, rowCount }))
+    .sort((a, b) => b.rowCount - a.rowCount);
+  return rawStatusAudit;
+}
+
+function printRawStatusAuditTable(rawStatusAudit, main, statusCol) {
+  const physical = main?.rows?.length || 0;
+  let sum = 0;
+  // eslint-disable-next-line no-console
+  console.log('--- 原始状态对账单 ---');
+  // eslint-disable-next-line no-console
+  console.log(
+    `主表：${main?.fileName || '(unknown)'} ｜ 物理行数：${physical} ｜ 状态列：${statusCol || '(未映射)'}`
+  );
+  for (const { value, rowCount } of rawStatusAudit) {
+    sum += rowCount;
+    // eslint-disable-next-line no-console
+    console.log(`[${value}] -> ${rowCount} 行`);
+  }
+  // eslint-disable-next-line no-console
+  console.log('--------------------');
+  if (sum !== physical) {
+    // eslint-disable-next-line no-console
+    console.warn(`[Engine] 原始状态计数合计 ${sum} 与物理行 ${physical} 不一致`);
+  }
 }
 
 function safeJsonRead(filePath) {
@@ -1746,6 +1789,10 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
     return out == null ? '' : normalize(out);
   };
 
+  // aggregateFinalDashboardData 等价入口：入库前强制原始状态普查（全表物理行，无过滤）
+  const rawStatusAudit = auditMainTableRawStatusDistribution(main, statusCol);
+  printRawStatusAuditTable(rawStatusAudit, main, statusCol);
+
   const inventory = [];
   const statusDist = { active: 0, draft: 0, obsolete: 0 };
   let traceFailCount = 0;
@@ -1919,16 +1966,8 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
 
   const totalStyles = inventory.length;
 
-  const allRows = inventory;
   // eslint-disable-next-line no-console
-  console.log('Unique Statuses Found:', [...new Set(allRows.map((r) => r.data_status))]);
-  const rawStatusUniq = new Set();
-  for (const row of main.rows) {
-    if (styleCol && !normalize(row?.[styleCol])) continue;
-    rawStatusUniq.add(String(statusCol ? row?.[statusCol] ?? '' : '').trim());
-  }
-  // eslint-disable-next-line no-console
-  console.log('Unique Raw Status Values:', [...rawStatusUniq]);
+  console.log('归一化状态桶（仅含已入库款号行）：', [...new Set(inventory.map((r) => r.data_status))]);
 
   // 分桶：effective(active) / draft / obsolete / total（total = 全量，不按状态过滤）
   const allBrands = uniqBrandsFromInventoryRows(inventory);
@@ -2006,12 +2045,15 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
     lastDigitizationStats,
     soleDigitizationStats,
     inventory: inventoryOut,
+    rawStatusAudit,
     meta: {
       mainTable: main.fileName,
       requiredCols: required,
       mainRowCount: main.rows?.length || 0,
       source: 'data_tables',
       uniqueBrandCount: allBrands.length,
+      dataStatusColumn: statusCol || null,
+      rawStatusAudit,
     },
   };
 }
@@ -2078,6 +2120,7 @@ export async function processAllData({ storageRoot }) {
         months: 12,
       }),
     },
+    rawStatusAudit: latest.rawStatusAudit || latest.meta?.rawStatusAudit || [],
   };
 
   // eslint-disable-next-line no-console

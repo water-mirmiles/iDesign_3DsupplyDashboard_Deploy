@@ -3262,6 +3262,7 @@ app.get('/api/dashboard-stats', async (req, res) => {
         lastDigitizationStats: payload.lastDigitizationStats || [],
         soleDigitizationStats: payload.soleDigitizationStats || [],
         trends: payload.trends || {},
+        rawStatusAudit: payload.rawStatusAudit || payload.meta?.rawStatusAudit || [],
       });
     }
 
@@ -3281,6 +3282,7 @@ app.get('/api/dashboard-stats', async (req, res) => {
       lastDigitizationStats: snap.lastDigitizationStats || [],
       soleDigitizationStats: snap.soleDigitizationStats || [],
       trends: snap.trends || {},
+      rawStatusAudit: snap.rawStatusAudit || snap.meta?.rawStatusAudit || [],
     });
 
   } catch (e) {

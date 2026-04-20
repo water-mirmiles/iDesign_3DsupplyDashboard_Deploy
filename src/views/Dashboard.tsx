@@ -13,7 +13,14 @@ type DashboardStatsResponse = {
   generatedAt?: string;
   dates: { latest: string; prev: string };
   mapping: { hasConfig: boolean; configPath: string };
-  meta: { mainTable: string | null; requiredCols?: string[]; reason?: string; uniqueBrandCount?: number };
+  meta: {
+    mainTable: string | null;
+    requiredCols?: string[];
+    reason?: string;
+    uniqueBrandCount?: number;
+    dataStatusColumn?: string | null;
+    rawStatusAudit?: Array<{ value: string; rowCount: number }>;
+  };
   kpis: {
     styles?: { totalAll: number; totalEffective: number };
     activeStyles: number;
@@ -75,6 +82,8 @@ type DashboardStatsResponse = {
   }>;
   trends?: { assetTrend?: AssetTrendStats[] };
   inventory?: Array<any>;
+  /** 主表状态列原始值普查（全表物理行） */
+  rawStatusAudit?: Array<{ value: string; rowCount: number }>;
   error?: string;
 };
 
@@ -124,6 +133,12 @@ export default function Dashboard() {
 
   const [trendPeriod, setTrendPeriod] = useState<TimePeriod>('week');
   const [chartData, setChartData] = useState<AssetTrendStats[]>([]);
+
+  const rawStatusCategoriesDebug = useMemo(() => {
+    const audit = stats?.rawStatusAudit?.length ? stats.rawStatusAudit : stats?.meta?.rawStatusAudit;
+    if (!audit?.length) return '';
+    return audit.map((x) => x.value).join(', ');
+  }, [stats?.rawStatusAudit, stats?.meta?.rawStatusAudit]);
 
   const brandTotalAll = useMemo(() => {
     const inv = stats?.inventory || [];
@@ -190,7 +205,7 @@ export default function Dashboard() {
     if (!sb) return fallback;
     if (statusScope === 'effective') return eff || fallback;
     if (statusScope === 'includeDraft') return merge(eff, dra);
-    // 全量池：必须用 total 分桶（含作废），避免回落到仅生效的顶层 kpis
+    // 全量池：必须用 statusBuckets.total（含作废），禁止误用 draft 或仅生效的顶层 kpis
     const t = tot;
     if (t && typeof t.totalStyles === 'number') {
       return {
@@ -518,6 +533,11 @@ export default function Dashboard() {
                     : '所有状态（含作废）'}
               </span>
             </div>
+            {rawStatusCategoriesDebug ? (
+              <div className="mt-2 text-[11px] leading-snug text-amber-800/90 bg-amber-50/80 border border-amber-100 rounded px-2 py-1 font-mono break-all">
+                Raw Status Categories: [{rawStatusCategoriesDebug}]
+              </div>
+            ) : null}
           </div>
         </div>
 
