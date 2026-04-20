@@ -42,10 +42,10 @@ type DashboardStatsResponse = {
     brand: string;
     lastBindingRate: number;
     soleBindingRate: number;
-    totalActive: number;
-    lastLinkedCount: number;
-    soleLinkedCount: number;
-    last3DMatchedCount: number;
+    totalEffective: number;
+    lastLinked: number;
+    soleLinked: number;
+    last3DMatched: number;
   }>;
   trends?: { assetTrend?: AssetTrendStats[] };
   error?: string;
@@ -391,7 +391,6 @@ export default function Dashboard() {
           <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm flex flex-col">
             <div className="flex justify-between items-center mb-6">
               <h3 className="text-base font-semibold text-slate-900">各品牌基础数据绑定率 (Data Completeness)</h3>
-              <span className="text-xs text-slate-500">点击品牌跳转清单</span>
             </div>
             <div className="flex-1 min-h-[400px] w-full">
               <ResponsiveContainer width="100%" height="100%">
@@ -420,11 +419,12 @@ export default function Dashboard() {
                       if (!active || !payload?.length) return null;
                       const p: any = payload?.[0]?.payload || {};
                       return (
-                        <div className="rounded-lg border border-slate-200 bg-white shadow-sm px-3 py-2 text-xs text-slate-700">
-                          <div className="font-medium text-slate-900 mb-1">{p.brand}</div>
-                          <div>该品牌总生效款：{p.totalActive ?? '-'}</div>
-                          <div>已绑定楦：{p.lastLinkedCount ?? '-'}</div>
-                          <div>已匹配 3D：{p.last3DMatchedCount ?? '-'}</div>
+                        <div className="rounded-lg border border-slate-700 bg-slate-900/90 shadow-sm px-3 py-2 text-xs text-white">
+                          <div className="font-medium text-white mb-1">{p.brand}</div>
+                          <div className="text-white/90">该品牌总生效款：{p.totalEffective ?? '-'}</div>
+                          <div className="text-white/90">已绑定楦：{p.lastLinked ?? '-'}</div>
+                          <div className="text-white/90">已绑定底：{p.soleLinked ?? '-'}</div>
+                          <div className="text-white/90">已匹配 3D：{p.last3DMatched ?? '-'}</div>
                         </div>
                       );
                     }}

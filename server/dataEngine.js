@@ -1046,12 +1046,13 @@ function computeBrandBindingStats(activeRows) {
       brand: x.brand,
       lastBindingRate: x.totalActive > 0 ? Math.round((x.lastLinkedCount / x.totalActive) * 1000) / 10 : 0,
       soleBindingRate: x.totalActive > 0 ? Math.round((x.soleLinkedCount / x.totalActive) * 1000) / 10 : 0,
-      totalActive: x.totalActive,
-      lastLinkedCount: x.lastLinkedCount,
-      soleLinkedCount: x.soleLinkedCount,
-      last3DMatchedCount: x.last3DMatchedCount,
+      // 语义化字段（供 Dashboard Tooltip 直读）
+      totalEffective: x.totalActive,
+      lastLinked: x.lastLinkedCount,
+      soleLinked: x.soleLinkedCount,
+      last3DMatched: x.last3DMatchedCount,
     }))
-    .sort((a, b) => b.totalActive - a.totalActive)
+    .sort((a, b) => (b.totalEffective || 0) - (a.totalEffective || 0))
     .slice(0, 30);
 }
 
