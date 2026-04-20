@@ -90,7 +90,7 @@ async function readFinalDashboardSnapshot() {
 // ============================
 const VERTEX_PROJECT_ID = 'idesign-3dsupplydashboard';
 const VERTEX_LOCATION = 'us-central1';
-const VERTEX_MODEL = 'gemini-1.5-flash-002';
+const VERTEX_MODEL = 'gemini-1.5-flash';
 const MODEL_PRIORITY = [VERTEX_MODEL];
 
 function ensureVertexCredentialsEnv() {
@@ -330,6 +330,20 @@ async function generateContentVertex({ prompt }) {
       '';
     return { text: String(text || '') };
   } catch (e) {
+    const resourcePublisherPath = `projects/${VERTEX_PROJECT_ID}/locations/${VERTEX_LOCATION}/publishers/google/models/${VERTEX_MODEL}`;
+    const resourceModelsPath = `projects/${VERTEX_PROJECT_ID}/locations/${VERTEX_LOCATION}/models/${VERTEX_MODEL}`;
+    const status = getHttpStatusFromGeminiError(e);
+    if (status === 404 || String(e?.message || '').includes('404')) {
+      // eslint-disable-next-line no-console
+      console.error('[vertex][404] model not found', {
+        model: VERTEX_MODEL,
+        project: VERTEX_PROJECT_ID,
+        location: VERTEX_LOCATION,
+        resourcePublisherPath,
+        resourceModelsPath,
+        message: String(e?.message || ''),
+      });
+    }
     // 提示更友好的鉴权错误
     const msg = String(e?.message || '');
     if (!process.env.GOOGLE_APPLICATION_CREDENTIALS && !fse.existsSync(vertexKeyPath)) {
@@ -1254,7 +1268,8 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
     // Vertex AI：固定锁定企业版稳定模型；失败则本地兜底
     const modelList = [VERTEX_MODEL];
     const prompt = [
-      '你是一个专业的 ETL 配置员。你的任务：把用户的大白话业务案例，提取为“动态黄金样本配置（dimensionSamples）”。',
+      '你是一个“坐标级业务实体提取引擎”。用户会给你一段包含【表名】【字段名】【值】的描述。',
+      '你的唯一任务：为 7 个标准维度提取精确坐标（tableName/fieldName/value），并输出为 dimensionSamples JSON。',
       '',
       '标准维度（standardKey）固定为以下 7 个：',
       '- styleCode (款号)',
@@ -1265,6 +1280,18 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
       '- materialCode (材质)',
       '- status (状态)',
       '',
+      '【强制匹配规则（必须遵守）】',
+      '1) 若用户提到了具体表名（例如 ods_wms_base_brand_df），你必须 100% 使用该表名，严禁改写/归类到主表或其他表。',
+      '2) 若用户提到了具体字段名（例如 brand_name），你必须 100% 使用该字段名，严禁替换为 id/code 等其他字段。',
+      '3) 你严禁臆造不存在的表名/字段名：若不确定，请留空字符串 ""，但不要猜。',
+      '4) 表名必须严格来自 DDL 表名清单（若用户写的表名不在清单中，仍原样输出该表名，并在 notes 说明“表名不在 DDL 清单”。）',
+      '',
+      '【拼接处理（必须做对）】',
+      '若用户描述材质为“LT + 04”或“由 LT 和 04 拼成”，你必须在 materialCode.rows[0].segments 中返回两个 segments，顺序必须与用户描述一致：',
+      '- segments[0].value = "LT"',
+      '- segments[1].value = "04"',
+      '并把 materialCode.targetGoal 写为 "LT04"（无分隔符）。',
+      '',
       '输出必须是严格 JSON 对象（不要 Markdown，不要解释），结构必须与前端 dimensionSamples 状态一致：',
       '{',
       '  "styleCode": { "targetGoal": "", "rows": [ { "id": "可省略", "notes": "", "segments": [ { "tableName": "", "fieldName": "", "value": "" } ] } ] },',
@@ -1272,15 +1299,8 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
       '  ... 其余维度 ...',
       '}',
       '',
-      '规则：',
-      '1) 你可以把用户描述中的“期望结果”写入 targetGoal（例如材质 LT04）。',
-      '2) rows 表示该维度的“样本行”。每行可带 notes（逻辑备注/线索）。',
-      '3) segments 表示该行的“物理取值分段”。',
-      '4) 【特别注意复合逻辑】如果用户提到“拼接/合成/父子/由X和Y组成”，请在同一维度下返回多行 rows（每一行对应一个分段），并在 notes 中清晰写明“父/子/拼接顺序”。',
-      '5) tableName 与 fieldName 若用户未明确指出，必须留空字符串（不要胡编表名字段名）。前端会基于 DDL 自动检索补全。',
-      '',
-      masterTable ? `业务主表（供参考，不要臆造字段）：${masterTable}` : '',
-      tableNames.length ? `DDL 表名清单（供参考，不要臆造）：${tableNames.join(', ')}` : '',
+      masterTable ? `业务主表（仅供参考）：${masterTable}` : '',
+      tableNames.length ? `DDL 表名清单（权威）：${tableNames.join(', ')}` : '',
       '',
       '用户描述：',
       text,

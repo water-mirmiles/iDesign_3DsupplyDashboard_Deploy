@@ -1540,6 +1540,11 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                       setChatToConfigBusy(true);
                       setError(null);
                       try {
+                        // 若 Step1 DDL 尚未解析进内存：先强制解析，保证下拉数据源不为空
+                        if (String(ddlText || '').trim() && Object.keys(parsedTableMap || {}).length === 0) {
+                          await runParseDdlSchema(ddlText, 'manual');
+                        }
+
                         const resp = await fetch(`${API_BASE}/api/parse-chat-to-samples`, {
                           method: 'POST',
                           headers: { 'Content-Type': 'application/json' },
@@ -1555,40 +1560,69 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                         const ds = json.dimensionSamples && typeof json.dimensionSamples === 'object' ? (json.dimensionSamples as any) : null;
                         if (!ds) throw new Error('AI 返回的 dimensionSamples 为空');
 
-                        // 自动补全 tableName/fieldName：基于 Step1 解析出的 DDL 字段做快速启发式匹配
-                        const next: DimensionSamplesState = createEmptyDimensionSamples();
-                        for (const f of initialStandardFields) {
-                          const k = f.standardKey;
-                          const blk = ds[k] && typeof ds[k] === 'object' ? ds[k] : { targetGoal: '', rows: [] };
-                          const targetGoal = String(blk?.targetGoal || '');
-                          const rowsRaw = Array.isArray(blk?.rows) ? blk.rows : [];
-                          const suggestion = suggestTableFieldFromDdl(parsedTableMap, k);
-                          const rows = rowsRaw
-                            .map((r: any) => {
-                              const notes = String(r?.notes || '');
-                              const id = String(r?.id || '') || newGoldenRowId();
+                        // 若 AI 提取的 tableName 在 DDL 中存在，但当前 parsedTableMap 缺失：再强制刷新一次 DDL 解析
+                        try {
+                          const mentioned = new Set<string>();
+                          for (const f of initialStandardFields) {
+                            const k = f.standardKey;
+                            const blk = ds[k] && typeof ds[k] === 'object' ? ds[k] : null;
+                            const rowsRaw = Array.isArray(blk?.rows) ? blk.rows : [];
+                            for (const r of rowsRaw) {
                               const segs = Array.isArray(r?.segments) ? r.segments : [];
-                              const segments = segs.map((s: any) => {
-                                const value = String(s?.value ?? '');
-                                const tableName = String(s?.tableName || '').trim() || suggestion.tableName;
-                                const fieldName = String(s?.fieldName || '').trim() || suggestion.fieldName;
-                                return { tableName, fieldName, value };
-                              });
-                              return {
-                                id,
-                                notes,
-                                segments: segments.length
-                                  ? segments
-                                  : [{ tableName: suggestion.tableName, fieldName: suggestion.fieldName, value: '' }],
-                              };
-                            })
-                            .filter(
-                              (r: any) =>
-                                Array.isArray(r.segments) && r.segments.some((s: any) => String(s?.value || '').trim() !== '')
-                            );
-                          next[k] = { targetGoal, rows };
+                              for (const s of segs) {
+                                const tn = String(s?.tableName || '').trim();
+                                if (tn) mentioned.add(tn);
+                              }
+                            }
+                          }
+                          const missing = Array.from(mentioned).filter((tn) => !(tn in (parsedTableMap || {})));
+                          if (missing.length && String(ddlText || '').trim()) {
+                            await runParseDdlSchema(ddlText, 'manual');
+                          }
+                        } catch {
+                          // ignore
                         }
-                        setDimensionSamples(next);
+
+                        // 自动补全 tableName/fieldName：基于 Step1 解析出的 DDL 字段做快速启发式匹配
+                        setDimensionSamples((prev) => {
+                          const next: DimensionSamplesState = { ...(prev || createEmptyDimensionSamples()) };
+                          for (const f of initialStandardFields) {
+                            const k = f.standardKey;
+                            const blk = ds[k] && typeof ds[k] === 'object' ? ds[k] : null;
+                            const targetGoal = typeof blk?.targetGoal === 'string' ? String(blk.targetGoal || '') : '';
+                            const rowsRaw = Array.isArray(blk?.rows) ? blk.rows : [];
+                            const suggestion = suggestTableFieldFromDdl(parsedTableMap, k);
+                            const rows = rowsRaw
+                              .map((r: any) => {
+                                const notes = String(r?.notes || '');
+                                const id = String(r?.id || '') || newGoldenRowId();
+                                const segs = Array.isArray(r?.segments) ? r.segments : [];
+                                const segments = segs.map((s: any) => {
+                                  const value = String(s?.value ?? '');
+                                  const tableName = String(s?.tableName || '').trim() || suggestion.tableName;
+                                  const fieldName = String(s?.fieldName || '').trim() || suggestion.fieldName;
+                                  return { tableName, fieldName, value };
+                                });
+                                return {
+                                  id,
+                                  notes,
+                                  segments: segments.length
+                                    ? segments
+                                    : [{ tableName: suggestion.tableName, fieldName: suggestion.fieldName, value: '' }],
+                                };
+                              })
+                              .filter(
+                                (r: any) =>
+                                  Array.isArray(r.segments) && r.segments.some((s: any) => String(s?.value || '').trim() !== '')
+                              );
+
+                            // 坐标级回填：只覆盖 AI 明确提取到的维度；未提及的维度保持用户原状态（严禁重置）
+                            if (rows.length || String(targetGoal || '').trim()) {
+                              next[k] = { targetGoal, rows };
+                            }
+                          }
+                          return next;
+                        });
                         setReviewTweakOpen(false);
 
                         // 直接触发 AI 建模（串行维度 + 回测闭环）
