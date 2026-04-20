@@ -38,6 +38,13 @@ type TableSamplesResponse = {
   samples: Record<string, string[]>;
 };
 
+type ListSandboxResponse = {
+  ok: boolean;
+  dir?: string;
+  files?: string[];
+  error?: string;
+};
+
 type MappingPart = {
   sourceField: string;
   sourceTable: string;
@@ -600,6 +607,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
   const [hasAttemptedAuth, setHasAttemptedAuth] = useState(false);
 
   const [isUploadingSandbox, setIsUploadingSandbox] = useState(false);
+  const [sandboxFiles, setSandboxFiles] = useState<string[]>([]);
 
   const [authSyncing, setAuthSyncing] = useState(false);
   const [certifyEngineRunning, setCertifyEngineRunning] = useState(false);
@@ -913,10 +921,29 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
     return set;
   }, [tables]);
 
-  const detectedTableCount = useMemo(() => {
-    const m = String(ddlText || '').match(/create\s+table\b/gi);
-    return m ? m.length : 0;
-  }, [ddlText]);
+  const detectedTableCount = useMemo(() => sandboxFiles.length, [sandboxFiles]);
+
+  const refreshSandboxFiles = useCallback(async () => {
+    try {
+      const resp = await fetch(`${API_BASE}/api/list-sandbox`);
+      if (!resp.ok) throw new Error(`获取沙盒列表失败（HTTP ${resp.status}）`);
+      const json = (await resp.json().catch(() => null)) as ListSandboxResponse | null;
+      if (!json?.ok) throw new Error(json?.error || '获取沙盒列表失败');
+      const files = Array.isArray(json.files) ? json.files.map((x) => String(x || '').trim()).filter(Boolean) : [];
+      setSandboxFiles(files);
+      setSelectedFile((prev) => {
+        if (prev && files.includes(prev)) return prev;
+        return files[0] || '';
+      });
+      if (!files.length) {
+        setTables({});
+        setSamples({});
+        setLatestDir('sandbox');
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '获取沙盒列表失败');
+    }
+  }, []);
 
   const activeField = useMemo(() => {
     return standardFields.find((f) => f.standardKey === activeFieldKey) || standardFields[0];
@@ -1009,8 +1036,8 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
       if (!json.ok) throw new Error('获取表头失败');
       setTables(json.tables || {});
       setLatestDir(json.latestDir || '');
-      const firstFile = Object.keys(json.tables || {})[0] || '';
-      setSelectedFile((prev) => prev || firstFile);
+      const firstFile = sandboxFiles[0] || Object.keys(json.tables || {})[0] || '';
+      setSelectedFile((prev) => (prev ? prev : firstFile));
     } catch (e) {
       setError(e instanceof Error ? e.message : '获取表头失败');
     }
@@ -1029,6 +1056,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
       if (!resp.ok) throw new Error(`上传失败（HTTP ${resp.status}）`);
       const json = (await resp.json().catch(() => null)) as any;
       if (!json?.ok) throw new Error(json?.error || '上传失败');
+      await refreshSandboxFiles();
       await refreshHeaders();
     } catch (err) {
       setError(err instanceof Error ? err.message : '上传失败');
@@ -1052,6 +1080,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
   };
 
   useEffect(() => {
+    void refreshSandboxFiles();
     void refreshHeaders();
   }, []);
 
@@ -1451,12 +1480,12 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                 <div className="text-[11px] text-slate-600">
                   最新目录：<span className="font-mono text-slate-800">{latestDir || '-'}</span>
                   <span className="mx-2 text-slate-300">|</span>
-                  文件数：<span className="font-mono text-slate-800">{Object.keys(tables || {}).length}</span>
+                  文件数：<span className="font-mono text-slate-800">{sandboxFiles.length}</span>
                 </div>
                 <div className="max-h-[260px] overflow-y-auto border border-slate-200 rounded-lg bg-white">
-                  {Object.keys(tables || {}).length ? (
+                  {sandboxFiles.length ? (
                     <div className="divide-y divide-slate-100">
-                      {Object.keys(tables || {}).map((fileName) => (
+                      {sandboxFiles.map((fileName) => (
                         <button
                           key={fileName}
                           type="button"
@@ -1475,7 +1504,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                       ))}
                     </div>
                   ) : (
-                    <div className="p-3 text-[11px] text-slate-500">暂无文件。请先上传，或检查 `server/storage/sandbox`。</div>
+                    <div className="p-3 text-[11px] text-slate-600">⚠️ 沙盒目录为空，请上传样本 XLSX</div>
                   )}
                 </div>
               </div>
@@ -2335,11 +2364,11 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                   <div className="grid grid-cols-12 gap-2">
                     <div className="col-span-12 xl:col-span-4 border border-slate-200 rounded-lg bg-white overflow-hidden">
                       <div className="px-3 py-2 border-b border-slate-200 text-[11px] text-slate-600 bg-slate-50">
-                        表（{Object.keys(tables || {}).length}）
+                        表（{sandboxFiles.length}）
                       </div>
                       <div className="max-h-[240px] overflow-y-auto p-2 space-y-1">
-                        {Object.keys(tables || {}).length ? (
-                          Object.keys(tables || {}).map((fileName) => (
+                        {sandboxFiles.length ? (
+                          sandboxFiles.map((fileName) => (
                             <button
                               key={fileName}
                               type="button"
@@ -2357,7 +2386,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                             </button>
                           ))
                         ) : (
-                          <div className="text-[11px] text-slate-500 p-2">暂无生产表头（如果你刚启动服务，请稍等或刷新页面）。</div>
+                          <div className="text-[11px] text-slate-600 p-2">⚠️ 沙盒目录为空，请上传样本 XLSX</div>
                         )}
                       </div>
                     </div>

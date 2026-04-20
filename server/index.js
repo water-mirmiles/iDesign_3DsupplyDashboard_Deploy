@@ -883,6 +883,29 @@ app.get('/api/assets', async (_req, res) => {
   res.json(assets);
 });
 
+// 实时扫描沙盒目录：用于 SchemaMapping 左侧文件列表（禁止 hardcode）
+app.get('/api/list-sandbox', (_req, res) => {
+  try {
+    const sandboxDir = path.join(__dirname, 'storage', 'sandbox');
+    let files = [];
+    try {
+      files = fs.readdirSync(sandboxDir, { withFileTypes: true });
+    } catch {
+      files = [];
+    }
+    const excel = (files || [])
+      .filter((e) => e && typeof e === 'object' && e.isFile && e.isFile())
+      .map((e) => e.name)
+      .filter((n) => isExcelFileName(n))
+      .sort();
+    // eslint-disable-next-line no-console
+    console.log(`[Storage] 物理扫描 Sandbox 目录完成，共发现 ${excel.length} 个真实文件。`);
+    return res.json({ ok: true, dir: 'storage/sandbox', files: excel });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e instanceof Error ? e.message : 'list sandbox failed' });
+  }
+});
+
 function normalizeScope(scope) {
   const s = String(scope || '').trim().toLowerCase();
   if (s === 'sandbox') return 'sandbox';
