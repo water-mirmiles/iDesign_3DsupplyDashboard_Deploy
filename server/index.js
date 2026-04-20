@@ -320,6 +320,15 @@ function buildPriorityFromAvailable(available) {
 
 async function generateContentVertex({ prompt }) {
   const p = String(prompt || '');
+  const resourcePublisherPath = `projects/${VERTEX_PROJECT_ID}/locations/${VERTEX_LOCATION}/publishers/google/models/${VERTEX_MODEL}`;
+  const resourceModelsPath = `projects/${VERTEX_PROJECT_ID}/locations/${VERTEX_LOCATION}/models/${VERTEX_MODEL}`;
+  if (!generateContentVertex._printedVertexModelPath) {
+    generateContentVertex._printedVertexModelPath = true;
+    // eslint-disable-next-line no-console
+    console.log('[vertex] model resource path check:', resourcePublisherPath);
+    // eslint-disable-next-line no-console
+    console.log('[vertex] alt resource path (for verification):', resourceModelsPath);
+  }
   try {
     const result = await vertexModel.generateContent({
       contents: [{ role: 'user', parts: [{ text: p }] }],
@@ -330,8 +339,6 @@ async function generateContentVertex({ prompt }) {
       '';
     return { text: String(text || '') };
   } catch (e) {
-    const resourcePublisherPath = `projects/${VERTEX_PROJECT_ID}/locations/${VERTEX_LOCATION}/publishers/google/models/${VERTEX_MODEL}`;
-    const resourceModelsPath = `projects/${VERTEX_PROJECT_ID}/locations/${VERTEX_LOCATION}/models/${VERTEX_MODEL}`;
     const status = getHttpStatusFromGeminiError(e);
     if (status === 404 || String(e?.message || '').includes('404')) {
       // eslint-disable-next-line no-console
@@ -1267,9 +1274,19 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
 
     // Vertex AI：固定锁定企业版稳定模型；失败则本地兜底
     const modelList = [VERTEX_MODEL];
+    const ddlSchemaCompact = ddlTables.map((t) => ({
+      tableName: String(t?.tableName || '').trim(),
+      columns: Array.isArray(t?.columns)
+        ? t.columns
+            .map((c) => ({ name: String(c?.name || '').trim(), comment: String(c?.comment || '') }))
+            .filter((c) => c.name)
+            .slice(0, 200)
+        : [],
+    }));
     const prompt = [
-      '你是一个“坐标级业务实体提取引擎”。用户会给你一段包含【表名】【字段名】【值】的描述。',
-      '你的唯一任务：为 7 个标准维度提取精确坐标（tableName/fieldName/value），并输出为 dimensionSamples JSON。',
+      '你是一个 SQL 专家，也是一个“坐标级业务实体提取引擎”。',
+      '输入包含：1) DDL 表结构（17 张表）；2) 用户的一段业务描述。',
+      '你的唯一任务：为 7 个标准维度提取精确坐标（standardKey + tableName/fieldName/value），并输出为 dimensionSamples JSON。',
       '',
       '标准维度（standardKey）固定为以下 7 个：',
       '- styleCode (款号)',
@@ -1281,10 +1298,10 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
       '- status (状态)',
       '',
       '【强制匹配规则（必须遵守）】',
-      '1) 若用户提到了具体表名（例如 ods_wms_base_brand_df），你必须 100% 使用该表名，严禁改写/归类到主表或其他表。',
-      '2) 若用户提到了具体字段名（例如 brand_name），你必须 100% 使用该字段名，严禁替换为 id/code 等其他字段。',
-      '3) 你严禁臆造不存在的表名/字段名：若不确定，请留空字符串 ""，但不要猜。',
-      '4) 表名必须严格来自 DDL 表名清单（若用户写的表名不在清单中，仍原样输出该表名，并在 notes 说明“表名不在 DDL 清单”。）',
+      '1) 若用户提到了具体表名（例如 ods_wms_base_brand_df），你必须优先使用该表名；若该表名与 DDL 清单不一致（例如漏字符 ods_pdm_product_info_df），你必须对比 DDL 清单做“模糊纠错”，自动修正为最接近且存在的表名（例如 ods_pdm_pdm_product_info_df）。',
+      '2) 若用户提到了具体字段名（例如 brand_name），你必须优先使用该字段名；若字段名与该表 DDL 不一致，也必须对比该表字段清单做“模糊纠错”，修正为最接近且存在的字段名。',
+      '3) 你严禁臆造不存在的表名/字段名：必须从 DDL 结构中选取（可做纠错），若无法确定则留空 ""，并在 notes 写明原因。',
+      '4) 纠错输出时：tableName/fieldName 写“纠错后的结果”；notes 中写原始用户写法与纠错依据。',
       '',
       '【拼接处理（必须做对）】',
       '若用户描述材质为“LT + 04”或“由 LT 和 04 拼成”，你必须在 materialCode.rows[0].segments 中返回两个 segments，顺序必须与用户描述一致：',
@@ -1301,6 +1318,7 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
       '',
       masterTable ? `业务主表（仅供参考）：${masterTable}` : '',
       tableNames.length ? `DDL 表名清单（权威）：${tableNames.join(', ')}` : '',
+      ddlSchemaCompact.length ? `DDL 结构(JSON，供你做精确/模糊匹配)：\n${JSON.stringify(ddlSchemaCompact)}` : '',
       '',
       '用户描述：',
       text,
@@ -1335,6 +1353,42 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
 
     const keys = ['styleCode', 'brand', 'lastCode', 'soleCode', 'colorCode', 'materialCode', 'status'];
     const normalized = {};
+
+    const normKey = (s) => String(s || '').trim().toLowerCase().replace(/[`"'’\s]/g, '');
+    const levenshtein = (a, b) => {
+      const s = normKey(a);
+      const t = normKey(b);
+      if (!s) return t.length;
+      if (!t) return s.length;
+      const dp = Array.from({ length: s.length + 1 }, () => new Array(t.length + 1).fill(0));
+      for (let i = 0; i <= s.length; i++) dp[i][0] = i;
+      for (let j = 0; j <= t.length; j++) dp[0][j] = j;
+      for (let i = 1; i <= s.length; i++) {
+        for (let j = 1; j <= t.length; j++) {
+          const cost = s[i - 1] === t[j - 1] ? 0 : 1;
+          dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
+        }
+      }
+      return dp[s.length][t.length];
+    };
+
+    const pickClosest = (raw, candidates) => {
+      const want = String(raw || '').trim();
+      if (!want) return { best: '', dist: Infinity };
+      const list = Array.isArray(candidates) ? candidates.filter(Boolean) : [];
+      let best = '';
+      let bestDist = Infinity;
+      for (const c of list) {
+        const d = levenshtein(want, c);
+        if (d < bestDist) {
+          bestDist = d;
+          best = c;
+        }
+      }
+      return { best, dist: bestDist };
+    };
+
+    const ddlTableNamesList = Array.from(ddlTableMap.keys());
     for (const k of keys) {
       const blk = obj[k] && typeof obj[k] === 'object' ? obj[k] : {};
       const targetGoal = typeof blk?.targetGoal === 'string' ? String(blk.targetGoal) : '';
@@ -1351,10 +1405,50 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
               value: typeof s?.value === 'string' ? String(s.value) : String(s?.value ?? ''),
             }))
             .filter((s) => String(s.value || '').trim() !== '' || s.tableName || s.fieldName);
-          return { ...(id ? { id } : {}), notes, segments: segments.length ? segments : [{ tableName: '', fieldName: '', value: '' }] };
+          const baseSegments = segments.length ? segments : [{ tableName: '', fieldName: '', value: '' }];
+          const fixedSegments = baseSegments.map((seg) => {
+            let tn = String(seg.tableName || '').trim();
+            let fn = String(seg.fieldName || '').trim();
+            let localNote = '';
+
+            // 表名模糊纠错
+            if (tn && ddlTableNamesList.length && !ddlTableMap.has(tn)) {
+              const { best, dist } = pickClosest(tn, ddlTableNamesList);
+              if (best && dist <= 3) {
+                localNote += `[auto-fix] tableName ${JSON.stringify(tn)} -> ${JSON.stringify(best)} (dist=${dist}) `;
+                tn = best;
+              }
+            }
+
+            // 字段名模糊纠错
+            if (tn && fn && ddlTableMap.has(tn)) {
+              const cols = ddlTableMap.get(tn) || [];
+              const names = cols.map((c) => String(c?.name || '').trim()).filter(Boolean);
+              const has = names.some((x) => normKey(x) === normKey(fn));
+              if (!has && names.length) {
+                const { best, dist } = pickClosest(fn, names);
+                if (best && dist <= 2) {
+                  localNote += `[auto-fix] fieldName ${JSON.stringify(fn)} -> ${JSON.stringify(best)} (dist=${dist}) `;
+                  fn = best;
+                }
+              }
+            }
+
+            return { tableName: tn, fieldName: fn, value: seg.value, ...(localNote ? { _autoFixNote: localNote.trim() } : {}) };
+          });
+
+          const autoFixNotes = fixedSegments.map((x) => x._autoFixNote).filter(Boolean).join(' ｜ ');
+          const mergedNotes = [notes, autoFixNotes].filter(Boolean).join(' ｜ ');
+          const cleanSegments = fixedSegments.map((x) => {
+            const { _autoFixNote, ...rest } = x;
+            return rest;
+          });
+
+          return { ...(id ? { id } : {}), notes: mergedNotes, segments: cleanSegments };
         })
         .filter((r) => r.segments.some((s) => String(s.value || '').trim() !== ''));
-      normalized[k] = { targetGoal, rows };
+      const operator = k === 'materialCode' && rows[0]?.segments?.length > 1 ? 'CONCAT' : undefined;
+      normalized[k] = { targetGoal, rows, ...(operator ? { operator } : {}) };
     }
     if (ddlText) fillCoordinatesFromDdl(normalized);
 
