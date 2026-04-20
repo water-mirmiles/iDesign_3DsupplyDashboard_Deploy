@@ -49,7 +49,7 @@ type MappingPart = {
   sourceField: string;
   sourceTable: string;
   physicalColumn?: string;
-  joinPath?: string[];
+  joinPath?: any;
 };
 
 type MappingEntry = {
@@ -58,7 +58,7 @@ type MappingEntry = {
   physicalColumn?: string;
   sourceTable?: string;
   sourceField?: string;
-  joinPath?: string[];
+  joinPath?: any;
   operator?: 'CONCAT';
   parts?: MappingPart[];
 };
@@ -72,7 +72,8 @@ function tokenToMappingPart(token: string): MappingPart | null {
     const dot = head.indexOf('.');
     const tbl = dot > 0 ? head.slice(0, dot) : '';
     const fld = dot > 0 ? head.slice(dot + 1) : head;
-    return { sourceField: fld, sourceTable: tbl, joinPath, physicalColumn: t };
+    // 注意：严禁把 CHAIN|... 作为 physicalColumn 传给后端；仅保留 joinPath JSON（数组）
+    return { sourceField: fld, sourceTable: tbl, joinPath };
   }
   if (t.includes('@')) {
     const at = t.lastIndexOf('@');
@@ -84,8 +85,30 @@ function tokenToMappingPart(token: string): MappingPart | null {
 }
 
 /** 写入 mapping_config 的完整条目（含 joinPath / CONCAT 多段） */
-function buildCertifiedMapping(fields: GlobalSchemaField[]): MappingEntry[] {
+function buildCertifiedMapping(fields: GlobalSchemaField[], overrides?: Record<string, Partial<MappingEntry>>): MappingEntry[] {
   return fields.map((f) => {
+    const ov = overrides && f.standardKey ? overrides[f.standardKey] : null;
+    if (ov && typeof ov === 'object') {
+      // 优先使用 AI 返回的结构化 JSON（避免任何字符串拼接/拆分导致的 [object Object]）
+      if (ov.operator === 'CONCAT' && Array.isArray((ov as any).parts) && (ov as any).parts.length >= 2) {
+        return {
+          standardKey: f.standardKey,
+          standardName: f.standardName,
+          operator: 'CONCAT',
+          parts: (ov as any).parts as any,
+          physicalColumn: '',
+        };
+      }
+      if (Array.isArray((ov as any).joinPath) && (ov as any).joinPath.length >= 2 && typeof (ov as any).joinPath[0] === 'object') {
+        return {
+          standardKey: f.standardKey,
+          standardName: f.standardName,
+          joinPath: (ov as any).joinPath,
+          physicalColumn: '',
+        };
+      }
+    }
+
     const tokens = (f.mappedSources || []).map((s) => String(s || '').trim()).filter(Boolean);
     if (tokens.length >= 2) {
       const parts = tokens.map((tok) => tokenToMappingPart(tok)).filter(Boolean) as MappingPart[];
@@ -95,7 +118,8 @@ function buildCertifiedMapping(fields: GlobalSchemaField[]): MappingEntry[] {
           standardName: f.standardName,
           operator: 'CONCAT',
           parts,
-          physicalColumn: `CONCAT|${tokens.join('||')}`,
+          // 注意：不要把任何 token 串（尤其 CHAIN|...）写入 physicalColumn，避免后端误判为字符串链路
+          physicalColumn: '',
         };
       }
     }
@@ -113,7 +137,7 @@ function buildCertifiedMapping(fields: GlobalSchemaField[]): MappingEntry[] {
             standardName: f.standardName,
             operator: 'CONCAT',
             parts,
-            physicalColumn: tokens[0],
+            physicalColumn: '',
           };
         }
       }
@@ -131,7 +155,7 @@ function buildCertifiedMapping(fields: GlobalSchemaField[]): MappingEntry[] {
         joinPath,
         sourceField: fld,
         sourceTable: tbl,
-        physicalColumn: token,
+        physicalColumn: '',
       };
     }
     if (token.includes('@')) {
@@ -170,7 +194,7 @@ type DdlColumn = {
 type AiTable = { tableName: string; columns: Array<{ name: string; comment?: string }> };
 type AiSuggestion = { standardKey: string; sourceField: string; sourceTable: string };
 type AiJoinPath = { targetStandardKey: string; path?: string[]; joinPath?: any };
-type AiConcatPart = { sourceField: string; sourceTable: string; joinPath?: string[] };
+type AiConcatPart = { sourceField: string; sourceTable: string; joinPath?: any };
 type AiConcatSuggestion = { standardKey: string; parts: AiConcatPart[]; operator?: string };
 
 /** 将 AI 返回的直连 / Join / CONCAT 合并进标准字段（纯函数，便于 flushSync 后立即预览） */
@@ -227,8 +251,13 @@ function mergeAiSuggestionsIntoStandardFields(
     if (lockedStandardKeys.has(c.standardKey)) continue;
     const tokens = c.parts
       .map((p) => {
-        const jpArr = Array.isArray(p.joinPath) ? p.joinPath.map((x) => String(x).trim()).filter(Boolean) : [];
-        if (jpArr.length >= 2) return `CHAIN|${jpArr.join('->')}`;
+        let legacyArr: string[] = [];
+        if (Array.isArray(p.joinPath) && p.joinPath.length >= 2) {
+          const first = p.joinPath[0];
+          if (first && typeof first === 'object') legacyArr = normalizeStructuredToLegacyPath(p.joinPath);
+          else legacyArr = p.joinPath.map((x: any) => String(x).trim()).filter(Boolean);
+        }
+        if (legacyArr.length >= 2) return `CHAIN|${legacyArr.join('->')}`;
         const sf = String(p.sourceField || '').trim();
         const st = String(p.sourceTable || '').trim();
         if (sf && st) return `${sf}@${st}`;
@@ -617,6 +646,8 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
   const [aiUnfilledAfterRun, setAiUnfilledAfterRun] = useState<Record<string, boolean>>({});
   /** 手动纠偏锁定：一旦用户手动点选字段，该维度不允许被 AI 覆盖 */
   const [lockedStandardKeys, setLockedStandardKeys] = useState<Set<string>>(() => new Set());
+  /** AI 结构化路径覆盖（仅用于发给后端；UI 仍显示 mappedSources token） */
+  const [mappingOverrides, setMappingOverrides] = useState<Record<string, Partial<MappingEntry>>>({});
   const [conversationalInput, setConversationalInput] = useState('');
   const [chatToConfigBusy, setChatToConfigBusy] = useState(false);
   const [reviewTweakOpen, setReviewTweakOpen] = useState(false);
@@ -642,7 +673,10 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
     return fallback;
   }, [parsedTableMap, ddlText]);
 
-  const mappingPreview: MappingEntry[] = useMemo(() => buildCertifiedMapping(standardFields), [standardFields]);
+  const mappingPreview: MappingEntry[] = useMemo(
+    () => buildCertifiedMapping(standardFields, mappingOverrides),
+    [standardFields, mappingOverrides]
+  );
   const expectedByStandardKey = useMemo(() => {
     const out: Record<string, string> = {};
     for (const f of initialStandardFields) {
@@ -903,14 +937,36 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
           const sug = Array.isArray(partial.smartSuggestions) ? partial.smartSuggestions : [];
           const jp = Array.isArray(partial.joinPathSuggestions) ? partial.joinPathSuggestions : [];
           const cc = Array.isArray(partial.concatMappingSuggestions) ? partial.concatMappingSuggestions : [];
+          // 结构化覆盖：仅用于后端执行，避免 stringify/split 导致的 [object Object]
+          const nextOverrides = (() => {
+            const next = { ...(mappingOverrides || {}) } as Record<string, Partial<MappingEntry>>;
+            for (const j of jp) {
+              const k = String(j?.targetStandardKey || '').trim();
+              if (!k || lockedStandardKeys.has(k)) continue;
+              const pathObj = Array.isArray(j?.joinPath) ? j.joinPath : null;
+              if (Array.isArray(pathObj) && pathObj.length >= 2 && typeof pathObj[0] === 'object') {
+                next[k] = { joinPath: pathObj };
+              }
+            }
+            for (const c of cc) {
+              const k = String(c?.standardKey || '').trim();
+              if (!k || lockedStandardKeys.has(k)) continue;
+              const parts = Array.isArray(c?.parts) ? c.parts : [];
+              if (parts.length >= 2 && Array.isArray(parts[0]?.joinPath) && typeof parts[0].joinPath[0] === 'object') {
+                next[k] = { operator: 'CONCAT', parts: parts as any };
+              }
+            }
+            return next;
+          })();
           let mergedFields: GlobalSchemaField[] = [];
           flushSync(() => {
+            setMappingOverrides(nextOverrides);
             setStandardFields((prev) => {
               mergedFields = mergeAiSuggestionsIntoStandardFields(prev, sug, jp, cc, lockedStandardKeys);
               return mergedFields;
             });
           });
-          const mappingNow = buildCertifiedMapping(mergedFields);
+          const mappingNow = buildCertifiedMapping(mergedFields, nextOverrides);
           void runPreviewMappingRow(mappingNow);
         }
       } catch {
@@ -1413,11 +1469,13 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
       setCertifyEngineRunning(true);
       setAuthSyncHint('');
       const syncPayload = {
-        mappingConfig: {
+        // 彻底避免前端把复杂对象隐式转成字符串（[object Object]）
+        // 后端必须按 JSON 递归解析，严禁 split('->') 等字符串拆分逻辑
+        mappingConfig: JSON.stringify({
           latestDir,
           mapping: mappingPreview,
           mappingAuthenticated: true,
-        },
+        }),
       };
       const syncResp = await fetch(`${API_BASE}/api/certify-and-sync`, {
         method: 'POST',
@@ -1723,7 +1781,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
 
                         // 直接触发 AI 建模（串行维度 + 回测闭环）
                         const r = await handleAiLogicModeling({ masterTable: mt || masterTable });
-                        if (!r.ok) throw new Error(r.error);
+                        if (!r.ok) throw new Error('error' in r ? r.error : 'AI 建模失败（未知错误）');
                       } catch (e) {
                         const msg = e instanceof Error ? e.message : String(e);
                         setError(msg);

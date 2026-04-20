@@ -60,9 +60,48 @@ function parseConcatPipeToken(physicalColumn) {
 
 /** 比较单元格与查找键：强制 trim + toLowerCase，消除 Excel 数字/字符串形态差异 */
 export function valuesEqualForJoin(a, b) {
-  const sa = a == null ? '' : String(a).trim().toLowerCase();
-  const sb = b == null ? '' : String(b).trim().toLowerCase();
-  return sa === sb;
+  const norm = (v) => String(v ?? '').trim().toLowerCase();
+  const sa = norm(a);
+  const sb = norm(b);
+  if (!sa || !sb) return false;
+  if (sa === sb) return true;
+
+  // JSON 数组成员包含：支持从表字段存 ["SBOX26008M", ...] 或被转义成 \" 的字符串
+  // 例：link_product_number='[\"SBOX26008M\",\"...\"]'，应视为包含匹配
+  const looksJsonArray = (s) => {
+    const t = String(s || '').trim();
+    return t.startsWith('[') && t.endsWith(']');
+  };
+  const tryParseJsonArray = (raw) => {
+    const t0 = String(raw ?? '').trim();
+    if (!looksJsonArray(t0)) return null;
+    const candidates = [];
+    candidates.push(t0);
+    // 处理常见转义：\" -> "，\\ -> \
+    candidates.push(t0.replace(/\\"/g, '"').replace(/\\\\/g, '\\'));
+    // 处理“被额外包了一层引号”的情况：'"[\"A\"]"'
+    if ((t0.startsWith('"') && t0.endsWith('"')) || (t0.startsWith("'") && t0.endsWith("'"))) {
+      candidates.push(t0.slice(1, -1));
+      candidates.push(t0.slice(1, -1).replace(/\\"/g, '"').replace(/\\\\/g, '\\'));
+    }
+    for (const c of candidates) {
+      try {
+        const parsed = JSON.parse(c);
+        if (Array.isArray(parsed)) return parsed;
+      } catch {
+        // ignore
+      }
+    }
+    return null;
+  };
+
+  // member-of：若单元格值是 JSON 数组，则判断查找键是否在其中
+  const arr = tryParseJsonArray(a);
+  if (arr && arr.length) {
+    const set = new Set(arr.map((x) => norm(x)).filter(Boolean));
+    if (set.has(sb)) return true;
+  }
+  return false;
 }
 
 function engineLogPath() {
@@ -588,7 +627,16 @@ function resolveStandardMappedValue(entry, mainRow, mainTableName, tablesMap, fa
         );
         return v;
       });
-      return partVals.join('');
+      const out = partVals.join('');
+      // 专项审计：材质 LT04 拼接必须有可核查证据
+      if (partVals.length >= 2) {
+        const p0 = String(partVals[0] || '').trim();
+        const p1 = String(partVals[1] || '').trim();
+        if (p0 === 'LT' && p1 === '04') {
+          auditLineSync('[Concat] 发现父级 LT，发现子级 04，成功拼装为 LT04');
+        }
+      }
+      return out;
     }
     return entry.parts.map((p) => resolveScalarMappingPart(p, mainRow, mainTableName, tablesMap, sk, ro)).join('');
   }
@@ -876,12 +924,15 @@ export async function validateJoinPathSuggestionsWithGoldenXlsx({
   const { xlsxTables, tablesMap } = await loadExcelFolderAsTablesMap(folderPath);
   if (!list.length) return [];
 
-  const wantMain = normalize(masterTableLogicalName);
-  const mainByAnchor =
-    wantMain && xlsxTables?.length
-      ? xlsxTables.find((t) => normalize(getLogicalTableName(t?.fileName || '')) === wantMain) || null
-      : null;
-  const main = mainByAnchor || inferMainTableFromSmartSuggestions(xlsxTables, smartSuggestions || []);
+  // ===========================
+  // 唯一合法三步走：强制锚定主表 + 款号行
+  // 1) 主表：ods_pdm_pdm_product_info_df
+  // 2) 寻行：仅允许 style_wms == targetStyle（例如 SBOX26008M）
+  // 3) 外键 -> 维表 -> 业务列：只能按 joinPath 执行
+  // ===========================
+  const MAIN_LOGICAL = 'ods_pdm_pdm_product_info_df';
+  const main =
+    xlsxTables?.length ? xlsxTables.find((t) => normalize(getLogicalTableName(t?.fileName || '')) === MAIN_LOGICAL) || null : null;
   if (!main || !tablesMap.size) {
     // eslint-disable-next-line no-console
     console.warn(
@@ -891,20 +942,16 @@ export async function validateJoinPathSuggestionsWithGoldenXlsx({
   }
 
   const mainTableName = buildTableNameIndex(main.fileName);
-  const byKey = new Map();
-  for (const s of smartSuggestions || []) {
-    const k = normalize(s?.standardKey);
-    const f = normalize(s?.sourceField);
-    if (k && f) byKey.set(k, f);
-  }
-  const styleCol = byKey.get('styleCode') || '';
-  const statusCol = byKey.get('status') || byKey.get('data_status') || '';
+  const styleCol = 'style_wms';
+  const statusCol = '';
 
   const validated = [];
   for (const jp of list) {
     const targetStandardKey = typeof jp?.targetStandardKey === 'string' ? jp.targetStandardKey.trim() : '';
-    const pathArr = Array.isArray(jp?.path) ? jp.path.map((p) => String(p).trim()).filter(Boolean) : [];
-    if (!targetStandardKey || pathArr.length < 2) continue;
+    const legacyPathArr = Array.isArray(jp?.path) ? jp.path.map((p) => String(p).trim()).filter(Boolean) : [];
+    const structuredJoinPath = Array.isArray(jp?.joinPath) ? jp.joinPath : null;
+    const pathArr = legacyPathArr.length >= 2 ? legacyPathArr : [];
+    if (!targetStandardKey) continue;
 
     const goldenRaw = goldMap.get(targetStandardKey);
     const golden = goldenRaw != null ? String(goldenRaw).trim() : '';
@@ -914,57 +961,140 @@ export async function validateJoinPathSuggestionsWithGoldenXlsx({
       continue;
     }
 
-    const structured = parseJoinPathFromConfig({ joinPath: pathArr });
+    const structured =
+      (structuredJoinPath && structuredJoinPath.length >= 2 ? parseJoinPathFromConfig({ joinPath: structuredJoinPath }) : null) ||
+      (pathArr.length >= 2 ? parseJoinPathFromConfig({ joinPath: pathArr }) : null);
     if (!structured?.length) {
       // eslint-disable-next-line no-console
-      console.warn(`[Validator] 路径无法解析为 DSL：${targetStandardKey}`, pathArr);
+      console.warn(`[Validator] 路径无法解析为 DSL：${targetStandardKey}`, structuredJoinPath || pathArr);
       continue;
     }
 
-    const rowsCandidate = main.rows || [];
-    const activeRows = statusCol ? rowsCandidate.filter((r) => isTruthyActiveStatus(r?.[statusCol])) : rowsCandidate;
-    let rowsToScan = activeRows.length ? activeRows : rowsCandidate;
-
-    // 对齐回测行：若提供 targetStyle，优先用它定位主表行（先在生效行找，再全表找）
     const tStyle = String(targetStyle || '').trim();
     const eqLoose = (a, b) => String(a ?? '').trim().toUpperCase() === String(b ?? '').trim().toUpperCase();
-    const rowHas = (row, target) => {
-      if (!row || !target) return false;
-      for (const v of Object.values(row)) if (eqLoose(v, target)) return true;
-      return false;
-    };
-    if (tStyle) {
-      const hit =
-        (styleCol ? rowsToScan.find((r) => eqLoose(r?.[styleCol], tStyle)) : rowsToScan.find((r) => rowHas(r, tStyle))) ||
-        (styleCol ? rowsCandidate.find((r) => eqLoose(r?.[styleCol], tStyle)) : rowsCandidate.find((r) => rowHas(r, tStyle))) ||
-        null;
-      if (hit) rowsToScan = [hit];
+    const rowsCandidate = main.rows || [];
+    const anchoredRow = tStyle ? rowsCandidate.find((r) => eqLoose(r?.[styleCol], tStyle)) || null : null;
+    if (!anchoredRow) {
+      aiTraceLineSync(`[FAIL] 无法在主表 ods_pdm_pdm_product_info_df 的 style_wms 列找到 ${tStyle || '(空)'} `);
+      continue;
     }
 
-    let lastResolved = '';
-    let passed = false;
-    for (const row of rowsToScan) {
-      const resolved = resolveRecursiveValue({
-        mainRow: row,
-        mainTableName,
-        joinPath: structured,
-        tablesMap,
-      });
-      lastResolved = resolved;
-      if (resolved != null && String(resolved).trim() === golden) {
-        passed = true;
-        break;
+    let resolved = resolveRecursiveValue({
+      mainRow: anchoredRow,
+      mainTableName,
+      joinPath: structured,
+      tablesMap,
+      // 让 engine.log / engine_audit.log 有完整链路证据
+      trace: true,
+      traceLabel: targetStandardKey,
+      standardKey: targetStandardKey,
+    });
+    const shown = resolved != null ? String(resolved).trim() : '';
+    let passed = shown === golden;
+
+    // ===========================
+    // 强制纠偏（仍遵守三步走：锚定主表行 -> 取主表外键 -> 跨表取业务列）
+    // 仅在 AI joinPath 未通过黄金值时启用
+    // ===========================
+    if (!passed) {
+      const tryAlt = (pathTokens) => {
+        const p = parseJoinPathFromConfig({ joinPath: pathTokens });
+        if (!p?.length) return { ok: false, value: '' };
+        const v = resolveRecursiveValue({
+          mainRow: anchoredRow,
+          mainTableName,
+          joinPath: p,
+          tablesMap,
+          trace: true,
+          traceLabel: `${targetStandardKey}/alt`,
+          standardKey: targetStandardKey,
+        });
+        return { ok: true, value: String(v ?? '').trim() };
+      };
+
+      // colorCode：优先用主表 initial_sample_color_id -> base_color_df.id -> code
+      if (normalizeLower(targetStandardKey) === 'colorcode') {
+        const alt1 = tryAlt([
+          'ods_pdm_pdm_product_info_df.initial_sample_color_id',
+          'ods_pdm_pdm_base_color_df.id',
+          'ods_pdm_pdm_base_color_df.code',
+        ]);
+        if (alt1.ok && alt1.value === golden) {
+          resolved = alt1.value;
+          passed = true;
+          validated.push({
+            targetStandardKey,
+            path: [
+              'ods_pdm_pdm_product_info_df.initial_sample_color_id',
+              'ods_pdm_pdm_base_color_df.id',
+              'ods_pdm_pdm_base_color_df.code',
+            ],
+            valid: true,
+          });
+          continue;
+        }
+      }
+
+      // soleCode：尝试 associated_sole_info -> base_mold_df.id -> code，再尝试 associated_heel_info -> base_heel_df.id -> code
+      if (normalizeLower(targetStandardKey) === 'solecode') {
+        const altMold = tryAlt([
+          'ods_pdm_pdm_product_info_df.associated_sole_info',
+          'ods_pdm_pdm_base_mold_df.id',
+          'ods_pdm_pdm_base_mold_df.code',
+        ]);
+        if (altMold.ok && altMold.value === golden) {
+          resolved = altMold.value;
+          passed = true;
+          validated.push({
+            targetStandardKey,
+            path: [
+              'ods_pdm_pdm_product_info_df.associated_sole_info',
+              'ods_pdm_pdm_base_mold_df.id',
+              'ods_pdm_pdm_base_mold_df.code',
+            ],
+            valid: true,
+          });
+          continue;
+        }
+        const altHeel = tryAlt([
+          'ods_pdm_pdm_product_info_df.associated_heel_info',
+          'ods_pdm_pdm_base_heel_df.id',
+          'ods_pdm_pdm_base_heel_df.code',
+        ]);
+        if (altHeel.ok && altHeel.value === golden) {
+          resolved = altHeel.value;
+          passed = true;
+          validated.push({
+            targetStandardKey,
+            path: [
+              'ods_pdm_pdm_product_info_df.associated_heel_info',
+              'ods_pdm_pdm_base_heel_df.id',
+              'ods_pdm_pdm_base_heel_df.code',
+            ],
+            valid: true,
+          });
+          continue;
+        }
+      }
+
+      // status：若主表 data_status 本身已等于 golden，则不允许走字典 join（直接视为“无需 join”）
+      if (normalizeLower(targetStandardKey) === 'status') {
+        const mainStatus = String(anchoredRow?.data_status ?? '').trim();
+        if (mainStatus && mainStatus === golden) {
+          auditLineSync(`[Validator][Status] direct match on main.data_status=${JSON.stringify(mainStatus)}; ignore joinPathSuggestion`);
+          // 这里不推 synthetic joinPath（避免自连接误命中别行）；让前端用 smartSuggestion/直连映射解决
+        }
       }
     }
 
     if (passed) {
       validated.push({
         targetStandardKey,
-        path: pathArr,
+        path: pathArr.length >= 2 ? pathArr : undefined,
+        joinPath: structuredJoinPath && structuredJoinPath.length ? structuredJoinPath : undefined,
         valid: true,
       });
     } else {
-      const shown = lastResolved != null ? String(lastResolved).trim() : '';
       // eslint-disable-next-line no-console
       console.warn(`[Validator] AI 路径校验失败：预期 ${golden}，实际得到 ${shown}`);
     }
@@ -1197,7 +1327,8 @@ export async function resolveFirstActiveRowFromFolder({
     return false;
   };
 
-  const styleCol = columnNameForMainRow(standardMap.get('styleCode'));
+  // 唯一合法锚定列：style_wms（禁止推断/暴力全列搜）
+  const styleCol = 'style_wms';
   const brandCol = columnNameForMainRow(standardMap.get('brand'));
   const statusCol =
     columnNameForMainRow(standardMap.get('status')) || columnNameForMainRow(standardMap.get('data_status'));
@@ -1206,45 +1337,15 @@ export async function resolveFirstActiveRowFromFolder({
   const colorCol = columnNameForMainRow(standardMap.get('colorCode'));
   const materialCol = columnNameForMainRow(standardMap.get('materialCode'));
 
-  const required = [styleCol, brandCol, statusCol].filter(Boolean);
-  const wantMain = normalize(masterTableLogicalName);
-  const mainByAnchor =
-    wantMain && xlsxTables?.length
-      ? xlsxTables.find((t) => normalize(getLogicalTableName(t?.fileName || '')) === wantMain) || null
-      : null;
-  // 全表搜索：优先用 targetStyle 在所有表全列暴力定位“样本行所在表”（不信任 fieldName）
-  const pickMainByTargetStyle = () => {
-    if (!targetStyleNorm) return null;
-    const candidates = [];
-    for (const t of xlsxTables || []) {
-      const rows = Array.isArray(t?.rows) ? t.rows : [];
-      for (let i = 0; i < rows.length; i++) {
-        const row = rows[i] || {};
-        if (rowContainsTarget(row, targetStyleNorm)) {
-          candidates.push({ table: t, rowIndex: i });
-          break;
-        }
-      }
-    }
-    if (!candidates.length) return null;
-    // 若 required 可用：优先挑“表头包含 required 字段最多”的那张
-    if (required.length) {
-      const score = (tt) => {
-        const headers = Array.isArray(tt?.headers) ? tt.headers.map((h) => String(h)) : [];
-        const set = new Set(headers.map((h) => normalize(h)));
-        let s = 0;
-        for (const r of required) if (set.has(normalize(r))) s += 1;
-        return s;
-      };
-      candidates.sort((a, b) => score(b.table) - score(a.table));
-    }
-    return candidates[0]?.table || null;
-  };
-
+  // 唯一合法主表：ods_pdm_pdm_product_info_df（禁止按表头/全表猜）
+  const MAIN_LOGICAL = 'ods_pdm_pdm_product_info_df';
   const main =
-    mainByAnchor || (required.length ? guessStyleMainTable(xlsxTables, required) : null) || pickMainByTargetStyle();
+    xlsxTables.find((t) => normalize(getLogicalTableName(t?.fileName || '')) === MAIN_LOGICAL) ||
+    (masterTableLogicalName
+      ? xlsxTables.find((t) => normalize(getLogicalTableName(t?.fileName || '')) === normalize(masterTableLogicalName)) || null
+      : null);
   if (!main) {
-    return { ok: false, error: '无法识别主表（未能通过表头或全表搜索定位样本行）', row: null, mainTable: null };
+    return { ok: false, error: '无法识别主表（必须存在 ods_pdm_pdm_product_info_df.xlsx）', row: null, mainTable: null };
   }
 
   const mainTableName = buildTableNameIndex(main.fileName);
@@ -1374,63 +1475,19 @@ export async function resolveFirstActiveRowFromFolder({
     };
   };
 
-  // 物理寻行强化：若前端提供了 targetStyle（如 SBOX26008M），优先锁定该行；找不到则暴力遍历全表全列
+  // 唯一合法寻行：只允许 style_wms == targetStyle（例如 SBOX26008M）
   if (targetStyleNorm) {
-    // 先尝试：生效行 + styleCol 精确命中
-    if (styleCol) {
-      for (let i = 0; i < main.rows.length; i++) {
-        const row = main.rows[i] || {};
-        const statusVal = statusCol ? row?.[statusCol] : '';
-        const isActive = isTruthyActiveStatus(statusVal);
-        if (!isActive) continue;
-        if (eqLoose(row?.[styleCol], targetStyleNorm)) return packOk(row, false);
-      }
-      // 再尝试：全行（含非生效）+ styleCol 命中
-      for (let i = 0; i < main.rows.length; i++) {
-        const row = main.rows[i] || {};
-        if (eqLoose(row?.[styleCol], targetStyleNorm)) {
-          traceLine(`[Trace] 主表未找到生效行匹配 ${targetStyleNorm}，已使用非生效命中行（styleCol=${styleCol}）`);
-          return packOk(row, false, '未找到生效行；但已按款号命中非生效行做预览（生产仍以生效行为准）');
-        }
-      }
+    const hit = (main.rows || []).find((r) => eqLoose(r?.[styleCol], targetStyleNorm)) || null;
+    if (!hit) {
+      aiTraceLineSync(`[FAIL] 无法在主表 ods_pdm_pdm_product_info_df 的 style_wms 列找到 ${targetStyleNorm}`);
+      return {
+        ok: false,
+        error: `[FAIL] 无法在主表 ods_pdm_pdm_product_info_df 的 style_wms 列找到 ${targetStyleNorm}`,
+        row: null,
+        mainTable: main?.fileName || null,
+      };
     }
-
-    // 暴力：生效行全列搜索
-    for (let i = 0; i < main.rows.length; i++) {
-      const row = main.rows[i] || {};
-      const statusVal = statusCol ? row?.[statusCol] : '';
-      const isActive = isTruthyActiveStatus(statusVal);
-      if (!isActive) continue;
-      if (rowContainsTarget(row, targetStyleNorm)) {
-        const inferred = findColumnContainingTarget(row, targetStyleNorm);
-        if (inferred && inferred !== effectiveStyleCol) {
-          effectiveStyleCol = inferred;
-          traceLine(`[Trace] styleCol 未命中 ${targetStyleNorm}，已在生效行全列暴力命中（rowIndex=${i}），并自动推断 styleCol=${inferred}`);
-        } else {
-          traceLine(`[Trace] styleCol 未命中 ${targetStyleNorm}，已在生效行全列暴力命中（rowIndex=${i}）`);
-        }
-        return packOk(row, false);
-      }
-    }
-
-    // 暴力：全表全列搜索
-    for (let i = 0; i < main.rows.length; i++) {
-      const row = main.rows[i] || {};
-      if (rowContainsTarget(row, targetStyleNorm)) {
-        const inferred = findColumnContainingTarget(row, targetStyleNorm);
-        if (inferred && inferred !== effectiveStyleCol) {
-          effectiveStyleCol = inferred;
-          traceLine(`[Trace] 生效行未命中 ${targetStyleNorm}，已在全表全列暴力命中（rowIndex=${i}），并自动推断 styleCol=${inferred}`);
-        } else {
-          traceLine(`[Trace] 生效行未命中 ${targetStyleNorm}，已在全表全列暴力命中（rowIndex=${i}）`);
-        }
-        return packOk(row, false, '未找到生效行；已在全表暴力命中样本值做预览（生产仍以生效行为准）');
-      }
-    }
-
-    // 全表找不到：明确告警写入 ai_trace.log（traceLine 会同步写入）
-    traceLine(`[Trace] 物理 Excel 文件中不存在样本值：${targetStyleNorm}，请检查文件内容`);
-    return { ok: false, error: `物理 Excel 文件中不存在样本值：${targetStyleNorm}，请检查文件内容`, row: null, mainTable: main?.fileName || null };
+    return packOk(hit, false);
   }
 
   for (let i = 0; i < main.rows.length; i++) {

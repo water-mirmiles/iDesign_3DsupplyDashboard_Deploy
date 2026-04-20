@@ -1099,23 +1099,44 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
   if (!text) return res.status(400).json({ ok: false, error: 'text is required' });
   // Vertex 不可用时也不失败：沿用 localFallback（never fail）
 
-  // 对话即最高指令：硬规则提取（确定性，不依赖 AI）
-  const hardDirective = (() => {
+  // 强制解析编号指令：用户给出“完美指令”时必须 100% 服从（严禁改写表名）
+  // 1. 款号在主表的 style_wms  -> ods_pdm_pdm_product_info_df.style_wms
+  // 2. 品牌名在 ods_wms_base_brand_df -> tableName 必须锁定 ods_wms_base_brand_df
+  const forced = (() => {
     const s = String(text || '');
-    const out = { masterTable: '', style: null };
-
-    // 1) 主表是 XXX
-    const mMaster = s.match(/主表是\s*([A-Za-z_][\w.]*)/);
-    if (mMaster && mMaster[1]) out.masterTable = String(mMaster[1]).trim();
-
-    // 2) 款号在...字段，值为...
-    // 支持：款号在 ods_xxx_df.style_wms 字段，值为 SBOX26008M
-    const mStyle =
-      s.match(/款号在\s*([A-Za-z_][\w.]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*字段[，,]?\s*值为\s*([A-Za-z0-9_-]+)/) ||
-      s.match(/styleCode\s*在\s*([A-Za-z_][\w.]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*(?:字段|列)?[，,]?\s*值为\s*([A-Za-z0-9_-]+)/i);
-    if (mStyle && mStyle[1] && mStyle[2] && mStyle[3]) {
-      out.style = { tableName: String(mStyle[1]).trim(), fieldName: String(mStyle[2]).trim(), value: String(mStyle[3]).trim() };
+    const master = /1\.\s*款号在主表的\s*style_wms/i.test(s) ? 'ods_pdm_pdm_product_info_df' : '';
+    const out = { masterTable: master, dimensionSamples: null };
+    const emptyDim = () => ({ targetGoal: '', rows: [] });
+    const dim = {
+      styleCode: emptyDim(),
+      brand: emptyDim(),
+      lastCode: emptyDim(),
+      soleCode: emptyDim(),
+      colorCode: emptyDim(),
+      materialCode: emptyDim(),
+      status: emptyDim(),
+    };
+    if (master) {
+      dim.styleCode.rows = [
+        {
+          id: `forced_${Date.now()}`,
+          notes: '强制锁定：1. 款号在主表的 style_wms',
+          segments: [{ tableName: 'ods_pdm_pdm_product_info_df', fieldName: 'style_wms', value: '' }],
+        },
+      ];
     }
+    const mBrand = s.match(/2\.\s*品牌名在\s*([A-Za-z_][\w.]*)/i);
+    if (mBrand && mBrand[1]) {
+      const tn = String(mBrand[1]).trim();
+      dim.brand.rows = [
+        {
+          id: `forced_${Date.now()}_brand`,
+          notes: '强制锁定：2. 品牌名在指定表（严禁改写表名）',
+          segments: [{ tableName: tn, fieldName: '', value: '' }],
+        },
+      ];
+    }
+    out.dimensionSamples = dim;
     return out;
   })();
 
@@ -1460,9 +1481,9 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
         : [],
     }));
     const prompt = [
-      '你是一个 SQL 专家，也是一个“坐标级业务实体提取引擎”。',
-      '输入包含：1) DDL 表结构（17 张表）；2) 用户的一段业务描述。',
-      '你的唯一任务：为 7 个标准维度提取精确坐标（standardKey + tableName/fieldName/value），并输出为 dimensionSamples JSON。',
+      '你现在是一个无偏见的数据解析器（Gemini 3.1）。',
+      '输入包含：1) DDL 表结构（多张表）；2) 用户的一段业务场景描述。',
+      '你的唯一任务：从描述中识别用户定义的【目标表】【目标字段】【黄金样本值】，并把它们归类到系统的 7 个标准维度中，输出为 dimensionSamples。',
       '',
       '标准维度（standardKey）固定为以下 7 个：',
       '- styleCode (款号)',
@@ -1473,42 +1494,24 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
       '- materialCode (材质)',
       '- status (状态)',
       '',
-      '【强制匹配规则（必须遵守）】',
-      '【物理特征强约束（最高优先级；严禁语义发散）】',
-      'A) 凡是以 "ods_" 开头的字符串，100% 视为 tableName（不要改写/不要归并到主表）。',
-      'B) 凡是紧跟在 tableName 后面的单词（形如 ods_xxx_yyy_df.brand_name），100% 视为 fieldName。',
-      'C) 凡是以 "SBOX" 开头的值，100% 视为 styleCode 的 value。',
-      'D) 凡是以 "L-B" 开头的值，100% 视为 lastCode 的 value。',
-      'E) 凡是材质提到 "LT/04" 或 "LT + 04" 或 "LT04"：你必须拆成 materialCode 的两个 segments（"LT" 与 "04"），targetGoal 必须为 "LT04"。',
+      '【动态识别（必须遵守）】',
+      '1) 只要用户在描述中给出了某个表名/字段名，并且它存在于 DDL 中，你必须采纳它（不得改写、不得替换为你更熟悉的表）。',
+      '2) 严禁臆造不存在的表名/字段名：只能从 DDL 中选择（必要时可做轻微纠错，但必须落到 DDL 中真实存在的名字）。',
+      '3) 若用户只给了 tableName + value 但没给 fieldName：你必须基于该表 DDL 选择最合理的业务展示列作为 fieldName（优先 code/name/xxx_name，其次 comment 语义匹配；严禁选择 id 作为终点展示字段）。',
+      '4) 若用户描述了拼接（例如“由 A 和 B 拼成”）：你必须在同一维度返回多段 segments，并正确填充 targetGoal 为拼接后的最终值。',
+      '【规则锁定（必须遵守，优先级最高）】',
+      '若用户使用编号指令明确指定坐标（例如“1. 款号在主表的 style_wms”“2. 品牌名在 ods_wms_base_brand_df”），你必须严格锁定其 tableName/fieldName，严禁做任何纠错/改写。',
       '',
-      '【全维度抓取（严禁遗漏）】你必须尽最大可能填满 7 个维度；若用户明确给出表名 + 值但没给字段名，你必须结合 DDL 在该表中选择最合理的业务列作为 fieldName：优先 code，其次 name/brand_name，再其次 comment 含中文含义的列；严禁选择 id 作为终点。',
-      '【维度与基础表对齐（优先遵守）】',
-      '- brand (品牌)：优先使用 ods_wms_base_brand_df（通常取 brand_name/name/code）',
-      '- soleCode (大底)：优先使用 ods_pdm_pdm_base_mold_df（通常取 code/name）',
-      '- colorCode (颜色)：优先使用 ods_pdm_pdm_base_color_df（通常取 code/name/color_code）',
-      '- status (状态)：优先使用 ods_pdm_pdm_product_info_df.data_status（或 status/lifecycle/status_name 等）',
+      '【全维度抓取（严禁遗漏）】你必须尽最大可能填满 7 个维度；无法确定的维度允许为空，但必须把能确定的全部提取出来。',
       '',
-      '【编号列表逐条解析（严禁漏项）】若用户用 1. 2. 3. 或 (1)(2)(3) 的序号逐条描述，你必须逐条解析并覆盖所有条目，严禁漏掉任何一条。',
-      '特别提醒：即便某表名在 DDL 清单靠后（例如 ods_wms_base_brand_df），只要用户明确写出，你必须提取并输出对应 tableName，禁止忽略。',
-      '1) 若用户提到了具体表名（例如 ods_wms_base_brand_df），你必须优先使用该表名；若该表名与 DDL 清单不一致（例如漏字符 ods_pdm_product_info_df），你必须对比 DDL 清单做“模糊纠错”，自动修正为最接近且存在的表名（例如 ods_pdm_pdm_product_info_df）。',
-      '2) 若用户提到了具体字段名（例如 brand_name），你必须优先使用该字段名；若字段名与该表 DDL 不一致，也必须对比该表字段清单做“模糊纠错”，修正为最接近且存在的字段名。',
-      '3) 你严禁臆造不存在的表名/字段名：必须从 DDL 结构中选取（可做纠错），若无法确定则留空 ""，并在 notes 写明原因。',
-      '4) 纠错输出时：tableName/fieldName 写“纠错后的结果”；notes 中写原始用户写法与纠错依据。',
+      '【输出格式（必须严格遵守）】',
+      '只输出严格 JSON（不要 Markdown，不要解释），外层结构必须为：',
+      '{ "masterTable": "", "dimensionSamples": { ...7维... } }',
       '',
-      '【拼接处理（必须做对）】',
-      '若用户描述材质为“LT + 04”或“由 LT 和 04 拼成”，你必须在 materialCode.rows[0].segments 中返回两个 segments，顺序必须与用户描述一致：',
-      '- segments[0].value = "LT"',
-      '- segments[1].value = "04"',
-      '并把 materialCode.targetGoal 写为 "LT04"（无分隔符）。',
+      'dimensionSamples 结构必须与前端状态一致（每个维度都有 targetGoal 与 rows[].segments[]）：',
+      '{ "styleCode": {...}, "brand": {...}, "lastCode": {...}, "soleCode": {...}, "colorCode": {...}, "materialCode": {...}, "status": {...} }',
       '',
-      '输出必须是严格 JSON 对象（不要 Markdown，不要解释），结构必须与前端 dimensionSamples 状态一致：',
-      '{',
-      '  "styleCode": { "targetGoal": "", "rows": [ { "id": "可省略", "notes": "", "segments": [ { "tableName": "", "fieldName": "", "value": "" } ] } ] },',
-      '  "brand": { "targetGoal": "", "rows": [ ... ] },',
-      '  ... 其余维度 ...',
-      '}',
-      '',
-      masterTable ? `业务主表（仅供参考）：${masterTable}` : '',
+      masterTableFromBody ? `业务主表（仅供参考）：${masterTableFromBody}` : '',
       tableNames.length ? `DDL 表名清单（权威）：${tableNames.join(', ')}` : '',
       ddlSchemaCompact.length ? `DDL 结构(JSON，供你做精确/模糊匹配)：\n${JSON.stringify(ddlSchemaCompact)}` : '',
       '',
@@ -1553,25 +1556,12 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
       auditLineSync('[Audit][Fallback] Gemini failed; use local regex fallback');
       let dimensionSamples = localFallback(text);
       if (ddlText) dimensionSamples = fillCoordinatesFromDdl(dimensionSamples);
-      // 硬性覆盖：对话指令优先
-      if (hardDirective?.style) {
-        dimensionSamples.styleCode = {
-          targetGoal: hardDirective.style.value,
-          rows: [
-            {
-              id: `hard_style_${Date.now()}`,
-              notes: '硬规则：款号在指定字段，值为指定值（对话即最高指令）',
-              segments: [{ tableName: hardDirective.style.tableName, fieldName: hardDirective.style.fieldName, value: hardDirective.style.value }],
-            },
-          ],
-        };
-      }
       modelingDebugLineSync('[Final][FallbackRegex]');
       modelingDebugLineSync(JSON.stringify(dimensionSamples, null, 2));
       modelingDebugLineSync(`[${new Date().toISOString()}] ===== parse-chat-to-samples END (fallback) =====`);
       auditLineSync(JSON.stringify({ fallback: true, dimensionSamples }, null, 2));
       auditLineSync(`[Audit] ===== Chat-to-Config 结束(本地兜底) ${new Date().toISOString()} =====`);
-      return res.json({ ok: true, masterTable: hardDirective.masterTable || masterTableFromBody || '', dimensionSamples, fallback: true });
+      return res.json({ ok: true, masterTable: masterTableFromBody || '', dimensionSamples, fallback: true });
     }
 
     const obj = extractJsonObject(stripJsonFences(out.text));
@@ -1579,25 +1569,20 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
       auditLineSync('[Audit][Fallback] AI JSON invalid; use local regex fallback');
       let dimensionSamples = localFallback(text);
       if (ddlText) dimensionSamples = fillCoordinatesFromDdl(dimensionSamples);
-      if (hardDirective?.style) {
-        dimensionSamples.styleCode = {
-          targetGoal: hardDirective.style.value,
-          rows: [
-            {
-              id: `hard_style_${Date.now()}`,
-              notes: '硬规则：款号在指定字段，值为指定值（对话即最高指令）',
-              segments: [{ tableName: hardDirective.style.tableName, fieldName: hardDirective.style.fieldName, value: hardDirective.style.value }],
-            },
-          ],
-        };
-      }
       modelingDebugLineSync('[Final][FallbackJsonInvalid]');
       modelingDebugLineSync(JSON.stringify(dimensionSamples, null, 2));
       modelingDebugLineSync(`[${new Date().toISOString()}] ===== parse-chat-to-samples END (fallback-json-invalid) =====`);
       auditLineSync(JSON.stringify({ fallback: true, dimensionSamples }, null, 2));
       auditLineSync(`[Audit] ===== Chat-to-Config 结束(本地兜底) ${new Date().toISOString()} =====`);
-      return res.json({ ok: true, masterTable: hardDirective.masterTable || masterTableFromBody || '', dimensionSamples, fallback: true });
+      return res.json({ ok: true, masterTable: masterTableFromBody || '', dimensionSamples, fallback: true });
     }
+
+    const wrapper = obj && typeof obj === 'object' ? obj : {};
+    const masterTableFromAi = typeof wrapper?.masterTable === 'string' ? String(wrapper.masterTable).trim() : '';
+    const dimObj =
+      wrapper?.dimensionSamples && typeof wrapper.dimensionSamples === 'object' && !Array.isArray(wrapper.dimensionSamples)
+        ? wrapper.dimensionSamples
+        : wrapper;
 
     const keys = ['styleCode', 'brand', 'lastCode', 'soleCode', 'colorCode', 'materialCode', 'status'];
     const normalized = {};
@@ -1638,7 +1623,7 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
 
     const ddlTableNamesList = Array.from(ddlTableMap.keys());
     for (const k of keys) {
-      const blk = obj[k] && typeof obj[k] === 'object' ? obj[k] : {};
+      const blk = dimObj[k] && typeof dimObj[k] === 'object' ? dimObj[k] : {};
       const targetGoal = typeof blk?.targetGoal === 'string' ? String(blk.targetGoal) : '';
       const rowsRaw = Array.isArray(blk?.rows) ? blk.rows : [];
       const rows = rowsRaw
@@ -1659,27 +1644,15 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
             let fn = String(seg.fieldName || '').trim();
             let localNote = '';
 
-            // 表名模糊纠错
+            // 严禁改写表名/字段名：只做存在性检查，不做纠错
             if (tn && ddlTableNamesList.length && !ddlTableMap.has(tn)) {
-              const { best, dist } = pickClosest(tn, ddlTableNamesList);
-              if (best && dist <= 3) {
-                localNote += `[auto-fix] tableName ${JSON.stringify(tn)} -> ${JSON.stringify(best)} (dist=${dist}) `;
-                tn = best;
-              }
+              localNote += `[strict] tableName not in DDL: ${JSON.stringify(tn)} `;
             }
-
-            // 字段名模糊纠错
             if (tn && fn && ddlTableMap.has(tn)) {
               const cols = ddlTableMap.get(tn) || [];
               const names = cols.map((c) => String(c?.name || '').trim()).filter(Boolean);
               const has = names.some((x) => normKey(x) === normKey(fn));
-              if (!has && names.length) {
-                const { best, dist } = pickClosest(fn, names);
-                if (best && dist <= 2) {
-                  localNote += `[auto-fix] fieldName ${JSON.stringify(fn)} -> ${JSON.stringify(best)} (dist=${dist}) `;
-                  fn = best;
-                }
-              }
+              if (!has && names.length) localNote += `[strict] fieldName not in DDL: ${JSON.stringify(fn)} `;
             }
 
             return { tableName: tn, fieldName: fn, value: seg.value, ...(localNote ? { _autoFixNote: localNote.trim() } : {}) };
@@ -1700,51 +1673,71 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
     }
     if (ddlText) fillCoordinatesFromDdl(normalized);
 
-    // 硬性覆盖：对话指令优先（masterTable + styleCode 唯一坐标）
-    if (hardDirective?.style) {
-      normalized.styleCode = {
-        targetGoal: hardDirective.style.value,
-        rows: [
-          {
-            id: `hard_style_${Date.now()}`,
-            notes: '硬规则：款号在指定字段，值为指定值（对话即最高指令）',
-            segments: [{ tableName: hardDirective.style.tableName, fieldName: hardDirective.style.fieldName, value: hardDirective.style.value }],
-          },
-        ],
-      };
+    // 强制覆盖：编号指令指定的坐标必须 100% 落地（无论 AI 输出什么）
+    if (forced?.dimensionSamples) {
+      if (forced.dimensionSamples.styleCode?.rows?.length) normalized.styleCode = forced.dimensionSamples.styleCode;
+      if (forced.dimensionSamples.brand?.rows?.length) normalized.brand = forced.dimensionSamples.brand;
     }
 
     modelingDebugLineSync('[Final][AI]');
     modelingDebugLineSync(JSON.stringify(normalized, null, 2));
     modelingDebugLineSync(`[${new Date().toISOString()}] ===== parse-chat-to-samples END (ai) =====`);
 
+    // 审计真相：把 AI 识别到的坐标写入 ai_trace.log
+    try {
+      const keyToCn = (k) =>
+        k === 'styleCode'
+          ? '款号'
+          : k === 'brand'
+            ? '品牌'
+            : k === 'lastCode'
+              ? '楦'
+              : k === 'soleCode'
+                ? '底'
+                : k === 'colorCode'
+                  ? '颜色'
+                  : k === 'materialCode'
+                    ? '材质'
+                    : k === 'status'
+                      ? '状态'
+                      : k;
+      for (const k of keys) {
+        const rows = Array.isArray(normalized?.[k]?.rows) ? normalized[k].rows : [];
+        for (const r of rows) {
+          const segs = Array.isArray(r?.segments) ? r.segments : [];
+          for (const seg of segs) {
+            const tn = String(seg?.tableName || '').trim();
+            const fn = String(seg?.fieldName || '').trim();
+            if (tn && fn) {
+              aiTraceLineSync(`[AI_REASONING] 我从用户描述中识别到：维度[${keyToCn(k)}] 对应的表名是 [${tn}]，字段是 [${fn}]。`);
+            }
+          }
+        }
+      }
+    } catch {
+      // ignore
+    }
+
     auditLineSync(`[Audit] ===== Chat-to-Config 结束 ${new Date().toISOString()} =====`);
-    return res.json({ ok: true, masterTable: hardDirective.masterTable || masterTableFromBody || '', dimensionSamples: normalized, fallback: false });
+    return res.json({
+      ok: true,
+      masterTable: forced.masterTable || masterTableFromAi || masterTableFromBody || '',
+      dimensionSamples: normalized,
+      fallback: false,
+    });
   } catch (e) {
     auditLineSync(`[Audit] ===== Chat-to-Config 异常 ${new Date().toISOString()} =====`);
     auditLineSync(String(e instanceof Error ? e.stack || e.message : String(e)));
     // 兜底：任何异常都走本地解析，保证前端可用
     let dimensionSamples = localFallback(text);
     if (ddlText) dimensionSamples = fillCoordinatesFromDdl(dimensionSamples);
-    if (hardDirective?.style) {
-      dimensionSamples.styleCode = {
-        targetGoal: hardDirective.style.value,
-        rows: [
-          {
-            id: `hard_style_${Date.now()}`,
-            notes: '硬规则：款号在指定字段，值为指定值（对话即最高指令）',
-            segments: [{ tableName: hardDirective.style.tableName, fieldName: hardDirective.style.fieldName, value: hardDirective.style.value }],
-          },
-        ],
-      };
-    }
     modelingDebugLineSync('[Final][ExceptionFallback]');
     modelingDebugLineSync(JSON.stringify(dimensionSamples, null, 2));
     modelingDebugLineSync(`[${new Date().toISOString()}] ===== parse-chat-to-samples END (exception-fallback) =====`);
     auditLineSync('[Audit][Fallback] Exception; use local regex fallback');
     auditLineSync(JSON.stringify({ fallback: true, error: e instanceof Error ? e.message : String(e), dimensionSamples }, null, 2));
     auditLineSync(`[Audit] ===== Chat-to-Config 结束(本地兜底) ${new Date().toISOString()} =====`);
-    return res.json({ ok: true, masterTable: hardDirective.masterTable || masterTableFromBody || '', dimensionSamples, fallback: true });
+    return res.json({ ok: true, masterTable: masterTableFromBody || '', dimensionSamples, fallback: true });
   }
 });
 
@@ -1797,127 +1790,8 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
     } catch {
       auditLineSync('[Audit][A] Input Audit JSON stringify failed');
     }
-    // 若用户传了对话文本：先解析对话为 dimensionSamples，并作为建模种子喂给后续推导
-    if (conversationalInput) {
-      aiTraceLineSync('[Step 1] conversationalInput detected; parsing chat-to-samples');
-      try {
-        // 合并逻辑：内部“确定性对话解析” -> goldenBlocks/goldenSamples/expectedMap 的唯一来源
-        const emptyDim = () => ({ targetGoal: '', rows: [] });
-        const makeSegmentsRow = (value, notes = '') => ({
-          id: `chat_${Date.now()}_${Math.random().toString(16).slice(2)}`,
-          notes,
-          segments: [{ tableName: '', fieldName: '', value: String(value ?? '') }],
-        });
-        const s = String(conversationalInput || '');
-        const dimensionSamples = {
-          styleCode: emptyDim(),
-          brand: emptyDim(),
-          lastCode: emptyDim(),
-          soleCode: emptyDim(),
-          colorCode: emptyDim(),
-          materialCode: emptyDim(),
-          status: emptyDim(),
-        };
-
-        // 1) 主表是 XXX（最高优先级）
-        const mm = s.match(/主表是\s*([A-Za-z_][\w.]*)/);
-        if (mm && mm[1]) {
-          masterTable = String(mm[1]).trim();
-          aiTraceLineSync(`[Step 1] masterTable overridden by chat: ${masterTable}`);
-        }
-
-        // 2) 款号在 表.字段 字段，值为 XXX（最高优先级坐标）
-        const mStyle =
-          s.match(/款号在\s*([A-Za-z_][\w.]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*字段[，,]?\s*值为\s*([A-Za-z0-9_-]+)/) ||
-          s.match(/styleCode\s*在\s*([A-Za-z_][\w.]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*(?:字段|列)?[，,]?\s*值为\s*([A-Za-z0-9_-]+)/i);
-        if (mStyle && mStyle[1] && mStyle[2] && mStyle[3]) {
-          const tn = String(mStyle[1]).trim();
-          const fn = String(mStyle[2]).trim();
-          const v = String(mStyle[3]).trim();
-          dimensionSamples.styleCode.rows = [
-            {
-              id: `hard_style_${Date.now()}`,
-              notes: '硬规则：款号在指定字段，值为指定值（对话即最高指令）',
-              segments: [{ tableName: tn, fieldName: fn, value: v }],
-            },
-          ];
-          dimensionSamples.styleCode.targetGoal = v;
-        }
-
-        // styleCode: SBOX26008M / 任意大写字母+数字+字母（保守）
-        const style = s.match(/\b[A-Z]{2,10}\d{3,10}[A-Z]?\b/);
-        if (style) {
-          if (!dimensionSamples.styleCode.targetGoal) {
-            dimensionSamples.styleCode.rows.push(makeSegmentsRow(style[0], '从描述中提取：款号/StyleCode'));
-            dimensionSamples.styleCode.targetGoal = style[0];
-          }
-        }
-
-        // lastCode: L-xxxx（示例：L-B26097M）
-        const last = s.match(/\bL-[A-Za-z0-9-]{3,30}\b/);
-        if (last) {
-          dimensionSamples.lastCode.rows.push(makeSegmentsRow(last[0], '从描述中提取：楦号/lastCode'));
-          dimensionSamples.lastCode.targetGoal = last[0];
-        }
-
-        // soleCode: S-xxxx / SOLE- / H- (粗略)
-        const sole = s.match(/\b(?:S-|SOLE-|H-)[A-Za-z0-9-]{3,30}\b/);
-        if (sole) {
-          dimensionSamples.soleCode.rows.push(makeSegmentsRow(sole[0], '从描述中提取：底号/soleCode'));
-          dimensionSamples.soleCode.targetGoal = sole[0];
-        }
-
-        // status: 生效/有效/active
-        if (/(生效|有效|active|enabled)/i.test(s)) {
-          const v = /(生效|有效)/.test(s) ? '生效' : 'active';
-          dimensionSamples.status.rows.push(makeSegmentsRow(v, '从描述中提取：状态'));
-          dimensionSamples.status.targetGoal = v;
-        }
-
-        // materialCode: LT04 或 LT + 04 拼接
-        const matDirect = s.match(/\bLT\d{2}\b/i);
-        if (matDirect) {
-          const v = matDirect[0].toUpperCase();
-          dimensionSamples.materialCode.rows.push(makeSegmentsRow(v, '从描述中提取：材质编码'));
-          dimensionSamples.materialCode.targetGoal = v;
-        } else {
-          const matParts = s.match(/\b(LT)\b[\s\S]{0,12}\b(0?\d{1,2})\b/i);
-          if (matParts) {
-            const p1 = String(matParts[1]).toUpperCase();
-            const p2 = String(matParts[2]).padStart(2, '0');
-            dimensionSamples.materialCode.rows.push(makeSegmentsRow(p1, '拼接段1：父/前缀（例如 LT）'));
-            dimensionSamples.materialCode.rows.push(makeSegmentsRow(p2, '拼接段2：子/后缀（例如 04）'));
-            dimensionSamples.materialCode.targetGoal = `${p1}${p2}`;
-          }
-        }
-
-        // brand: “品牌 X/brand X”
-        const brand =
-          s.match(/品牌[:：\s]*([A-Za-z][A-Za-z\s]{1,40})/i) ||
-          s.match(/\bbrand[:：\s]*([A-Za-z][A-Za-z\s]{1,40})/i);
-        if (brand && brand[1]) {
-          const v = String(brand[1]).trim().replace(/\s+/g, ' ');
-          dimensionSamples.brand.rows.push(makeSegmentsRow(v, '从描述中提取：品牌名称'));
-          dimensionSamples.brand.targetGoal = v;
-        }
-
-        // colorCode: “颜色 X/color X”
-        const color = s.match(/颜色[:：\s]*([A-Za-z0-9-]{2,20})/i) || s.match(/\bcolor[:：\s]*([A-Za-z0-9-]{2,20})/i);
-        if (color && color[1]) {
-          const v = String(color[1]).trim();
-          dimensionSamples.colorCode.rows.push(makeSegmentsRow(v, '从描述中提取：颜色编码/名称'));
-          dimensionSamples.colorCode.targetGoal = v;
-        }
-
-        dimensionSamplesSeed = dimensionSamples;
-        goldenBlocks = normalizeGoldenByDimensionForAi(dimensionSamples);
-        goldenSamples = expandGoldenBlocksToFlatSamples(goldenBlocks);
-        goldenExpectedMap = buildGoldenExpectedMap({ goldenBlocks, goldenSamples, reference });
-        aiTraceLineSync('[Step 1] chat parsed and injected into modeling seed (goldenSamples rebuilt)');
-      } catch (e) {
-        aiTraceLineSync(`[Step 1] chat-to-samples exception; continue: ${e instanceof Error ? e.message : String(e)}`);
-      }
-    }
+    // conversationalInput 的解析必须走“DDL+描述”的动态语义抽取（禁止关键词硬匹配/预设表名）
+    // 解析将在 DDL 本地解析完成后进行，以便 Gemini 可以基于真实 DDL 做坐标锁定与轻微纠错。
 
     aiTraceLineSync('[Step 2] 开始根据实体推导 SQL 关联路径...');
 
@@ -1974,6 +1848,114 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
       });
     }
 
+    // Step 1.5：基于“DDL+业务描述”的动态语义抽取（废除硬编码/关键词硬匹配）
+    if (conversationalInput) {
+      aiTraceLineSync('[Step 1.5] 使用 Gemini 基于 DDL 动态抽取 dimensionSamples...');
+      try {
+        const schemaCompactForChat = parsedTables.map((t) => ({
+          tableName: String(t?.tableName || '').trim(),
+          columns: Array.isArray(t?.columns) ? (t.columns || []).slice(0, 200) : [],
+        }));
+        const ddlTableNamesForChat = parsedTables.map((t) => String(t?.tableName || '').trim()).filter(Boolean);
+        const chatPrompt = [
+          '你现在是一个无偏见的数据解析器（Gemini 3.x）。',
+          '输入包含：DDL 表结构（多张表）与用户业务描述。',
+          '你的唯一任务：从描述中识别【目标表】【目标字段】【黄金样本值】并归类到 7 个标准维度，输出 dimensionSamples。',
+          '',
+          '标准维度（standardKey）固定为：styleCode, brand, lastCode, soleCode, colorCode, materialCode, status。',
+          '',
+          '【动态识别规则】',
+          '1) 用户给出的 tableName/fieldName 只要存在于 DDL，就必须采纳；不得替换为你更熟悉的表。',
+          '2) 严禁臆造表/字段：只能从 DDL 选择；必要时可做轻微纠错，但必须落到 DDL 中真实存在的名字。',
+          '3) 若缺 fieldName：在该 table 的 DDL 中选择最合理的展示列（优先 code/name/xxx_name；严禁以 id 作为终点展示字段）。',
+          '4) 若描述了拼接：在同一维度返回多段 segments，并正确填充 targetGoal 为最终拼接值。',
+          '',
+          '输出必须是严格 JSON（不要 Markdown，不要解释），外层必须为：',
+          '{ "masterTable": "", "dimensionSamples": { "styleCode": {...}, "brand": {...}, "lastCode": {...}, "soleCode": {...}, "colorCode": {...}, "materialCode": {...}, "status": {...} } }',
+          '',
+          masterTable ? `业务主表（若用户已明确指出）：${masterTable}` : '',
+          `DDL 表名清单（权威）：${ddlTableNamesForChat.join(', ')}`,
+          `DDL 结构(JSON)：${JSON.stringify(schemaCompactForChat)}`,
+          '',
+          '用户描述：',
+          conversationalInput,
+        ]
+          .filter(Boolean)
+          .join('\n');
+
+        aiTraceLineSync('[AI_REASONING] 开始从用户描述中识别 7 维坐标...');
+        const chatOut = await generateWithModelList({ modelNames: modelList, prompt: chatPrompt, retries: 1 });
+        const chatObj = chatOut.ok ? extractJsonObject(stripJsonFences(chatOut.text)) : null;
+        if (chatOut.ok && chatObj && typeof chatObj === 'object') {
+          const masterFromAi = typeof chatObj?.masterTable === 'string' ? String(chatObj.masterTable).trim() : '';
+          const dimObj =
+            chatObj?.dimensionSamples && typeof chatObj.dimensionSamples === 'object' && !Array.isArray(chatObj.dimensionSamples)
+              ? chatObj.dimensionSamples
+              : chatObj;
+          const keys = ['styleCode', 'brand', 'lastCode', 'soleCode', 'colorCode', 'materialCode', 'status'];
+          const normalized = {};
+          for (const k of keys) {
+            const blk = dimObj?.[k] && typeof dimObj[k] === 'object' ? dimObj[k] : {};
+            const targetGoal = typeof blk?.targetGoal === 'string' ? String(blk.targetGoal) : '';
+            const rowsRaw = Array.isArray(blk?.rows) ? blk.rows : [];
+            const rows = rowsRaw
+              .map((r) => ({
+                id: typeof r?.id === 'string' ? String(r.id) : '',
+                notes: typeof r?.notes === 'string' ? String(r.notes) : '',
+                segments: Array.isArray(r?.segments)
+                  ? r.segments.map((s) => ({
+                      tableName: typeof s?.tableName === 'string' ? String(s.tableName) : '',
+                      fieldName: typeof s?.fieldName === 'string' ? String(s.fieldName) : '',
+                      value: typeof s?.value === 'string' ? String(s.value) : String(s?.value ?? ''),
+                    }))
+                  : [{ tableName: '', fieldName: '', value: '' }],
+              }))
+              .filter((r) => Array.isArray(r.segments) && r.segments.some((s) => String(s.value || '').trim() !== ''));
+            normalized[k] = { targetGoal, rows };
+          }
+
+          // 审计真相：记录识别坐标
+          const keyToCn = (k) =>
+            k === 'styleCode'
+              ? '款号'
+              : k === 'brand'
+                ? '品牌'
+                : k === 'lastCode'
+                  ? '楦'
+                  : k === 'soleCode'
+                    ? '底'
+                    : k === 'colorCode'
+                      ? '颜色'
+                      : k === 'materialCode'
+                        ? '材质'
+                        : k === 'status'
+                          ? '状态'
+                          : k;
+          for (const k of keys) {
+            const rows = Array.isArray(normalized?.[k]?.rows) ? normalized[k].rows : [];
+            for (const r of rows) {
+              const segs = Array.isArray(r?.segments) ? r.segments : [];
+              for (const seg of segs) {
+                const tn = String(seg?.tableName || '').trim();
+                const fn = String(seg?.fieldName || '').trim();
+                if (tn && fn) aiTraceLineSync(`[AI_REASONING] 我从用户描述中识别到：维度[${keyToCn(k)}] 对应的表名是 [${tn}]，字段是 [${fn}]。`);
+              }
+            }
+          }
+
+          dimensionSamplesSeed = normalized;
+          goldenBlocks = normalizeGoldenByDimensionForAi(normalized);
+          goldenSamples = expandGoldenBlocksToFlatSamples(goldenBlocks);
+          goldenExpectedMap = buildGoldenExpectedMap({ goldenBlocks, goldenSamples, reference });
+          if (masterFromAi) masterTable = masterFromAi;
+        } else {
+          aiTraceLineSync(`[AI_REASONING] 业务描述解析失败：${chatOut.ok ? 'JSON 无效' : String(chatOut.error?.message || '')}`);
+        }
+      } catch (e) {
+        aiTraceLineSync(`[AI_REASONING] 业务描述解析异常：${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+
     // ===========================
     // 2026 Stack：Gemini 3.x 一次性全表推理（合并维度解析，释放大上下文能力）
     // ===========================
@@ -1991,6 +1973,25 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
             ].join('\n')
           : '【黄金样本期望值】（空）';
 
+      // 审计真相：基于坐标开始路径搜索（记录意图，不预设任何表名）
+      try {
+        const seed = dimensionSamplesSeed && typeof dimensionSamplesSeed === 'object' ? dimensionSamplesSeed : null;
+        const keys = ['styleCode', 'brand', 'lastCode', 'soleCode', 'colorCode', 'materialCode', 'status'];
+        for (const k of keys) {
+          const rows = Array.isArray(seed?.[k]?.rows) ? seed[k].rows : [];
+          for (const r of rows) {
+            const segs = Array.isArray(r?.segments) ? r.segments : [];
+            for (const seg of segs) {
+              const tn = String(seg?.tableName || '').trim();
+              const fn = String(seg?.fieldName || '').trim();
+              if (tn && fn) aiTraceLineSync(`[PATH_SEARCH] 正在根据 DDL 寻找从主表到 [${tn}].[${fn}] 的 Join 路径...`);
+            }
+          }
+        }
+      } catch {
+        // ignore
+      }
+
       const oneShotPrompt = [
         '你是 Gemini 3.x（超大上下文）。请一次性理解全部表结构，并为 7 个维度给出从主表到维表业务值列的完整 CHAIN 路径。',
         masterTable ? `业务主表（Master Table）：${masterTable}` : '',
@@ -2001,6 +2002,11 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
         '3) joinPath 末段必须是 { targetTable, valueField }，且 valueField 必须是业务可读列（code/name/brand_name...），严禁以 id 结尾。',
         '4) 严禁输出“未找到”。',
         '5) 【材质 LT04 专项】如果黄金材质为 LT04/或对话中描述为拼接：你必须同时输出 concatMappingSuggestions，standardKey="materialCode"，operator="CONCAT"，parts=2。每个 part 必须包含 joinPath，并尽量利用 parent_id 等层级关联把父段(LT)与子段(04)从各自列取出。',
+        '',
+        '【重要线索：JSON 数组成员关联（专攻 soleCode）】',
+        '请特别注意 ods_pdm_pdm_base_mold_df 表：它与主表的关联不是传统 ID 对应。',
+        '关联方式：主表的款号 style_wms（例如 SBOX26008M）被包含在维表 ods_pdm_pdm_base_mold_df.link_product_number 的 JSON 数组字符串中。',
+        '因此 soleCode 的 joinPath 允许使用 targetField="link_product_number"（即“ARRAY_CONTAINS”语义匹配），然后在命中的那一行取 valueField="code" 作为最终底号。',
         '',
         goldenSection,
         '',
@@ -2555,19 +2561,17 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
           '2) 严禁「ID 终点」与「纯数字陷阱」：最后一项的 valueField 不得名为 id 或 *_id；若该列取值为纯数字而用户黄金样本含字母/横杠等业务字符，则必须改选 code/name 等业务列。除非用户样本本身即为该数字 ID。',
           '3) 路径完整性：主表外键 → 维表定位键 → … → 维表业务值列，每一跳都写入 joinPath，不得跳步。',
           '4) 表名严格对齐：smartSuggestions 与 joinPath 内所有 table 名须与「DDL 表名清单」100% 一致，禁止臆造缩写。',
-          '5) 【品牌 brand — 数字主表 vs 字符串黄金样本】若黄金样本中品牌为**可读名称**（如 Bruno Marc），而主表 `brand`（或 smartSuggestions 中映射列）在业务上存的是**数值 ID**（如 1），则**必须**输出 targetStandardKey=brand 的 joinPath：主表该列 → 品牌维表（DDL 中如 ods_wms_base_brand_df 或含 base_brand / wms+brand 的表）的 id（或主键）→ **品牌展示列**（优先 brand_name，其次 name）。禁止把可执行路径的终点留在主表数字列上。结构化 joinPath 示例末项 valueField 须为 brand_name（或与 COMMENT 一致之展示列）。Legacy CHAIN 等价示例：CHAIN|ods_pdm_pdm_product_info_df.brand->ods_wms_base_brand_df.id->ods_wms_base_brand_df.brand_name（表名以 DDL 为准，勿臆造）。',
+          '5) 【品牌 brand — 数字主表 vs 字符串黄金样本】若黄金样本中品牌为**可读名称**（如 Bruno Marc），而主表 brand 列在业务上存的是**数值 ID**（如 1），则必须输出 targetStandardKey=brand 的 joinPath：主表该列 → DDL 中“品牌维表”（表/列 comment 或字段名含 brand/品牌 的那张）主键(id) → 品牌展示列（优先 xxx_name/name/code；严禁以 id 作为最终展示字段）。',
           '',
           '【强迫学习（必须照抄范式）】',
           'brand 已被证明可执行且正确：主表.brand -> 品牌表.id -> 品牌表.brand_name。',
           '你必须把它当成“模板模式”：其它维度（lastCode/soleCode/colorCode/materialCode）必须同样遵循「主表外键/关联列(可能是数字ID) -> 目标维表定位键(id/parent_id/...) -> 目标维表业务值列(code/name/...)」。',
           '如果你算出的终点仍是纯数字（例如 1695）而黄金样本是业务号（例如 L-B26097M），说明路径没有走到最后一公里，你必须继续往下跳到 code/name 等字段，直到与黄金样本字符串严格一致。',
           '',
-          '【楦/底维度硬性线索（必须优先尝试）】',
-          '1) 楦编号 lastCode：起点通常在主表的 associated_last_type（或 associated_last/last_id/last_type_id 等），终点必须是 ods_pdm_pdm_base_last_df.code。',
-          '   - 允许中间多跳（<=3表），但最后一项必须是 { targetTable: "ods_pdm_pdm_base_last_df", valueField: "code" }。',
-          '2) 大底编号 soleCode：起点通常在主表的 associated_sole_info（或 sole_id/associated_sole 等），终点必须是 ods_pdm_pdm_base_heel_df.code。',
-          '   - 允许中间多跳（<=3表），但最后一项必须是 { targetTable: "ods_pdm_pdm_base_heel_df", valueField: "code" }。',
-          '注意：上述表名与字段名必须与 DDL 清单一致；若 DDL 中确无该表/字段，则在 joinPathSuggestions 中明确留空并说明原因（不要编造）。',
+          '【楦/底维度线索（不预设表名；仅给通用模式）】',
+          '1) lastCode：起点通常在主表的 associated_last_* / last_id / last_type_id 等外键列；终点必须是“楦维表”的业务列（优先 code，其次 name）。',
+          '2) soleCode：起点通常在主表的 associated_sole_* / sole_id 等外键列；终点必须是“底维表”的业务列（优先 code，其次 name）。',
+          '注意：目标维表必须从 DDL 中动态选择（表/列 comment 或字段名语义匹配），严禁臆造固定表名。',
           '',
           '【DDL 表名清单（唯一合法表名来源）】',
           allDdlTableNames.join(', '),
@@ -2591,8 +2595,8 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
           '      { "targetTable": "ods_xxx_last_df", "valueField": "code" }',
           '    ] },',
           '    { "targetStandardKey": "brand", "joinPath": [',
-          '      { "sourceTable": "ods_pdm_pdm_product_info_df", "sourceField": "brand", "targetTable": "ods_wms_base_brand_df", "targetField": "id" },',
-          '      { "targetTable": "ods_wms_base_brand_df", "valueField": "brand_name" }',
+          '      { "sourceTable": "<主表>", "sourceField": "<brand外键列>", "targetTable": "<品牌维表>", "targetField": "id" },',
+          '      { "targetTable": "<品牌维表>", "valueField": "<brand展示列，例如 brand_name/name/code>" }',
           '    ] }',
           '  ],',
           '  "concatMappingSuggestions": [',
@@ -2620,7 +2624,7 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
           '2) 主表上哪些外键指向**品牌 / 楦 / 底 / 色 / 材**维表（brand、associated_*、sole_id、material_id 等）？主表上的数值多为 ID，仅作跳板。',
           '3) 品牌：对照黄金样本若为「名称字符串」而主表为数字，必须经品牌基础表解析出 brand_name（或等价列），不得停在主表 1。',
           '4) 在维表 DDL 中定位「最后一公里」业务列：brand_name、code、category_code、last_code、name 等，使 valueField 读出后与黄金样本同形态。',
-          '5) 若需 ods_pdm_pdm_base_heel_df / ods_pdm_pdm_base_material_df 等，先 id 关联再延伸到业务编码列；末项 valueField 禁止为裸 id（除非样本为数字）。',
+          '5) 若需“底/材质”相关维表：先按 id/parent_id 等键关联定位行，再延伸到业务编码列；末项 valueField 禁止为裸 id（除非样本为数字）。',
           '6) 为每个目标维度写出完整 joinPath（含末项 valueField），确保后端可按数组逐步执行并得到目标业务值。',
           '',
           '进阶任务（Logic Sandbox）：',
@@ -3177,8 +3181,21 @@ app.post('/api/certify-and-sync', async (req, res) => {
   try {
     await ensureStorageDirs();
     const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
-    const mc = body.mappingConfig;
-    if (mc && typeof mc === 'object' && !Array.isArray(mc)) {
+    const mcRaw = body.mappingConfig;
+    const mc =
+      typeof mcRaw === 'string'
+        ? (() => {
+            try {
+              const parsed = JSON.parse(mcRaw);
+              return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+            } catch {
+              return null;
+            }
+          })()
+        : mcRaw && typeof mcRaw === 'object' && !Array.isArray(mcRaw)
+          ? mcRaw
+          : null;
+    if (mc) {
       const filePayload = {
         savedAt: new Date().toISOString(),
         mappingAuthenticated: Boolean(mc.mappingAuthenticated),
