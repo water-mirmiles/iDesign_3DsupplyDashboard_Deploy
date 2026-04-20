@@ -1486,6 +1486,7 @@ app.post('/api/parse-chat-to-samples', async (req, res) => {
       '- brand (品牌)：优先使用 ods_wms_base_brand_df（通常取 brand_name/name/code）',
       '- soleCode (大底)：优先使用 ods_pdm_pdm_base_mold_df（通常取 code/name）',
       '- colorCode (颜色)：优先使用 ods_pdm_pdm_base_color_df（通常取 code/name/color_code）',
+      '- status (状态)：优先使用 ods_pdm_pdm_product_info_df.data_status（或 status/lifecycle/status_name 等）',
       '',
       '【编号列表逐条解析（严禁漏项）】若用户用 1. 2. 3. 或 (1)(2)(3) 的序号逐条描述，你必须逐条解析并覆盖所有条目，严禁漏掉任何一条。',
       '特别提醒：即便某表名在 DDL 清单靠后（例如 ods_wms_base_brand_df），只要用户明确写出，你必须提取并输出对应 tableName，禁止忽略。',

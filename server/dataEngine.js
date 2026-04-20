@@ -518,6 +518,10 @@ export function buildStandardMap(mappingArr) {
 /** 单列 / CONCAT 子段解析：CHAIN、结构化 joinPath、主表直连、col@维表 启发式跨表 */
 function resolveScalarMappingPart(part, mainRow, mainTableName, tablesMap, standardKeyHint, options = {}) {
   if (!part) return '';
+  // 兼容：若上游误传 string，按 physicalColumn token 处理（避免 "[object Object]"）
+  if (typeof part === 'string') {
+    return resolveScalarMappingPart({ physicalColumn: part, sourceField: '', sourceTable: '', joinPath: undefined }, mainRow, mainTableName, tablesMap, standardKeyHint, options);
+  }
   const trace = Boolean(options.trace);
   const lbl = normalize(options.traceLabel) || normalize(standardKeyHint);
   const sk = normalize(options.standardKey) || lbl;
@@ -1248,6 +1252,14 @@ export async function resolveFirstActiveRowFromFolder({
   // eslint-disable-next-line no-console
   console.log('[Debug] 正在查找逻辑表:', mainTableName, '对应的物理文件是:', main.fullPath || main.fileName);
   const diagnosticsMap = previewStrict ? new Map() : null;
+  let effectiveStyleCol = styleCol;
+  const findColumnContainingTarget = (row, target) => {
+    if (!row || !target) return '';
+    for (const [k, v] of Object.entries(row)) {
+      if (eqLoose(v, target)) return String(k || '');
+    }
+    return '';
+  };
   const traceOpts = (label) => ({
     trace: traceJoins,
     traceLabel: label,
@@ -1339,7 +1351,7 @@ export async function resolveFirstActiveRowFromFolder({
     );
 
     return {
-      style_wms: styleCol ? normalize(row?.[styleCol]) : '',
+      style_wms: effectiveStyleCol ? normalize(row?.[effectiveStyleCol]) : '',
       brand: brandVal,
       lastCode: lastCodeVal,
       soleCode: soleCodeVal,
@@ -1390,7 +1402,13 @@ export async function resolveFirstActiveRowFromFolder({
       const isActive = isTruthyActiveStatus(statusVal);
       if (!isActive) continue;
       if (rowContainsTarget(row, targetStyleNorm)) {
-        traceLine(`[Trace] styleCol 未命中 ${targetStyleNorm}，已在生效行全列暴力命中（rowIndex=${i}）`);
+        const inferred = findColumnContainingTarget(row, targetStyleNorm);
+        if (inferred && inferred !== effectiveStyleCol) {
+          effectiveStyleCol = inferred;
+          traceLine(`[Trace] styleCol 未命中 ${targetStyleNorm}，已在生效行全列暴力命中（rowIndex=${i}），并自动推断 styleCol=${inferred}`);
+        } else {
+          traceLine(`[Trace] styleCol 未命中 ${targetStyleNorm}，已在生效行全列暴力命中（rowIndex=${i}）`);
+        }
         return packOk(row, false);
       }
     }
@@ -1399,7 +1417,13 @@ export async function resolveFirstActiveRowFromFolder({
     for (let i = 0; i < main.rows.length; i++) {
       const row = main.rows[i] || {};
       if (rowContainsTarget(row, targetStyleNorm)) {
-        traceLine(`[Trace] 生效行未命中 ${targetStyleNorm}，已在全表全列暴力命中（rowIndex=${i}）`);
+        const inferred = findColumnContainingTarget(row, targetStyleNorm);
+        if (inferred && inferred !== effectiveStyleCol) {
+          effectiveStyleCol = inferred;
+          traceLine(`[Trace] 生效行未命中 ${targetStyleNorm}，已在全表全列暴力命中（rowIndex=${i}），并自动推断 styleCol=${inferred}`);
+        } else {
+          traceLine(`[Trace] 生效行未命中 ${targetStyleNorm}，已在全表全列暴力命中（rowIndex=${i}）`);
+        }
         return packOk(row, false, '未找到生效行；已在全表暴力命中样本值做预览（生产仍以生效行为准）');
       }
     }
