@@ -2,6 +2,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import express from 'express';
 import fs from 'node:fs';
+import { execSync } from 'node:child_process';
 import fse from 'fs-extra';
 import multer from 'multer';
 import path from 'path';
@@ -94,9 +95,9 @@ const VERTEX_LOCATION = 'us-central1';
 // 404 兜底：部分项目/区域配额未下发时，切换 region 重试
 const VERTEX_LOCATION_FALLBACKS = ['us-east1', 'asia-northeast1'];
 const VERTEX_LOCATIONS = [VERTEX_LOCATION, ...VERTEX_LOCATION_FALLBACKS];
-const VERTEX_MODEL = 'gemini-1.5-flash';
-// 优先使用“别名”模型；若项目无权限/404，则自动降级到可用版本（仍会打印完整资源路径便于核对）
-const MODEL_PRIORITY = [VERTEX_MODEL, 'gemini-1.5-flash-002', 'gemini-1.5-pro'];
+// 按最新线上实践：优先锁定明确版本号，避免 alias 在部分 Vertex 项目/区域下 404
+const VERTEX_MODEL = 'gemini-1.5-flash-002';
+const MODEL_PRIORITY = [VERTEX_MODEL, 'gemini-1.5-flash-001', 'gemini-1.5-pro'];
 
 function ensureVertexCredentialsEnv() {
   const keyPath = path.join(__dirname, 'gcp-key.json');
@@ -121,6 +122,9 @@ function getVertexModel({ modelName, location }) {
   const loc = String(location || '').trim() || VERTEX_LOCATION;
   return getVertexClient(loc).getGenerativeModel({ model: m });
 }
+
+// 作用域锁定：全局初始化对象（用于路由里做“是否已初始化”的判定）
+const vertexAi = getVertexClient(VERTEX_LOCATION);
 
 let currentAIStatus = {
   status: 'idle',
@@ -1043,7 +1047,7 @@ app.post('/api/preview-mapping-row', async (req, res) => {
 app.post('/api/ai-parse-ddl', async (req, res) => {
   const sqlText = String(req.body?.sqlText || '');
   if (!sqlText.trim()) return res.status(400).json({ ok: false, error: 'sqlText is required' });
-  if (!vertexAI) return res.status(500).json({ ok: false, error: 'Vertex AI is not initialized' });
+  if (!vertexAi) return res.status(500).json({ ok: false, error: 'Vertex AI is not initialized' });
 
   try {
     clearEngineLogSync();
@@ -1703,7 +1707,7 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
       : null;
   const goldenExpectedMap = buildGoldenExpectedMap({ goldenBlocks, goldenSamples, reference });
   if (!sqlText.trim()) return res.status(400).json({ ok: false, error: 'sqlText is required' });
-  if (!vertexAI) return res.status(500).json({ ok: false, error: 'Vertex AI is not initialized' });
+  if (!vertexAi) return res.status(500).json({ ok: false, error: 'Vertex AI is not initialized' });
 
   try {
     // 新一轮 AI 建模开始：清空上一轮引擎 Trace 日志，便于用户直接看 engine.log
@@ -3057,9 +3061,28 @@ async function start() {
   await refreshAssetsCache();
 
   const port = 3001;
+  // 强制释放端口并自检（best-effort；仅本地开发使用）
+  try {
+    const pids = execSync(`lsof -ti tcp:${port}`, { stdio: ['ignore', 'pipe', 'ignore'] })
+      .toString('utf8')
+      .split('\n')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    for (const pid of pids) {
+      try {
+        process.kill(Number(pid), 'SIGKILL');
+      } catch {
+        // ignore
+      }
+    }
+  } catch {
+    // ignore
+  }
   app.listen(port, () => {
     // eslint-disable-next-line no-console
     console.clear();
+    // eslint-disable-next-line no-console
+    console.log(`🚀 后端复活成功，模型锁定为 ${MODEL_PRIORITY[0]}`);
     // eslint-disable-next-line no-console
     console.log('[startup] Vertex AI Gemini model (locked):', MODEL_PRIORITY[0]);
     (async () => {
