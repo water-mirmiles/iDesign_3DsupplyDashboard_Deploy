@@ -14,6 +14,7 @@ import {
   persistFinalDashboardData,
   processAllData,
   resolveFirstActiveRowFromFolder,
+  validateJoinPathSuggestionsWithGoldenXlsx,
 } from './dataEngine.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -163,12 +164,88 @@ function expandGoldenBlocksToFlatSamples(blocks) {
   return flat;
 }
 
+/** 黄金期望值 Map：Step2 样本 + reference 缺省字段（供 Prompt 与 XLSX 回测共用） */
+function buildGoldenExpectedMap({ goldenBlocks, goldenSamples, reference }) {
+  const out = new Map();
+  if (goldenBlocks && goldenBlocks.length) {
+    for (const b of goldenBlocks) {
+      const sk = String(b.standardKey || '').trim();
+      if (!sk) continue;
+      const goal = String(b.targetGoal || '').trim();
+      if (goal) {
+        out.set(sk, goal);
+        continue;
+      }
+      const rows = Array.isArray(b.rows) ? b.rows : [];
+      const joined = rows
+        .map((r) => (Array.isArray(r?.segments) ? r.segments.map((s) => String(s?.value ?? '')).join('') : ''))
+        .join('');
+      if (joined.trim()) out.set(sk, joined.trim());
+    }
+  } else if (goldenSamples && goldenSamples.length) {
+    for (const g of goldenSamples) {
+      const sk = String(g.standardKey || '').trim();
+      if (!sk) continue;
+      const joined = Array.isArray(g.segments) ? g.segments.map((s) => String(s?.value ?? '')).join('') : '';
+      if (joined.trim() && !out.has(sk)) out.set(sk, joined.trim());
+    }
+  }
+  const refKeys = ['styleCode', 'brand', 'lastCode', 'soleCode', 'colorCode', 'materialCode', 'status'];
+  if (reference && typeof reference === 'object') {
+    for (const k of refKeys) {
+      const v = reference[k];
+      if (v != null && String(v).trim() && !out.has(k)) out.set(k, String(v).trim());
+    }
+  }
+  return out;
+}
+
 /** joinPath 最后一节的字段名（小写），用于拒绝楦/底以 .id 结尾的错误路径 */
 function joinPathLastFieldLower(pathArr) {
   const last = pathArr && pathArr.length ? pathArr[pathArr.length - 1] : '';
   const s = String(last);
   const dot = s.lastIndexOf('.');
   return dot > 0 ? s.slice(dot + 1).trim().toLowerCase() : '';
+}
+
+/**
+ * AI 新 DSL：中间段 { sourceTable, sourceField, targetTable, targetField }，末段 { targetTable, valueField }。
+ * 转为与引擎/前端兼容的 table.field 链。
+ */
+function structuredJoinPathToLegacyStringPath(segments) {
+  const norm = (x) => String(x ?? '').trim();
+  if (!Array.isArray(segments) || segments.length < 2) return null;
+  const out = [];
+  for (let i = 0; i < segments.length - 1; i++) {
+    const seg = segments[i];
+    if (!seg || typeof seg !== 'object') return null;
+    const st = norm(seg.sourceTable);
+    const sf = norm(seg.sourceField);
+    const tt = norm(seg.targetTable);
+    const tf = norm(seg.targetField);
+    if (!st || !sf || !tt || !tf) return null;
+    if (norm(seg.valueField)) return null;
+    if (i === 0) out.push(`${st}.${sf}`);
+    else out.push(`${st}.${sf}`);
+    out.push(`${tt}.${tf}`);
+  }
+  const last = segments[segments.length - 1];
+  if (!last || typeof last !== 'object') return null;
+  const tt = norm(last.targetTable);
+  const vf = norm(last.valueField);
+  if (!tt || !vf) return null;
+  if (norm(last.targetField) || norm(last.sourceTable) || norm(last.sourceField)) return null;
+  out.push(`${tt}.${vf}`);
+  return out.length >= 2 ? out : null;
+}
+
+/** AI 输出：结构化 joinPath 数组或旧版 string[]（table.field） */
+function normalizeAiJoinPathToStringPath(raw) {
+  if (!Array.isArray(raw) || !raw.length) return [];
+  if (typeof raw[0] === 'object' && raw[0] !== null) {
+    return structuredJoinPathToLegacyStringPath(raw) || [];
+  }
+  return raw.map((p) => String(p).trim()).filter(Boolean);
 }
 
 function isModelNotFoundError(e) {
@@ -383,6 +460,14 @@ function heuristicInferSuggestions({ tables }) {
     findTableBy((t) => t.tableKey.includes('material') && t.columns.some((c) => normalizeLower(c?.name) === 'code' || normalizeLower(c?.name) === 'name')) ||
     findTableBy((t) => t.tableKey.includes('material'));
 
+  const baseBrand =
+    findTableBy(
+      (t) =>
+        t.tableKey.includes('brand') &&
+        (t.tableKey.includes('base') || t.tableKey.includes('wms')) &&
+        t.columns.some((c) => normalizeLower(c?.name) === 'id' || normalizeLower(c?.comment).includes('id'))
+    ) || findTableBy((t) => t.tableKey.includes('brand') && t.columns.some((c) => normalizeLower(c?.name) === 'id'));
+
   const pickIdLike = (kw) =>
     findColIn(product, (c) => normalizeLower(c?.name).includes(kw) && (normalizeLower(c?.name).includes('id') || normalizeLower(c?.comment).includes('id'))) ||
     findColIn(product, (c) => normalizeLower(c?.comment).includes(kw) && normalizeLower(c?.comment).includes('id'));
@@ -427,6 +512,19 @@ function heuristicInferSuggestions({ tables }) {
     outJoinPaths.push({
       targetStandardKey: 'materialCode',
       path: [`${productName}.${materialId.name}`, `${baseMaterial.tableName}.${idCol(baseMaterial)}`, `${baseMaterial.tableName}.${code?.name || 'name'}`],
+    });
+  }
+
+  if (productName && brandCol && baseBrand?.tableName) {
+    const brandNameCol =
+      findColIn(baseBrand, (c) => normalizeLower(c?.name) === 'brand_name') ||
+      findColIn(baseBrand, (c) => normalizeLower(c?.name) === 'name') ||
+      findColIn(baseBrand, (c) => normalizeLower(c?.name).includes('brand') && normalizeLower(c?.name).includes('name')) ||
+      findColIn(baseBrand, (c) => normalizeLower(c?.comment).includes('品牌') && !normalizeLower(c?.name).includes('id'));
+    const bname = brandNameCol?.name || 'brand_name';
+    outJoinPaths.push({
+      targetStandardKey: 'brand',
+      path: [`${productName}.${brandCol}`, `${baseBrand.tableName}.${idCol(baseBrand)}`, `${baseBrand.tableName}.${bname}`],
     });
   }
 
@@ -958,7 +1056,7 @@ app.get('/api/table-samples', async (req, res) => {
   return res.json({ ok: true, fileName, headers, samples });
 });
 
-// 预览：根据当前 mapping（含 CHAIN joinPath）从最新 XLSX 抽取一行真实数据
+// 预览：根据当前 mapping（结构化 JoinPath + resolveRecursiveValue）从最新快照目录 XLSX 抽取一行真实数据
 app.post('/api/preview-mapping-row', async (req, res) => {
   await ensureStorageDirs();
   try {
@@ -966,7 +1064,11 @@ app.post('/api/preview-mapping-row', async (req, res) => {
     if (!mappingArr?.length) return res.status(400).json({ ok: false, error: 'mapping array required' });
     const latestDir = await getLatestDataTablesDir();
     const standardMap = buildStandardMap(mappingArr);
-    const resolved = await resolveFirstActiveRowFromFolder({ folderPath: latestDir, standardMap });
+    const resolved = await resolveFirstActiveRowFromFolder({
+      folderPath: latestDir,
+      standardMap,
+      traceJoins: true,
+    });
     if (!resolved.ok) return res.json({ ok: false, error: resolved.error || 'resolve failed' });
     return res.json({
       ok: true,
@@ -975,6 +1077,7 @@ app.post('/api/preview-mapping-row', async (req, res) => {
       usedFallbackRow: resolved.usedFallbackRow,
       warning: resolved.warning,
       row: resolved.row || {},
+      engine: 'resolveRecursiveValue',
     });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e instanceof Error ? e.message : 'preview failed' });
@@ -1061,6 +1164,7 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
     req.body?.sampleRow && typeof req.body.sampleRow === 'object' && !Array.isArray(req.body.sampleRow)
       ? req.body.sampleRow
       : null;
+  const goldenExpectedMap = buildGoldenExpectedMap({ goldenBlocks, goldenSamples, reference });
   if (!sqlText.trim()) return res.status(400).json({ ok: false, error: 'sqlText is required' });
   if (!genAI) return res.status(500).json({ ok: false, error: 'GEMINI_API_KEY is not configured' });
 
@@ -1081,6 +1185,7 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
           '',
           '你拥有一个“正确样例对照”（Golden Record），用于帮助推断隐含外键与 join path：',
           `- 款号(styleCode) = ${String(reference?.styleCode || '')}`,
+          reference?.brand ? `- 品牌(brand) = ${String(reference?.brand || '')}（若为可读名称而主表存 ID，必须经品牌基础表 join）` : '',
           reference?.lastCode ? `- 楦号(lastCode) = ${String(reference?.lastCode || '')}` : '',
           reference?.soleCode ? `- 底号(soleCode) = ${String(reference?.soleCode || '')}` : '',
           reference?.colorCode ? `- 颜色(colorCode) = ${String(reference?.colorCode || '')}` : '',
@@ -1184,33 +1289,6 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
         const x = String(s ?? '').trim();
         return Boolean(x) && /^[0-9]+$/.test(x);
       };
-      const expectedValueByStandardKey = (() => {
-        const out = new Map();
-        if (goldenBlocks && goldenBlocks.length) {
-          for (const b of goldenBlocks) {
-            const sk = String(b.standardKey || '').trim();
-            if (!sk) continue;
-            const goal = String(b.targetGoal || '').trim();
-            if (goal) {
-              out.set(sk, goal);
-              continue;
-            }
-            const rows = Array.isArray(b.rows) ? b.rows : [];
-            const joined = rows
-              .map((r) => (Array.isArray(r?.segments) ? r.segments.map((s) => String(s?.value ?? '')).join('') : ''))
-              .join('');
-            if (joined.trim()) out.set(sk, joined.trim());
-          }
-        } else if (goldenSamples && goldenSamples.length) {
-          for (const g of goldenSamples) {
-            const sk = String(g.standardKey || '').trim();
-            if (!sk) continue;
-            const joined = Array.isArray(g.segments) ? g.segments.map((s) => String(s?.value ?? '')).join('') : '';
-            if (joined.trim() && !out.has(sk)) out.set(sk, joined.trim());
-          }
-        }
-        return out;
-      })();
       const goldenKeysWithMultiRows =
         goldenBlocks && goldenBlocks.length
           ? goldenBlocks.filter((b) => b.rows.length > 1).map((b) => b.standardKey)
@@ -1292,13 +1370,26 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
           '',
           '【User-Defined First — 用户指定优先（绝对硬性规则）】',
           '当用户在 Step2 的黄金样本中明确选择了 tableName 与 fieldName（即某个具体的 目标表.目标字段），你严禁改选其它字段作为终点（尤其禁止把 *.id 替换为 *.code 或其它列）。',
-          '你的任务从“猜字段”变为“找路径”：必须输出从【主表】出发，经哪些中间 ID/外键字段，才能连到用户指定的那个 目标表.目标字段；并确保 path/parts[].joinPath 的最后一个节点就是该 目标表.目标字段（字符串必须 100% 与用户选择一致）。',
+          '',
+          '【业务目标 — 值匹配优先（必读）】',
+          '主表上的外键/关联列往往是「内部 ID」，它只是 Join 链上的过客，不是用户要看的最终答案。用户与黄金样本要的是「业务可读值」：例如楦号 L-B26097M、款号 SBOX…、材质编码 LT04。',
+          '你必须在 SQL/DDL 中主动寻找「最后一公里」：从维表主键 id 或中间键继续延伸到 code、style_no、category_code、last_code、sole_code、material_code、number、name 等**业务列**，使整条链执行后得到的**末字段取值**能与黄金样本字符串一致。不要把路径停在纯数字 id 上，除非用户样本本身就是该数字。',
+          '',
+          '你的任务从“猜字段”变为“找路径”：从【主表】出发，用结构化 joinPath 描述每一跳，直到**最后一项的 valueField** 指向要展示给用户的业务值列（与 Step2 所选字段一致）。',
+          '',
+          '【JoinPath 输出协议 — 必须严格遵守】',
+          'joinPathSuggestions 与 concatMappingSuggestions.parts[].joinPath 必须使用**结构化数组**（禁止仅用 string[] 的 table.field 链）：',
+          '- 前若干项为「关联跳」，每项必须含四键：sourceTable, sourceField, targetTable, targetField（在 targetTable 中用 targetField 匹配当前键值）。',
+          '- **最后一项必须为终点**，且仅含两键：targetTable, valueField（表示在当前维表行上读取的最终业务列）。',
+          '- 示例单跳：[{"sourceTable":"ods_product_df","sourceField":"associated_last","targetTable":"ods_last_df","targetField":"id"},{"targetTable":"ods_last_df","valueField":"code"}]',
+          '- 禁止在最后一项写 sourceField/targetField；禁止省略末项 valueField。',
           '',
           '【硬性约束 — 必须遵守，否则视为错误输出】',
-          '1) 终点必须匹配「值」：joinPathSuggestions.path 与 concatMappingSuggestions.parts[].joinPath 的最后一个节点，其字段取值形态必须与用户黄金样本一致（例如款号样本 SBOX…、楦号 L-B…、材质 LT04）。你必须在脑中校验：沿该 path 取到的末字段值应与样本同类型（字符串编码、可打印业务号），而不是内部自增 ID。',
-          '2) 严禁「ID 终点」与「纯数字陷阱」：路径最后一节不得为 .id / *_id；若末字段取值为纯数字且用户黄金样本不是纯数字，也视为错误终点（这通常仍是内部 ID）。除非用户黄金样本值本身就是该数字 ID 且与 DDL 一致。若当前唯一可达列为维表主键 id，你必须在同表继续延伸到业务列：优先寻找列名或 COMMENT 含「编号」「编码」「代码」「款」「楦」「底」「材质」的字段，如 .code、.style_no、.category_code、.last_code、.sole_code、.material_code、.number、.name 等，使 path 末节点为这些「值列」。',
-          '3) 路径完整性：从主表到目标值列的每一跳关联都必须写入 path（不得跳步）。例如 Master 上外键列 -> 维表主键/唯一键 -> 维表业务编码列，应完整输出三步：["master_table.fk_col","dim_table.id","dim_table.code"]（表名用 DDL 原名）。',
-          '4) 表名严格对齐：smartSuggestions.sourceTable、path 与 joinPath 中出现的所有 table 名称必须与「DDL 表名清单」中的字符串 100% 一致（大小写、下划线、前缀如 ods_ 均不得改写或缩写）。若不确定表名，只能从清单中择一，禁止臆造缩写表名。',
+          '1) 终点必须匹配「值」：末项 valueField 取到的值在形态上必须与用户黄金样本一致（可打印业务号，而非无意图的纯内部 ID）。',
+          '2) 严禁「ID 终点」与「纯数字陷阱」：最后一项的 valueField 不得名为 id 或 *_id；若该列取值为纯数字而用户黄金样本含字母/横杠等业务字符，则必须改选 code/name 等业务列。除非用户样本本身即为该数字 ID。',
+          '3) 路径完整性：主表外键 → 维表定位键 → … → 维表业务值列，每一跳都写入 joinPath，不得跳步。',
+          '4) 表名严格对齐：smartSuggestions 与 joinPath 内所有 table 名须与「DDL 表名清单」100% 一致，禁止臆造缩写。',
+          '5) 【品牌 brand — 数字主表 vs 字符串黄金样本】若黄金样本中品牌为**可读名称**（如 Bruno Marc），而主表 `brand`（或 smartSuggestions 中映射列）在业务上存的是**数值 ID**（如 1），则**必须**输出 targetStandardKey=brand 的 joinPath：主表该列 → 品牌维表（DDL 中如 ods_wms_base_brand_df 或含 base_brand / wms+brand 的表）的 id（或主键）→ **品牌展示列**（优先 brand_name，其次 name）。禁止把可执行路径的终点留在主表数字列上。结构化 joinPath 示例末项 valueField 须为 brand_name（或与 COMMENT 一致之展示列）。Legacy CHAIN 等价示例：CHAIN|ods_pdm_pdm_product_info_df.brand->ods_wms_base_brand_df.id->ods_wms_base_brand_df.brand_name（表名以 DDL 为准，勿臆造）。',
           '',
           '【DDL 表名清单（唯一合法表名来源）】',
           allDdlTableNames.join(', '),
@@ -1317,28 +1408,42 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
           '    { "standardKey": "styleCode|brand|lastCode|soleCode|colorCode|materialCode|status", "sourceTable": "...", "sourceField": "..." }',
           '  ],',
           '  "joinPathSuggestions": [',
-          '    { "targetStandardKey": "lastCode|soleCode|colorCode|materialCode", "path": ["table.field", "table.id", "table.code"] }',
+          '    { "targetStandardKey": "lastCode", "joinPath": [',
+          '      { "sourceTable": "主表DDL名", "sourceField": "指向楦的外键列", "targetTable": "ods_xxx_last_df", "targetField": "id" },',
+          '      { "targetTable": "ods_xxx_last_df", "valueField": "code" }',
+          '    ] },',
+          '    { "targetStandardKey": "brand", "joinPath": [',
+          '      { "sourceTable": "ods_pdm_pdm_product_info_df", "sourceField": "brand", "targetTable": "ods_wms_base_brand_df", "targetField": "id" },',
+          '      { "targetTable": "ods_wms_base_brand_df", "valueField": "brand_name" }',
+          '    ] }',
           '  ],',
           '  "concatMappingSuggestions": [',
           '    { "standardKey": "materialCode", "operator": "CONCAT", "parts": [',
-          '      { "sourceTable": "DDL完整表名", "sourceField": "终点值列名", "joinPath": ["master.fk","dim.id","dim.code"] },',
-          '      { "sourceTable": "DDL完整表名", "sourceField": "category_code", "joinPath": ["master.ref","self.parent_id","self.category_code"] }',
+          '      { "sourceTable": "ods_xxx_material_df", "sourceField": "category_code", "joinPath": [',
+          '        { "sourceTable": "主表DDL名", "sourceField": "material_id", "targetTable": "ods_xxx_material_df", "targetField": "id" },',
+          '        { "targetTable": "ods_xxx_material_df", "valueField": "category_code" }',
+          '      ] },',
+          '      { "sourceTable": "ods_xxx_material_df", "sourceField": "category_code", "joinPath": [',
+          '        { "sourceTable": "主表DDL名", "sourceField": "sub_material_ref", "targetTable": "ods_xxx_material_df", "targetField": "parent_id" },',
+          '        { "targetTable": "ods_xxx_material_df", "valueField": "category_code" }',
+          '      ] }',
           '    ] }',
           '  ]',
           '}',
           '',
-          'concatMappingSuggestions：需要拼接时 operator 恒为 "CONCAT"；parts≥2；每 part 的 joinPath 最后一节必须是值列（见硬性约束）；sourceTable 必须来自 DDL 表名清单；若全路径已由 joinPath 表达，sourceField 填路径终点字段名。',
+          '说明：joinPathSuggestions 也可额外带 "path": ["a.b","c.d"] 兼容旧版，但优先且推荐只输出 joinPath 结构化数组。concatMappingSuggestions：operator 恒为 "CONCAT"；parts≥2；每 part 的 joinPath 末项必须是 { targetTable, valueField }；sourceField 填 valueField 列名以便展示。',
           '',
           '【复合维度 CONCAT（多行）— 必须读 notes】',
           '若同一 standardKey 在 Step2 中有多行样本（rows.length>1），必须返回 operator:"CONCAT" 且 parts 顺序与行顺序一致。',
           '你必须阅读每行 notes 线索：例如材质 LT04，若 notes 提示父子关系，请利用 parent_id 做自连接（Self-Join）：(Parent.category_code) + (Child.category_code)。在 parts 中分别给出父段与子段的 joinPath，并确保终点字段仍是用户指定的 category_code（或用户指定字段）。',
           '',
-          '侦探式推理步骤（必须按这个思路找链路并给出 path）：',
-          '1) 哪张表能找到款号（通常是 product_info 的 style_wms 或类似字段）？',
-          '2) 在这张表里哪个字段可能指向楦头/大底/颜色/材质的 ID（如 associated_last_type、associated_sole_info、sole_id、initial_sample_color_id、material_id、main_material 等）？',
-          '3) 若 soleCode/materialCode 一次推导失败，请扩大搜索：检查 DDL 清单中是否存在 ods_pdm_pdm_base_heel_df（大底/鞋跟基础表）或 ods_pdm_pdm_base_material_df（材质基础表），并将其主键 id 与主表中外键（如 associated_sole_info、material_id 等）做关联，再跳到其业务编码列（code/number 等），末节点禁止停在 .id。',
-          '4) 哪张表能找到楦号/底号/颜色/材质（搜索所有名为 code/name/number 的字段注释与列名）？',
-          '5) 这两张表如何通过 ID 关联？请输出可执行的 joinPathSuggestions.path。',
+          '侦探式推理步骤（必须按此思路输出结构化 joinPath）：',
+          '1) 哪张表承载款号（如 style_wms）？',
+          '2) 主表上哪些外键指向**品牌 / 楦 / 底 / 色 / 材**维表（brand、associated_*、sole_id、material_id 等）？主表上的数值多为 ID，仅作跳板。',
+          '3) 品牌：对照黄金样本若为「名称字符串」而主表为数字，必须经品牌基础表解析出 brand_name（或等价列），不得停在主表 1。',
+          '4) 在维表 DDL 中定位「最后一公里」业务列：brand_name、code、category_code、last_code、name 等，使 valueField 读出后与黄金样本同形态。',
+          '5) 若需 ods_pdm_pdm_base_heel_df / ods_pdm_pdm_base_material_df 等，先 id 关联再延伸到业务编码列；末项 valueField 禁止为裸 id（除非样本为数字）。',
+          '6) 为每个目标维度写出完整 joinPath（含末项 valueField），确保后端可按数组逐步执行并得到目标业务值。',
           '',
           '进阶任务（Logic Sandbox）：',
           '若提供了“样本行”，你必须对比【样本表中的列值】与【DDL 字段结构】，找出将样本中的值 A 通过 Join 推导到值 B 的完整路径（允许跨最多 3 张表）。',
@@ -1387,9 +1492,11 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
 
         for (const j of jp) {
           const targetStandardKey = typeof j?.targetStandardKey === 'string' ? j.targetStandardKey.trim() : '';
-          const pathArr = Array.isArray(j?.path) ? j.path.map((p) => String(p).trim()).filter(Boolean) : [];
+          const rawJoin =
+            Array.isArray(j?.joinPath) && j.joinPath.length ? j.joinPath : Array.isArray(j?.path) ? j.path : [];
+          const pathArr = normalizeAiJoinPathToStringPath(rawJoin);
           if (!targetStandardKey || pathArr.length < 2) continue;
-          const expected = expectedValueByStandardKey.get(targetStandardKey) || '';
+          const expected = goldenExpectedMap.get(targetStandardKey) || '';
           const lastLower = joinPathLastFieldLower(pathArr);
           if (lastLower === 'id' || lastLower.endsWith('_id')) {
             if (!isNumericLike(expected)) continue;
@@ -1402,15 +1509,19 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
           const standardKey = typeof c?.standardKey === 'string' ? c.standardKey.trim() : '';
           const partsRaw = Array.isArray(c?.parts) ? c.parts : [];
           const parts = partsRaw
-            .map((p) => ({
-              sourceField: typeof p?.sourceField === 'string' ? p.sourceField.trim() : '',
-              sourceTable: typeof p?.sourceTable === 'string' ? p.sourceTable.trim() : '',
-              joinPath: Array.isArray(p?.joinPath) ? p.joinPath.map((x) => String(x).trim()).filter(Boolean) : undefined,
-            }))
+            .map((p) => {
+              const rawJp = Array.isArray(p?.joinPath) && p.joinPath.length ? p.joinPath : undefined;
+              const jpNorm = rawJp ? normalizeAiJoinPathToStringPath(rawJp) : undefined;
+              return {
+                sourceField: typeof p?.sourceField === 'string' ? p.sourceField.trim() : '',
+                sourceTable: typeof p?.sourceTable === 'string' ? p.sourceTable.trim() : '',
+                joinPath: jpNorm && jpNorm.length >= 2 ? jpNorm : undefined,
+              };
+            })
             .filter((p) => {
               if (!p.sourceField || !p.sourceTable) return false;
               const jpArr = p.joinPath;
-              const expected = expectedValueByStandardKey.get(standardKey) || '';
+              const expected = goldenExpectedMap.get(standardKey) || '';
               if (Array.isArray(jpArr) && jpArr.length >= 2) {
                 const lastLower = joinPathLastFieldLower(jpArr);
                 if (lastLower === 'id' || lastLower.endsWith('_id')) {
@@ -1442,6 +1553,14 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
       smartSuggestions = heuristic.smartSuggestions || [];
       joinPathSuggestions = heuristic.joinPathSuggestions || [];
     }
+
+    const latestDirForBacktest = await getLatestDataTablesDir();
+    joinPathSuggestions = await validateJoinPathSuggestionsWithGoldenXlsx({
+      joinPathSuggestions,
+      goldenByStandardKey: goldenExpectedMap,
+      folderPath: latestDirForBacktest,
+      smartSuggestions,
+    });
 
     setAIStatus({ status: 'done', model: modelList[0] || '', message: `分批解析完成：${parsedNames.length}/${total}`, parsedCount: parsedNames.length, totalCount: total, parsedTables: parsedNames });
     return res.json({
@@ -1518,108 +1637,18 @@ app.get('/api/load-schema-draft', async (_req, res) => {
   }
 });
 
-/** Step2 持久化：dimensionSamples / goldenByDimension 同源结构 */
-function normalizeDimensionSamplesPayload(raw) {
-  const out = {};
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
-  for (const [key, grp] of Object.entries(raw)) {
-    const standardKey = String(key || '').trim();
-    if (!standardKey) continue;
-    const targetGoal = typeof grp?.targetGoal === 'string' ? String(grp.targetGoal) : '';
-    const rowsRaw = Array.isArray(grp?.rows) ? grp.rows : [];
-    const rows = rowsRaw.map((r) => {
-      const notes = typeof r?.notes === 'string' ? String(r.notes) : '';
-      const id = typeof r?.id === 'string' && r.id.trim() ? r.id.trim() : '';
-      const segments = Array.isArray(r?.segments)
-        ? r.segments.map((s) => ({
-            tableName: typeof s?.tableName === 'string' ? s.tableName : '',
-            fieldName: typeof s?.fieldName === 'string' ? s.fieldName : '',
-            value: typeof s?.value === 'string' ? s.value : String(s?.value ?? ''),
-          }))
-        : [];
-      return { id, notes, segments };
-    });
-    out[standardKey] = { targetGoal, rows };
-  }
-  return out;
-}
-
 app.post('/api/save-schema-draft', async (req, res) => {
   try {
     await ensureStorageDirs();
     const draftDir = path.dirname(SCHEMA_DRAFT_PATH);
     fse.ensureDirSync(draftDir);
-
-    let prevDraft = null;
-    try {
-      if (await fse.pathExists(SCHEMA_DRAFT_PATH)) {
-        prevDraft = await fse.readJson(SCHEMA_DRAFT_PATH);
-      }
-    } catch {
-      prevDraft = null;
-    }
-    const body = req.body || {};
-    const ddlText = typeof body.ddlText === 'string' ? body.ddlText : '';
-    const masterTable = typeof body.masterTable === 'string' ? body.masterTable : '';
-    const goldenRaw = body.goldenRecord;
-    const goldenRecord =
-      goldenRaw && typeof goldenRaw === 'object' && !Array.isArray(goldenRaw) ? goldenRaw : {};
-    const goldenSamplesRaw = body.goldenSamples;
-    const goldenSamples = Array.isArray(goldenSamplesRaw)
-      ? goldenSamplesRaw
-          .map((x) => {
-            if (x && Array.isArray(x.segments) && x.segments.length) {
-              return {
-                standardKey: typeof x.standardKey === 'string' ? x.standardKey : '',
-                segments: x.segments.map((s) => ({
-                  tableName: typeof s?.tableName === 'string' ? s.tableName : '',
-                  fieldName: typeof s?.fieldName === 'string' ? s.fieldName : '',
-                  value: typeof s?.value === 'string' ? s.value : '',
-                })),
-              };
-            }
-            return {
-              tableName: typeof x?.tableName === 'string' ? x.tableName : '',
-              fieldName: typeof x?.fieldName === 'string' ? x.fieldName : '',
-              value: typeof x?.value === 'string' ? x.value : '',
-            };
-          })
-          .filter((x) => {
-            if (x.segments) return x.segments.some((s) => s.tableName || s.fieldName || s.value);
-            return x.tableName || x.fieldName || x.value;
-          })
-      : [];
-
-    const dimRaw = body.dimensionSamples ?? body.goldenByDimension;
-    let dimensionSamplesOut = {};
-    if (dimRaw && typeof dimRaw === 'object' && !Array.isArray(dimRaw)) {
-      dimensionSamplesOut = normalizeDimensionSamplesPayload(dimRaw);
-    } else if (prevDraft?.dimensionSamples && typeof prevDraft.dimensionSamples === 'object') {
-      dimensionSamplesOut = normalizeDimensionSamplesPayload(prevDraft.dimensionSamples);
-    } else if (prevDraft?.goldenByDimension && typeof prevDraft.goldenByDimension === 'object') {
-      dimensionSamplesOut = normalizeDimensionSamplesPayload(prevDraft.goldenByDimension);
-    }
-
+    const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
     const out = {
       savedAt: new Date().toISOString(),
-      ddlText,
-      masterTable,
-      goldenRecord,
-      goldenSamples,
-      dimensionSamples: dimensionSamplesOut,
-      goldenByDimension: dimensionSamplesOut,
+      ...body,
     };
 
-    if (body.sandboxMergedRow && typeof body.sandboxMergedRow === 'object' && !Array.isArray(body.sandboxMergedRow)) {
-      out.sandboxMergedRow = body.sandboxMergedRow;
-    }
-    if (typeof body.sandboxUploadHint === 'string') {
-      out.sandboxUploadHint = body.sandboxUploadHint;
-    }
-    if (Array.isArray(body.standardFields)) {
-      out.standardFields = body.standardFields;
-    }
-
+    // 绝对路径落盘，确保目录存在（避免写到错误 cwd）
     fse.ensureDirSync(path.dirname(SCHEMA_DRAFT_PATH));
     await fse.writeJson(SCHEMA_DRAFT_PATH, out, { spaces: 2 });
     return res.json({ ok: true });
