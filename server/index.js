@@ -796,7 +796,7 @@ const sandboxUpload = multer({
     },
     filename: (_req, file, cb) => {
       const safe = String(file.originalname || 'sample.xlsx').replace(/[^\w.\-]+/g, '_');
-      cb(null, `${Date.now()}_${safe}`);
+      cb(null, safe);
     },
   }),
   limits: { fileSize: 50 * 1024 * 1024 },
@@ -883,9 +883,24 @@ app.get('/api/assets', async (_req, res) => {
   res.json(assets);
 });
 
-// 扫描最新日期目录下的 XLSX，并读取首行表头
-app.get('/api/table-headers', async (_req, res) => {
-  const latestDir = await getLatestDataTablesDir();
+function normalizeScope(scope) {
+  const s = String(scope || '').trim().toLowerCase();
+  if (s === 'sandbox') return 'sandbox';
+  if (s === 'data_tables' || s === 'datatables' || s === 'prod' || s === 'production') return 'data_tables';
+  return '';
+}
+
+function pickTablesRootForScope(scope) {
+  const s = normalizeScope(scope);
+  if (s === 'sandbox') return DIRS.sandbox;
+  return null;
+}
+
+// 扫描指定目录下的 XLSX，并读取首行表头（SchemaMapping 强制读 sandbox）
+app.get('/api/table-headers', async (req, res) => {
+  const scope = normalizeScope(req.query?.scope);
+  const root = pickTablesRootForScope(scope);
+  const latestDir = root || (await getLatestDataTablesDir());
   const entries = await fse.readdir(latestDir, { withFileTypes: true });
   const files = entries.filter((e) => e.isFile() && isExcelFileName(e.name)).map((e) => e.name).sort();
 
@@ -905,7 +920,7 @@ app.get('/api/table-headers', async (_req, res) => {
     }
   }
 
-  res.json({ ok: true, latestDir: path.basename(latestDir), tables: out });
+  res.json({ ok: true, latestDir: root ? 'sandbox' : path.basename(latestDir), tables: out });
 });
 
 // 返回指定文件的列抽样（每列前 3 条），用于前端映射校验
@@ -915,7 +930,9 @@ app.get('/api/table-samples', async (req, res) => {
     return res.status(400).json({ ok: false, error: 'Invalid fileName' });
   }
 
-  const latestDir = await getLatestDataTablesDir();
+  const scope = normalizeScope(req.query?.scope);
+  const root = pickTablesRootForScope(scope);
+  const latestDir = root || (await getLatestDataTablesDir());
   const fullPath = path.join(latestDir, fileName);
   if (!(await fse.pathExists(fullPath))) {
     return res.status(404).json({ ok: false, error: 'File not found' });
@@ -929,30 +946,32 @@ app.get('/api/table-samples', async (req, res) => {
   if (!sheet) return res.json({ ok: true, fileName, headers: [], samples: {} });
   const headers = getSheetHeaders(sheet);
   const samples = getSheetColumnSamples(sheet, headers, 3);
-  return res.json({ ok: true, fileName, headers, samples });
+  return res.json({ ok: true, fileName, headers, samples, scope: root ? 'sandbox' : 'data_tables' });
 });
 
-// 预览：根据当前 mapping（结构化 JoinPath + resolveRecursiveValue）从最新快照目录 XLSX 抽取一行真实数据
+// 预览：根据当前 mapping（结构化 JoinPath + resolveRecursiveValue）从 sandbox 样本目录抽取一行数据（配置验证专用）
 app.post('/api/preview-mapping-row', async (req, res) => {
   await ensureStorageDirs();
   try {
     const mappingArr = Array.isArray(req.body?.mapping) ? req.body.mapping : null;
     const targetStyle = String(req.body?.targetStyle || '').trim();
+    const scope = normalizeScope(req.body?.scope);
     if (!mappingArr?.length) return res.status(400).json({ ok: false, error: 'mapping array required' });
-    const latestDir = await getLatestDataTablesDir();
+    // 配置页强制 sandbox：默认 sandbox；若明确传 data_tables 则用于诊断/看板侧（慎用）
+    const latestDir = scope === 'data_tables' ? await getLatestDataTablesDir() : DIRS.sandbox;
     if (!(await fse.pathExists(latestDir))) {
       return res.status(404).json({
         ok: false,
-        error: 'Latest data_tables directory not found',
-        code: 'DataDirMissing',
+        error: scope === 'data_tables' ? 'Latest data_tables directory not found' : 'Sandbox directory not found',
+        code: scope === 'data_tables' ? 'DataDirMissing' : 'SandboxDirMissing',
       });
     }
     const preload = await readAllFilesFromFolder(latestDir);
     if (!preload.xlsxTables?.length) {
       return res.status(404).json({
         ok: false,
-        error: 'No Excel files in latest data_tables snapshot',
-        code: 'NoExcelInDataDir',
+        error: scope === 'data_tables' ? 'No Excel files in latest data_tables snapshot' : 'No Excel files in sandbox',
+        code: scope === 'data_tables' ? 'NoExcelInDataDir' : 'NoExcelInSandbox',
       });
     }
     const standardMap = buildStandardMap(mappingArr);
@@ -973,7 +992,7 @@ app.post('/api/preview-mapping-row', async (req, res) => {
     }
     return res.json({
       ok: true,
-      latestDir: path.basename(latestDir),
+      latestDir: scope === 'data_tables' ? path.basename(latestDir) : 'sandbox',
       mainTable: resolved.mainTable,
       usedFallbackRow: resolved.usedFallbackRow,
       warning: resolved.warning,
@@ -1830,6 +1849,7 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
 
       const buildSingleDimensionPrompt = ({ dimKey, dimExpected }) => {
         const expectation = dimExpected != null ? String(dimExpected).trim() : '';
+        const isNonNumericExpectation = Boolean(expectation) && !/^\d+$/.test(expectation);
         const hintLines =
           goldenBlocks && goldenBlocks.length
             ? (() => {
@@ -1877,6 +1897,9 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
           '2) 若 dimKey=materialCode 且用户提供多行样本/多段目标，请输出 concatMappingSuggestions（operator:"CONCAT"，parts 数量与样本行一致）。',
           '3) 路径末项必须是 { targetTable, valueField } 且 valueField 必须是业务值列（code/name/category_code/brand_name...），禁止以 id 结尾。',
           '4) 你严禁输出“未找到”。请在 DDL 中寻找最可能的 *_id / associated_* 链路（允许 0~2 中间表）。',
+          dimKey === 'brand' && isNonNumericExpectation
+            ? '5) 【强制品牌 Join】当黄金期望值为可读字符串（如 Bruno Marc）时，主表 brand 往往是数字 ID。你严禁输出 brand 的 direct/smartSuggestions 作为最终答案；必须输出 joinPathSuggestions：主表.brand(数字) -> 品牌表.id -> 品牌表.brand_name/name。'
+            : '',
           '',
           '【DDL 表名清单】',
           allDdlTableNames.join(', '),
@@ -1905,6 +1928,7 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
 
       // 回测数据源：必须使用 Sandbox（用户刚上传的样本）
       const latestDirForBacktest = DIRS.sandbox;
+      const targetStyleForBacktest = String(goldenExpectedMap.get('styleCode') || reference?.styleCode || '').trim();
       let smartSuggestions = [];
       let joinPathSuggestions = [];
       let concatMappingSuggestions = [];
@@ -1924,9 +1948,41 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
           }
           const mainTableName = getLogicalTableName(main.fileName);
           const statusCol = (smartSuggestionsForMain || []).find((x) => String(x?.standardKey || '').trim() === 'status')?.sourceField || '';
+          const styleCol = (smartSuggestionsForMain || []).find((x) => String(x?.standardKey || '').trim() === 'styleCode')?.sourceField || '';
           const rowsCandidate = main.rows || [];
-          const rowsToScan = statusCol ? rowsCandidate.filter((r) => isTruthyActiveStatus(r?.[statusCol])) : rowsCandidate;
-          const row = rowsToScan[0] || rowsCandidate[0] || null;
+          const eqLoose = (a, b) => String(a ?? '').trim().toUpperCase() === String(b ?? '').trim().toUpperCase();
+          const rowHas = (row, target) => {
+            if (!row || !target) return false;
+            for (const v of Object.values(row)) if (eqLoose(v, target)) return true;
+            return false;
+          };
+          const activeRows = statusCol ? rowsCandidate.filter((r) => isTruthyActiveStatus(r?.[statusCol])) : rowsCandidate;
+          const targetStyle = String(targetStyleForBacktest || '').trim();
+
+          // 对齐回测行：必须先用 targetStyle 定位主表行，严禁直接取第一行
+          let row = null;
+          if (targetStyle) {
+            if (styleCol) {
+              row = activeRows.find((r) => eqLoose(r?.[styleCol], targetStyle)) || rowsCandidate.find((r) => eqLoose(r?.[styleCol], targetStyle)) || null;
+              aiTraceLineSync(
+                `[现场 C] RowAlign: search styleCol=${JSON.stringify(styleCol)} targetStyle=${JSON.stringify(targetStyle)} => ${row ? 'HIT' : 'MISS'}`
+              );
+            } else {
+              row = activeRows.find((r) => rowHas(r, targetStyle)) || rowsCandidate.find((r) => rowHas(r, targetStyle)) || null;
+              aiTraceLineSync(
+                `[现场 C] RowAlign: styleCol missing; brute-search targetStyle=${JSON.stringify(targetStyle)} => ${row ? 'HIT' : 'MISS'}`
+              );
+            }
+            if (!row) {
+              aiTraceLineSync(
+                `[现场 C] PATH_BROKEN: cannot locate master row by targetStyle=${JSON.stringify(targetStyle)} in sandbox; check uploaded XLSX content`
+              );
+              return;
+            }
+          } else {
+            // 若用户未提供 styleCode 黄金值：退回第一条生效行（保持兼容）
+            row = activeRows[0] || rowsCandidate[0] || null;
+          }
           if (!row) {
             aiTraceLineSync(`[${dimKey}] [现场 C] PATH_BROKEN: main table has no rows`);
             return;
@@ -2014,9 +2070,18 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
           }
 
           const obj = extractJsonObject(stripJsonFences(out.text));
-          const ssRaw = Array.isArray(obj?.smartSuggestions) ? obj.smartSuggestions : [];
+          let ssRaw = Array.isArray(obj?.smartSuggestions) ? obj.smartSuggestions : [];
           const jpRaw = Array.isArray(obj?.joinPathSuggestions) ? obj.joinPathSuggestions : [];
           const ccRaw = Array.isArray(obj?.concatMappingSuggestions) ? obj.concatMappingSuggestions : [];
+
+          // 强制品牌 Join：黄金为字符串时禁止 brand direct/smartSuggestions
+          if (dimKey === 'brand') {
+            const exp = String(expected || '').trim();
+            const expIsString = Boolean(exp) && !/^\d+$/.test(exp);
+            if (expIsString) {
+              ssRaw = (ssRaw || []).filter((s) => String(s?.standardKey || '').trim() !== 'brand');
+            }
+          }
 
           const jpOne = jpRaw
             .map((j) => {
@@ -2029,12 +2094,24 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
             })
             .filter(Boolean);
 
+          if (dimKey === 'brand') {
+            const exp = String(expected || '').trim();
+            const expIsString = Boolean(exp) && !/^\d+$/.test(exp);
+            if (expIsString && (!jpOne || !jpOne.length)) {
+              lastErr = 'Brand expectation is string; joinPathSuggestions is required (DIRECT is forbidden)';
+              auditLineSync(`[Audit][D] FAIL dim=${dimKey} attempt=${attempt}: ${lastErr}`);
+              aiTraceLineSync(`[现场 D] ${dimKey} Final Verdict: PATH_BROKEN (DIRECT forbidden; joinPath required)`);
+              continue;
+            }
+          }
+
           aiTraceLineSync('[Step 3] 物理回测验证...');
           const validated = await validateJoinPathSuggestionsWithGoldenXlsx({
             joinPathSuggestions: jpOne,
             goldenByStandardKey: goldenExpectedMap,
             folderPath: latestDirForBacktest,
             smartSuggestions: ssRaw,
+            targetStyle: targetStyleForBacktest,
           });
 
           if (validated && validated.length) {
@@ -2428,6 +2505,7 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
 
     // 回测数据源：必须使用 Sandbox（用户刚上传的样本）
     const latestDirForBacktest = DIRS.sandbox;
+    const targetStyleForBacktest = String(goldenExpectedMap.get('styleCode') || reference?.styleCode || '').trim();
     auditLineSync('[Audit][C] Join Execution Trace: start backtest on latest XLSX');
     auditLineSync(JSON.stringify({ latestDirForBacktest, joinPathCount: joinPathSuggestions.length }, null, 2));
     const validatedFirst = await validateJoinPathSuggestionsWithGoldenXlsx({
@@ -2435,6 +2513,7 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
       goldenByStandardKey: goldenExpectedMap,
       folderPath: latestDirForBacktest,
       smartSuggestions,
+      targetStyle: targetStyleForBacktest,
     });
     joinPathSuggestions = validatedFirst;
     auditLineSync('[Audit][D] Validation & Retry Logic: first validation result');
@@ -2486,6 +2565,7 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
           goldenByStandardKey: goldenExpectedMap,
           folderPath: latestDirForBacktest,
           smartSuggestions,
+          targetStyle: targetStyleForBacktest,
         });
         auditLineSync('[Audit][D] Retry validation result');
         auditLineSync(JSON.stringify({ validatedRetryCount: validatedRetry.length, validatedRetryKeys: validatedRetry.map((x) => x.targetStandardKey) }, null, 2));
@@ -2622,8 +2702,7 @@ app.post('/api/save-schema-draft', async (req, res) => {
   }
 });
 
-// 上传逻辑沙盒样本 XLSX（多文件可覆盖同目录，供 Join 验证）
-app.post('/api/upload-sandbox-xlsx', sandboxUpload.array('files', 50), async (req, res) => {
+async function handleSandboxUploadXlsx(req, res) {
   await ensureStorageDirs();
   const files = req.files;
   if (!files || !Array.isArray(files) || files.length === 0) {
@@ -2649,7 +2728,13 @@ app.post('/api/upload-sandbox-xlsx', sandboxUpload.array('files', 50), async (re
     }
   }
   return res.json({ ok: true, sandboxDir: 'storage/sandbox', files: out });
-});
+}
+
+// 上传逻辑沙盒样本 XLSX（专用接口；强制存入 storage/sandbox；保留原文件名便于物理对账）
+app.post('/api/upload-sandbox', sandboxUpload.array('files', 50), handleSandboxUploadXlsx);
+
+// 兼容旧接口名
+app.post('/api/upload-sandbox-xlsx', sandboxUpload.array('files', 50), handleSandboxUploadXlsx);
 
 // 沙盒校验：对 storage/sandbox 下 XLSX 套用映射，与期望 Golden 值比对
 app.post('/api/sandbox-validate-mapping', async (req, res) => {

@@ -599,7 +599,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
   const [error, setError] = useState<string | null>(null);
   const [hasAttemptedAuth, setHasAttemptedAuth] = useState(false);
 
-  const [isUploadingDataTables, setIsUploadingDataTables] = useState(false);
+  const [isUploadingSandbox, setIsUploadingSandbox] = useState(false);
 
   const [authSyncing, setAuthSyncing] = useState(false);
   const [certifyEngineRunning, setCertifyEngineRunning] = useState(false);
@@ -1003,7 +1003,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
   const refreshHeaders = async () => {
     setError(null);
     try {
-      const resp = await fetch(`${API_BASE}/api/table-headers`);
+      const resp = await fetch(`${API_BASE}/api/table-headers?scope=sandbox`);
       if (!resp.ok) throw new Error(`获取表头失败（HTTP ${resp.status}）`);
       const json = (await resp.json()) as TableHeadersResponse;
       if (!json.ok) throw new Error('获取表头失败');
@@ -1016,7 +1016,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
     }
   };
 
-  const handleDataTablesUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleSandboxUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     setError(null);
     const files = e.target.files;
     if (!files?.length) return;
@@ -1024,8 +1024,8 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
     const fd = new FormData();
     for (const f of all) fd.append('files', f);
     try {
-      setIsUploadingDataTables(true);
-      const resp = await fetch(`${API_BASE}/api/upload`, { method: 'POST', body: fd });
+      setIsUploadingSandbox(true);
+      const resp = await fetch(`${API_BASE}/api/upload-sandbox`, { method: 'POST', body: fd });
       if (!resp.ok) throw new Error(`上传失败（HTTP ${resp.status}）`);
       const json = (await resp.json().catch(() => null)) as any;
       if (!json?.ok) throw new Error(json?.error || '上传失败');
@@ -1033,7 +1033,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
     } catch (err) {
       setError(err instanceof Error ? err.message : '上传失败');
     } finally {
-      setIsUploadingDataTables(false);
+      setIsUploadingSandbox(false);
     }
     e.target.value = '';
   };
@@ -1041,7 +1041,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
   const loadSamples = async (fileName: string) => {
     if (!fileName) return;
     try {
-      const resp = await fetch(`${API_BASE}/api/table-samples?fileName=${encodeURIComponent(fileName)}`);
+      const resp = await fetch(`${API_BASE}/api/table-samples?scope=sandbox&fileName=${encodeURIComponent(fileName)}`);
       if (!resp.ok) return;
       const json = (await resp.json()) as TableSamplesResponse;
       if (!json.ok) return;
@@ -1075,7 +1075,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         signal,
-        body: JSON.stringify({ mapping, targetStyle }),
+        body: JSON.stringify({ mapping, targetStyle, scope: 'sandbox' }),
       });
       const json = (await resp.json().catch(() => null)) as any;
       if (signal?.aborted) return;
@@ -1360,7 +1360,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
 
   // 并发保护：仅在“AI 建模 / 发布 / 真实值预览抓取 / 样本 XLSX 解析”期间禁止用户修改配置
   // DDL 的即时解析（isParsingDdl）不应阻塞用户继续编辑
-  const busy = isAiModeling || authSyncing || certifyEngineRunning || isUploadingDataTables || resolvingRow;
+  const busy = isAiModeling || authSyncing || certifyEngineRunning || isUploadingSandbox || resolvingRow;
   const draftHydrating = schemaDraftLoadState === 'loading';
   const step12Disabled = busy || draftHydrating;
   const activeMapping = mappingPreview.find((m) => m.standardKey === activeFieldKey);
@@ -1428,10 +1428,13 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
             </div>
           </div>
           <div className="p-3 grid grid-cols-12 gap-3">
-            {/* Left: Physical files (data_tables) */}
+            {/* Left: Sandbox sample files (storage/sandbox) */}
             <div className="col-span-12 lg:col-span-6 border border-slate-200 rounded-xl overflow-hidden">
               <div className="px-3 py-2 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-2">
-                <div className="text-[11px] font-semibold text-slate-800">物理文件区（data_tables）</div>
+                <div className="space-y-1">
+                  <div className="text-[11px] font-semibold text-slate-800">沙盒样本区（Sandbox - 仅用于配置验证）</div>
+                  <div className="text-[11px] text-slate-500">此处文件仅供逻辑推导使用，建议上传包含 5-10 行典型数据的极简表。</div>
+                </div>
                 <label className="inline-flex items-center gap-2 px-3 py-1.5 text-[11px] font-medium rounded-lg bg-white border border-emerald-400 text-emerald-900 cursor-pointer hover:bg-emerald-50">
                   <input
                     type="file"
@@ -1439,9 +1442,9 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                     multiple
                     className="hidden"
                     disabled={step12Disabled}
-                    onChange={(e) => void handleDataTablesUpload(e)}
+                    onChange={(e) => void handleSandboxUpload(e)}
                   />
-                  {isUploadingDataTables ? '上传中…' : '上传样本 XLSX'}
+                  {isUploadingSandbox ? '上传中…' : '上传样本 XLSX'}
                 </label>
               </div>
               <div className="p-3 space-y-2">
@@ -1472,7 +1475,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                       ))}
                     </div>
                   ) : (
-                    <div className="p-3 text-[11px] text-slate-500">暂无文件。请先上传，或检查 `server/storage/data_tables`。</div>
+                    <div className="p-3 text-[11px] text-slate-500">暂无文件。请先上传，或检查 `server/storage/sandbox`。</div>
                   )}
                 </div>
               </div>

@@ -858,6 +858,7 @@ export async function validateJoinPathSuggestionsWithGoldenXlsx({
   goldenByStandardKey,
   folderPath,
   smartSuggestions,
+  targetStyle = '',
 }) {
   const list = Array.isArray(joinPathSuggestions) ? joinPathSuggestions : [];
   const goldMap =
@@ -881,6 +882,7 @@ export async function validateJoinPathSuggestionsWithGoldenXlsx({
     const f = normalize(s?.sourceField);
     if (k && f) byKey.set(k, f);
   }
+  const styleCol = byKey.get('styleCode') || '';
   const statusCol = byKey.get('status') || byKey.get('data_status') || '';
 
   const validated = [];
@@ -905,10 +907,24 @@ export async function validateJoinPathSuggestionsWithGoldenXlsx({
     }
 
     const rowsCandidate = main.rows || [];
-    const tryRows = statusCol
-      ? rowsCandidate.filter((r) => isTruthyActiveStatus(r?.[statusCol]))
-      : rowsCandidate;
-    const rowsToScan = tryRows.length ? tryRows : rowsCandidate;
+    const activeRows = statusCol ? rowsCandidate.filter((r) => isTruthyActiveStatus(r?.[statusCol])) : rowsCandidate;
+    let rowsToScan = activeRows.length ? activeRows : rowsCandidate;
+
+    // 对齐回测行：若提供 targetStyle，优先用它定位主表行（先在生效行找，再全表找）
+    const tStyle = String(targetStyle || '').trim();
+    const eqLoose = (a, b) => String(a ?? '').trim().toUpperCase() === String(b ?? '').trim().toUpperCase();
+    const rowHas = (row, target) => {
+      if (!row || !target) return false;
+      for (const v of Object.values(row)) if (eqLoose(v, target)) return true;
+      return false;
+    };
+    if (tStyle) {
+      const hit =
+        (styleCol ? rowsToScan.find((r) => eqLoose(r?.[styleCol], tStyle)) : rowsToScan.find((r) => rowHas(r, tStyle))) ||
+        (styleCol ? rowsCandidate.find((r) => eqLoose(r?.[styleCol], tStyle)) : rowsCandidate.find((r) => rowHas(r, tStyle))) ||
+        null;
+      if (hit) rowsToScan = [hit];
+    }
 
     let lastResolved = '';
     let passed = false;
