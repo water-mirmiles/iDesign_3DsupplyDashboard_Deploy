@@ -608,6 +608,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
 
   const [isUploadingSandbox, setIsUploadingSandbox] = useState(false);
   const [sandboxFiles, setSandboxFiles] = useState<string[]>([]);
+  const [isSyncingSandboxFiles, setIsSyncingSandboxFiles] = useState(false);
 
   const [authSyncing, setAuthSyncing] = useState(false);
   const [certifyEngineRunning, setCertifyEngineRunning] = useState(false);
@@ -924,6 +925,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
   const detectedTableCount = useMemo(() => sandboxFiles.length, [sandboxFiles]);
 
   const refreshSandboxFiles = useCallback(async () => {
+    setIsSyncingSandboxFiles(true);
     try {
       const resp = await fetch(`${API_BASE}/api/list-sandbox`);
       if (!resp.ok) throw new Error(`获取沙盒列表失败（HTTP ${resp.status}）`);
@@ -942,6 +944,8 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : '获取沙盒列表失败');
+    } finally {
+      setIsSyncingSandboxFiles(false);
     }
   }, []);
 
@@ -1056,8 +1060,11 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
       if (!resp.ok) throw new Error(`上传失败（HTTP ${resp.status}）`);
       const json = (await resp.json().catch(() => null)) as any;
       if (!json?.ok) throw new Error(json?.error || '上传失败');
+      // 上传成功后必须立即物理刷新一次沙盒列表（实时同步）
       await refreshSandboxFiles();
       await refreshHeaders();
+      // 再刷新一次列表，避免“表头刷新/选中切换”导致 UI 短暂不一致
+      await refreshSandboxFiles();
     } catch (err) {
       setError(err instanceof Error ? err.message : '上传失败');
     } finally {
@@ -1483,7 +1490,9 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                   文件数：<span className="font-mono text-slate-800">{sandboxFiles.length}</span>
                 </div>
                 <div className="max-h-[260px] overflow-y-auto border border-slate-200 rounded-lg bg-white">
-                  {sandboxFiles.length ? (
+                  {isUploadingSandbox || isSyncingSandboxFiles ? (
+                    <div className="p-3 text-[11px] text-slate-600">正在同步文件列表...</div>
+                  ) : sandboxFiles.length ? (
                     <div className="divide-y divide-slate-100">
                       {sandboxFiles.map((fileName) => (
                         <button
@@ -2367,7 +2376,9 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
                         表（{sandboxFiles.length}）
                       </div>
                       <div className="max-h-[240px] overflow-y-auto p-2 space-y-1">
-                        {sandboxFiles.length ? (
+                        {isUploadingSandbox || isSyncingSandboxFiles ? (
+                          <div className="text-[11px] text-slate-600 p-2">正在同步文件列表...</div>
+                        ) : sandboxFiles.length ? (
                           sandboxFiles.map((fileName) => (
                             <button
                               key={fileName}

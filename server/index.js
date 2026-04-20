@@ -2750,6 +2750,17 @@ async function handleSandboxUploadXlsx(req, res) {
       out.push({ storedName: f.filename, originalName: f.originalname, error: e instanceof Error ? e.message : 'read failed' });
     }
   }
+  // 强制写入检查：保存后立刻物理扫描一次，确认当前真实文件数
+  try {
+    const sandboxDir = path.join(__dirname, 'storage', 'sandbox');
+    const entries = fs.readdirSync(sandboxDir, { withFileTypes: true });
+    const excel = entries.filter((e) => e.isFile()).map((e) => e.name).filter((n) => isExcelFileName(n));
+    // eslint-disable-next-line no-console
+    console.log(`[Storage] upload-sandbox write-check: sandbox now has ${excel.length} excel files`);
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.warn('[Storage] upload-sandbox write-check failed', e instanceof Error ? e.message : String(e));
+  }
   return res.json({ ok: true, sandboxDir: 'storage/sandbox', files: out });
 }
 
