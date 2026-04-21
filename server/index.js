@@ -78,6 +78,75 @@ const MAPPING_CONFIG_PATH = path.join(STORAGE_ROOT, 'mapping_config.json');
 const FINAL_DASHBOARD_PATH = path.join(STORAGE_ROOT, 'final_dashboard_data.json');
 const FINAL_RESULTS_PATH = path.join(STORAGE_ROOT, 'final_results.json');
 
+/** 与 dataEngine 物理对账一致：去后缀 + trim + 小写 */
+const ASSET_3D_EXTS = ['.obj', '.stl', '.3dm'];
+
+function stripExtAssetName(name) {
+  return String(name ?? '').trim().replace(/\.[^.]+$/, '');
+}
+
+function normalizeAssetCodeKey(codeOrFileName) {
+  return stripExtAssetName(String(codeOrFileName ?? '').trim()).toLowerCase();
+}
+
+function findPhysicalAssetFileAbs(dirAbs, codeRaw) {
+  const want = normalizeAssetCodeKey(codeRaw);
+  if (!want) return null;
+  let entries = [];
+  try {
+    entries = fs.readdirSync(dirAbs, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  const candidates = [];
+  for (const e of entries) {
+    if (!e.isFile()) continue;
+    const ext = path.extname(e.name).toLowerCase();
+    if (!ASSET_3D_EXTS.includes(ext)) continue;
+    if (normalizeAssetCodeKey(e.name) !== want) continue;
+    candidates.push(e.name);
+  }
+  if (!candidates.length) return null;
+  const rank = (n) => {
+    const i = ASSET_3D_EXTS.indexOf(path.extname(n).toLowerCase());
+    return i >= 0 ? i : 99;
+  };
+  candidates.sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+  return path.join(dirAbs, candidates[0]);
+}
+
+function formatBytesHuman(bytes) {
+  const n = Number(bytes);
+  if (!Number.isFinite(n) || n < 0) return '—';
+  if (n < 1024) return `${Math.round(n)} B`;
+  const units = ['KB', 'MB', 'GB'];
+  let v = n / 1024;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return `${v.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+function formatDisplayMtime(d) {
+  const dt = d instanceof Date ? d : new Date(d);
+  if (Number.isNaN(dt.getTime())) return '—';
+  const y = dt.getFullYear();
+  const mo = String(dt.getMonth() + 1).padStart(2, '0');
+  const day = String(dt.getDate()).padStart(2, '0');
+  const h = String(dt.getHours()).padStart(2, '0');
+  const min = String(dt.getMinutes()).padStart(2, '0');
+  return `${y}-${mo}-${day} ${h}:${min}`;
+}
+
+function isPathInsideAssetDir(fileAbs, dirAbs) {
+  const f = path.resolve(fileAbs);
+  const root = path.resolve(dirAbs);
+  const prefix = root.endsWith(path.sep) ? root : root + path.sep;
+  return f === root || f.startsWith(prefix);
+}
+
 async function readFinalDashboardSnapshot() {
   try {
     if (!(await fse.pathExists(FINAL_DASHBOARD_PATH))) return null;
@@ -3458,6 +3527,104 @@ app.get('/api/inventory-real', async (req, res) => {
     // eslint-disable-next-line no-console
     console.error('[dataEngine] inventory-real failed', e);
     return res.status(500).json({ ok: false, error: e instanceof Error ? e.message : 'inventory-real failed' });
+  }
+});
+
+// 3D 资产详情：物理文件 stat + 全量清单关联款号 / 楦头-大底关系
+app.get('/api/asset-details', async (req, res) => {
+  try {
+    const typeRaw = String(req.query?.type || '').trim().toLowerCase();
+    const code = String(req.query?.code || '').trim();
+    if (!code) return res.status(400).json({ ok: false, error: 'missing code' });
+
+    const isSole = typeRaw === 'soles' || typeRaw === 'sole';
+    const type = isSole ? 'soles' : 'lasts';
+    const dir = isSole ? DIRS.soles : DIRS.lasts;
+
+    const abs = findPhysicalAssetFileAbs(dir, code);
+    let file = {
+      exists: false,
+      fileName: null,
+      sizeBytes: null,
+      sizeLabel: null,
+      modifiedAt: null,
+      modifiedLabel: null,
+    };
+    if (abs && fs.existsSync(abs)) {
+      const st = fs.statSync(abs);
+      file = {
+        exists: true,
+        fileName: path.basename(abs),
+        sizeBytes: st.size,
+        sizeLabel: formatBytesHuman(st.size),
+        modifiedAt: st.mtime.toISOString(),
+        modifiedLabel: formatDisplayMtime(st.mtime),
+      };
+    }
+
+    const snap = await readFinalDashboardSnapshot();
+    let inventory = Array.isArray(snap?.inventory) ? snap.inventory : [];
+    if (!inventory.length) {
+      try {
+        const payload = await processAllData({ storageRoot: STORAGE_ROOT });
+        inventory = payload.inventory || [];
+      } catch {
+        inventory = [];
+      }
+    }
+
+    const key = normalizeAssetCodeKey(code);
+    const field = isSole ? 'soleCode' : 'lastCode';
+    const linkedStyles = [];
+    const soleSet = new Set();
+
+    for (const row of inventory) {
+      const v = row?.[field];
+      if (normalizeAssetCodeKey(v) !== key) continue;
+      linkedStyles.push({
+        style_wms: String(row?.style_wms ?? '').trim() || '—',
+        data_status: row?.data_status ?? 'other',
+      });
+      if (!isSole) {
+        const sc = String(row?.soleCode ?? '').trim();
+        if (sc && sc !== '-' && sc !== '0') soleSet.add(sc);
+      }
+    }
+
+    const linkedSoleCodes = !isSole ? Array.from(soleSet).sort((a, b) => a.localeCompare(b)) : [];
+
+    return res.json({
+      ok: true,
+      type,
+      code,
+      file,
+      uploadedBy: '系统导入 (Storage)',
+      linkedStyles,
+      linkedSoleCodes,
+    });
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.error('[api/asset-details]', e);
+    return res.status(500).json({ ok: false, error: e instanceof Error ? e.message : 'asset-details failed' });
+  }
+});
+
+// 下载 3D 源文件（仅 storage/assets/{lasts|soles} 内已解析路径）
+app.get('/api/asset-file', (req, res) => {
+  try {
+    const typeRaw = String(req.query?.type || '').trim().toLowerCase();
+    const code = String(req.query?.code || '').trim();
+    if (!code) return res.status(400).json({ ok: false, error: 'missing code' });
+    const isSole = typeRaw === 'soles' || typeRaw === 'sole';
+    const dir = isSole ? DIRS.soles : DIRS.lasts;
+    const abs = findPhysicalAssetFileAbs(dir, code);
+    if (!abs || !fs.existsSync(abs)) return res.status(404).json({ ok: false, error: 'file not found' });
+    if (!isPathInsideAssetDir(abs, dir)) return res.status(400).json({ ok: false, error: 'invalid path' });
+    return res.download(abs, path.basename(abs));
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.error('[api/asset-file]', e);
+    return res.status(500).json({ ok: false, error: e instanceof Error ? e.message : 'asset-file failed' });
   }
 });
 

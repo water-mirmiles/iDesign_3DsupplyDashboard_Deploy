@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Search, Filter, Download, MoreHorizontal, CheckCircle2, XCircle, Database, Box, Layers, X, DownloadCloud, ChevronDown } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { InventoryItem } from '@/types';
@@ -10,6 +10,39 @@ type InventoryRealResponse = {
   mapping?: { hasConfig: boolean };
   error?: string;
 };
+
+type AssetDetailsResponse = {
+  ok: boolean;
+  type: 'lasts' | 'soles';
+  code: string;
+  file: {
+    exists: boolean;
+    fileName: string | null;
+    sizeBytes: number | null;
+    sizeLabel: string | null;
+    modifiedAt: string | null;
+    modifiedLabel: string | null;
+  };
+  uploadedBy: string;
+  linkedStyles: Array<{ style_wms: string; data_status: string }>;
+  linkedSoleCodes: string[];
+  error?: string;
+};
+
+function styleStatusLabel(status: string) {
+  switch (status) {
+    case 'active':
+      return '生效';
+    case 'draft':
+      return '草稿';
+    case 'obsolete':
+      return '作废';
+    case 'other':
+      return '其他';
+    default:
+      return status || '—';
+  }
+}
 
 const DataStatusBadge = ({ status }: { status: InventoryItem['data_status'] }) => {
   switch (status) {
@@ -36,14 +69,45 @@ interface PreviewModalProps {
 const PreviewModal = ({ isOpen, onClose, assetCode, assetType }: PreviewModalProps) => {
   const [showAllStyles, setShowAllStyles] = useState(false);
   const [showAllSoles, setShowAllSoles] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [fetchError, setFetchError] = useState<string | null>(null);
+  const [details, setDetails] = useState<AssetDetailsResponse | null>(null);
+
+  const apiType = assetType === 'last' ? 'lasts' : 'soles';
+
+  const loadDetails = useCallback(async () => {
+    if (!assetCode.trim()) return;
+    setLoading(true);
+    setFetchError(null);
+    setDetails(null);
+    try {
+      const qs = new URLSearchParams({ type: apiType, code: assetCode.trim() });
+      const resp = await fetch(`/api/asset-details?${qs.toString()}`);
+      const json = (await resp.json()) as AssetDetailsResponse;
+      if (!resp.ok || !json.ok) throw new Error(json.error || `加载失败（HTTP ${resp.status}）`);
+      setDetails(json);
+    } catch (e) {
+      setFetchError(e instanceof Error ? e.message : '加载失败');
+    } finally {
+      setLoading(false);
+    }
+  }, [apiType, assetCode]);
+
+  useEffect(() => {
+    if (!isOpen || !assetCode.trim()) return;
+    setShowAllStyles(false);
+    setShowAllSoles(false);
+    void loadDetails();
+  }, [isOpen, assetCode, loadDetails]);
 
   if (!isOpen) return null;
 
-  const mockStyles = ['NK-RUN-2024-001', 'NK-RUN-2024-002', 'NK-RUN-2024-005', 'NK-TRAIN-X1', 'NK-CASUAL-09', 'NK-CASUAL-10', 'NK-CASUAL-11', 'NK-CASUAL-12', 'NK-CASUAL-13', 'NK-CASUAL-14'];
-  const mockSoles = ['SOL-NK-A1-01', 'SOL-NK-A1-02', 'SOL-NK-A1-03', 'SOL-NK-A1-04', 'SOL-NK-A1-05', 'SOL-NK-A1-06'];
-
-  const displayedStyles = showAllStyles ? mockStyles : mockStyles.slice(0, 5);
-  const displayedSoles = showAllSoles ? mockSoles : mockSoles.slice(0, 3);
+  const styles = details?.linkedStyles ?? [];
+  const soles = details?.linkedSoleCodes ?? [];
+  const displayedStyles = showAllStyles ? styles : styles.slice(0, 5);
+  const displayedSoles = showAllSoles ? soles : soles.slice(0, 3);
+  const file = details?.file;
+  const downloadHref = `/api/asset-file?type=${encodeURIComponent(apiType)}&code=${encodeURIComponent(assetCode.trim())}`;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm animate-in fade-in duration-200">
@@ -56,10 +120,31 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType }: PreviewModalPro
             <span className="font-mono">{assetCode}</span>
           </div>
           
-          <div className="text-center">
-            <div className="w-16 h-16 border-4 border-slate-700 border-t-blue-500 rounded-full animate-spin mx-auto mb-4"></div>
-            <p className="text-slate-400 font-medium tracking-widest">3D Viewer 加载中...</p>
-            <p className="text-slate-600 text-sm mt-2">Three.js Engine Initialization</p>
+          <div className="text-center px-8 max-w-lg">
+            {loading ? (
+              <>
+                <div className="w-16 h-16 border-4 border-slate-700 border-t-blue-500 rounded-full animate-spin mx-auto mb-4" />
+                <p className="text-slate-400 font-medium tracking-widest">3D Viewer 加载中...</p>
+                <p className="text-slate-600 text-sm mt-2">正在读取物理文件与关联关系</p>
+              </>
+            ) : fetchError ? (
+              <>
+                <XCircle className="w-14 h-14 text-red-400 mx-auto mb-4" />
+                <p className="text-red-300 font-medium">{fetchError}</p>
+              </>
+            ) : file?.exists && file.fileName ? (
+              <>
+                <CheckCircle2 className="w-14 h-14 text-emerald-400 mx-auto mb-4" />
+                <p className="text-slate-200 font-medium text-lg">3D 引擎准备就绪：{file.fileName}</p>
+                <p className="text-slate-500 text-sm mt-2">未来在此挂载 Three.js 画布</p>
+              </>
+            ) : (
+              <>
+                <Database className="w-14 h-14 text-amber-400/80 mx-auto mb-4" />
+                <p className="text-slate-300 font-medium">未找到本地物理文件</p>
+                <p className="text-slate-500 text-sm mt-2">仍可查看右侧关联款号；请确认已上传至 storage/assets/{assetType === 'last' ? 'lasts' : 'soles'}</p>
+              </>
+            )}
           </div>
         </div>
 
@@ -70,7 +155,7 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType }: PreviewModalPro
               <h2 className="text-xl font-bold text-slate-900">资产详情</h2>
               <p className="text-sm text-slate-500 mt-1">{assetType === 'last' ? '3D 楦头模型' : '3D 大底模型'}</p>
             </div>
-            <button onClick={onClose} className="p-2 hover:bg-slate-100 rounded-full text-slate-400 hover:text-slate-600 transition-colors">
+            <button type="button" onClick={onClose} className="p-2 hover:bg-slate-100 rounded-full text-slate-400 hover:text-slate-600 transition-colors">
               <X className="w-5 h-5" />
             </button>
           </div>
@@ -83,20 +168,26 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType }: PreviewModalPro
               </div>
               <div>
                 <label className="text-xs font-medium text-slate-500 uppercase tracking-wider">源文件名</label>
-                <p className="text-sm text-slate-900 mt-1">{assetCode}_v1.2.obj</p>
+                <p className="text-sm text-slate-900 mt-1 font-mono">
+                  {loading ? '…' : file?.exists && file.fileName ? file.fileName : '—'}
+                </p>
               </div>
-              <div className="grid grid-cols-3 gap-4">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                 <div>
                   <label className="text-xs font-medium text-slate-500 uppercase tracking-wider">上传日期</label>
-                  <p className="text-sm text-slate-900 mt-1">2024-05-20</p>
+                  <p className="text-sm text-slate-900 mt-1">
+                    {loading ? '…' : file?.modifiedLabel || '—'}
+                  </p>
                 </div>
                 <div>
                   <label className="text-xs font-medium text-slate-500 uppercase tracking-wider">上传用户</label>
-                  <p className="text-sm text-slate-900 mt-1">Admin</p>
+                  <p className="text-sm text-slate-900 mt-1">{details?.uploadedBy ?? '系统导入 (Storage)'}</p>
                 </div>
                 <div>
                   <label className="text-xs font-medium text-slate-500 uppercase tracking-wider">文件大小</label>
-                  <p className="text-sm text-slate-900 mt-1">12.4 MB</p>
+                  <p className="text-sm text-slate-900 mt-1">
+                    {loading ? '…' : file?.sizeLabel || '—'}
+                  </p>
                 </div>
               </div>
             </div>
@@ -104,53 +195,91 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType }: PreviewModalPro
             <div className="pt-6 border-t border-slate-100">
               <div className="flex justify-between items-center mb-3">
                 <label className="text-xs font-medium text-slate-500 uppercase tracking-wider block">关联款号列表</label>
-                <button 
-                  onClick={() => setShowAllStyles(!showAllStyles)}
-                  className="text-xs text-blue-600 hover:text-blue-700 font-medium transition-colors"
-                >
-                  {showAllStyles ? '收起' : `查看全部 (${mockStyles.length})`}
-                </button>
+                {styles.length > 5 ? (
+                  <button
+                    type="button"
+                    onClick={() => setShowAllStyles(!showAllStyles)}
+                    className="text-xs text-blue-600 hover:text-blue-700 font-medium transition-colors"
+                  >
+                    {showAllStyles ? '收起' : `查看全部 (${styles.length})`}
+                  </button>
+                ) : null}
               </div>
-              <div className="space-y-2">
-                {displayedStyles.map((style, idx) => (
-                  <div key={idx} className="flex items-center justify-between p-2 rounded-lg bg-slate-50 border border-slate-100">
-                    <span className="text-sm font-mono text-slate-700">{style}</span>
-                    <span className="text-xs text-emerald-600 bg-emerald-50 px-1.5 py-0.5 rounded font-medium">Active</span>
-                  </div>
-                ))}
-              </div>
+              {styles.length === 0 && !loading ? (
+                <p className="text-sm text-slate-500">暂无关联款号（全量清单中无相同编号）</p>
+              ) : (
+                <div className="space-y-2">
+                  {displayedStyles.map((row, idx) => (
+                    <div key={`${row.style_wms}-${idx}`} className="flex items-center justify-between p-2 rounded-lg bg-slate-50 border border-slate-100 gap-2">
+                      <span className="text-sm font-mono text-slate-700 truncate">{row.style_wms}</span>
+                      <span
+                        className={cn(
+                          'text-xs shrink-0 px-1.5 py-0.5 rounded font-medium',
+                          row.data_status === 'active' && 'text-emerald-700 bg-emerald-50',
+                          row.data_status === 'draft' && 'text-slate-600 bg-slate-100',
+                          row.data_status === 'obsolete' && 'text-red-700 bg-red-50',
+                          row.data_status === 'other' && 'text-amber-800 bg-amber-50',
+                          !['active', 'draft', 'obsolete', 'other'].includes(row.data_status) && 'text-slate-600 bg-slate-100'
+                        )}
+                      >
+                        {styleStatusLabel(row.data_status)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
 
             {assetType === 'last' && (
               <div className="pt-6 border-t border-slate-100">
                 <div className="flex justify-between items-center mb-3">
                   <label className="text-xs font-medium text-slate-500 uppercase tracking-wider block">关联大底列表</label>
-                  <button 
-                    onClick={() => setShowAllSoles(!showAllSoles)}
-                    className="text-xs text-blue-600 hover:text-blue-700 font-medium transition-colors"
-                  >
-                    {showAllSoles ? '收起' : `查看全部 (${mockSoles.length})`}
-                  </button>
+                  {soles.length > 3 ? (
+                    <button
+                      type="button"
+                      onClick={() => setShowAllSoles(!showAllSoles)}
+                      className="text-xs text-blue-600 hover:text-blue-700 font-medium transition-colors"
+                    >
+                      {showAllSoles ? '收起' : `查看全部 (${soles.length})`}
+                    </button>
+                  ) : null}
                 </div>
-                <div className="space-y-2">
-                  {displayedSoles.map((sole, idx) => (
-                    <div key={idx} className="flex items-center justify-between p-2 rounded-lg bg-slate-50 border border-slate-100">
-                      <span className="text-sm font-mono text-slate-700">{sole}</span>
-                      <span className="text-xs text-emerald-600 bg-emerald-50 px-1.5 py-0.5 rounded font-medium flex items-center gap-1">
-                        <CheckCircle2 className="w-3 h-3" /> 3D 已匹配
-                      </span>
-                    </div>
-                  ))}
-                </div>
+                {soles.length === 0 && !loading ? (
+                  <p className="text-sm text-slate-500">该款号维度下无大底编号</p>
+                ) : (
+                  <div className="space-y-2">
+                    {displayedSoles.map((sole, idx) => (
+                      <div key={`${sole}-${idx}`} className="flex items-center justify-between p-2 rounded-lg bg-slate-50 border border-slate-100">
+                        <span className="text-sm font-mono text-slate-700">{sole}</span>
+                        <span className="text-xs text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded font-medium">清单关联</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
           </div>
 
           <div className="p-6 border-t border-slate-100 bg-slate-50">
-            <button className="w-full flex items-center justify-center gap-2 py-3 bg-blue-600 text-white rounded-xl font-medium hover:bg-blue-700 transition-colors shadow-sm">
-              <DownloadCloud className="w-5 h-5" />
-              下载 .obj 源文件
-            </button>
+            {file?.exists ? (
+              <a
+                href={downloadHref}
+                download
+                className="w-full flex items-center justify-center gap-2 py-3 bg-blue-600 text-white rounded-xl font-medium hover:bg-blue-700 transition-colors shadow-sm"
+              >
+                <DownloadCloud className="w-5 h-5" />
+                下载源文件{file.fileName ? `（${pathBasenameOnly(file.fileName)}）` : ''}
+              </a>
+            ) : (
+              <button
+                type="button"
+                disabled
+                className="w-full flex items-center justify-center gap-2 py-3 bg-slate-300 text-slate-500 rounded-xl font-medium cursor-not-allowed"
+              >
+                <DownloadCloud className="w-5 h-5" />
+                无本地文件可下载
+              </button>
+            )}
           </div>
         </div>
 
@@ -158,6 +287,11 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType }: PreviewModalPro
     </div>
   );
 };
+
+function pathBasenameOnly(name: string) {
+  const parts = name.split(/[/\\]/);
+  return parts[parts.length - 1] || name;
+}
 
 export default function InventoryList() {
   const [previewModal, setPreviewModal] = useState<{isOpen: boolean, assetCode: string, type: 'last'|'sole'}>({ isOpen: false, assetCode: '', type: 'last' });
@@ -411,7 +545,7 @@ export default function InventoryList() {
                   <td className="px-5 py-4">
                     {item.lastStatus === 'matched' ? (
                       <button 
-                        onClick={() => openPreview(item.lastCode, 'last')}
+                        onClick={() => openPreview(item.lastCode ? String(item.lastCode).trim() : undefined, 'last')}
                         className="flex items-center gap-1.5 text-emerald-600 bg-emerald-50 hover:bg-emerald-100 px-2 py-1 rounded-md w-fit transition-colors cursor-pointer group/btn"
                       >
                         <CheckCircle2 className="w-4 h-4 group-hover/btn:scale-110 transition-transform" />
@@ -430,7 +564,7 @@ export default function InventoryList() {
                   <td className="px-5 py-4">
                     {item.soleStatus === 'matched' ? (
                       <button 
-                        onClick={() => openPreview(item.soleCode, 'sole')}
+                        onClick={() => openPreview(item.soleCode ? String(item.soleCode).trim() : undefined, 'sole')}
                         className="flex items-center gap-1.5 text-emerald-600 bg-emerald-50 hover:bg-emerald-100 px-2 py-1 rounded-md w-fit transition-colors cursor-pointer group/btn"
                       >
                         <CheckCircle2 className="w-4 h-4 group-hover/btn:scale-110 transition-transform" />
