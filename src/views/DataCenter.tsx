@@ -160,6 +160,21 @@ export default function DataCenter() {
     });
   };
 
+  /** 上传后强制重算看板并落盘，避免仍读未含新 3D 文件的旧快照 */
+  const triggerDashboardPhysicalSync = async () => {
+    try {
+      const resp = await fetch('/api/force-sync-dashboard', { method: 'POST' });
+      const json = (await resp.json().catch(() => null)) as { ok?: boolean; error?: string } | null;
+      if (!resp.ok || !json?.ok) {
+        // eslint-disable-next-line no-console
+        console.warn('[DataCenter] force-sync-dashboard 失败', json?.error || resp.status);
+      }
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.warn('[DataCenter] force-sync-dashboard', e);
+    }
+  };
+
   const startUpload = async () => {
     if (isUploading) return;
     const toUpload = queue.filter((q) => q.status === 'queued' || q.status === 'failed');
@@ -169,10 +184,12 @@ export default function DataCenter() {
     setUploadError(null);
 
     try {
+      let anyUploadOk = false;
       for (const q of toUpload) {
         setQueue((prev) => prev.map((it) => (it.id === q.id ? { ...it, status: 'uploading', progress: 0, error: undefined } : it)));
         try {
           await uploadOneWithProgress(q.id, q.file);
+          anyUploadOk = true;
           setQueue((prev) => prev.map((it) => (it.id === q.id ? { ...it, status: 'success', progress: 100 } : it)));
         } catch (e) {
           const message = e instanceof Error ? e.message : '上传失败';
@@ -180,6 +197,7 @@ export default function DataCenter() {
         }
       }
       await loadHistory();
+      if (anyUploadOk) await triggerDashboardPhysicalSync();
     } catch (e) {
       const message = e instanceof Error ? e.message : '上传失败';
       setUploadError(message);

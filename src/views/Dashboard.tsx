@@ -226,6 +226,39 @@ export default function Dashboard() {
     return fallback;
   }, [stats, statusScope]);
 
+  /** 与详细清单一致：当前 Tab 口径下 has3DLast === true 的行数（优先于分桶 KPI 展示） */
+  const kpiLast3DMatchedFromInventory = useMemo(() => {
+    const inv = stats?.inventory || [];
+    if (!inv.length) return null;
+    const want = (ds: string) => {
+      const s = String(ds || '').trim();
+      if (statusScope === 'effective') return s === 'active';
+      if (statusScope === 'includeDraft') return s === 'active' || s === 'draft';
+      return true;
+    };
+    return inv.filter((it) => want(String(it?.data_status || '')) && it.has3DLast === true).length;
+  }, [stats?.inventory, statusScope]);
+
+  const kpiSole3DMatchedFromInventory = useMemo(() => {
+    const inv = stats?.inventory || [];
+    if (!inv.length) return null;
+    const want = (ds: string) => {
+      const s = String(ds || '').trim();
+      if (statusScope === 'effective') return s === 'active';
+      if (statusScope === 'includeDraft') return s === 'active' || s === 'draft';
+      return true;
+    };
+    return inv.filter((it) => {
+      if (!want(String(it?.data_status || ''))) return false;
+      return it.has3DSole === true || String(it?.soleStatus || '') === 'matched';
+    }).length;
+  }, [stats?.inventory, statusScope]);
+
+  const displayLast3DKpi =
+    kpiLast3DMatchedFromInventory !== null ? kpiLast3DMatchedFromInventory : (scopeKPIs?.last3DCount ?? scopeKPIs?.matched3DLasts ?? 0);
+  const displaySole3DKpi =
+    kpiSole3DMatchedFromInventory !== null ? kpiSole3DMatchedFromInventory : (scopeKPIs?.sole3DCount ?? scopeKPIs?.matched3DSoles ?? 0);
+
   /** 仅生效 / 含草稿 / 全量池：effective + draft + invalid(=obsolete) + other，与入库行数一致 */
   const tabStyleTotalCount = useMemo(() => {
     const c = invStatusCounts;
@@ -259,7 +292,10 @@ export default function Dashboard() {
         cur.total += 1;
         const hasCode = isLinkedCode(it?.[codeField]);
         if (hasCode) cur.hasCode += 1;
-        const has3D = hasCode && String(it?.[statusField] || '') === 'matched';
+        const has3D =
+          dim === 'last'
+            ? hasCode && (it?.has3DLast === true || String(it?.lastStatus || '') === 'matched')
+            : hasCode && (it?.has3DSole === true || String(it?.soleStatus || '') === 'matched');
         if (has3D) cur.has3D += 1;
         byBrand.set(brand, cur);
       }
@@ -561,7 +597,7 @@ export default function Dashboard() {
           <div className="mt-4">
             <div className="flex items-end gap-2">
               <span className="text-3xl font-bold text-slate-900">
-                {(scopeKPIs?.last3DCount ?? scopeKPIs?.matched3DLasts ?? 0).toLocaleString()}
+                {displayLast3DKpi.toLocaleString()}
               </span>
               {getTrendBadge(stats?.kpis?.deltaMatched3DLasts || 0)}
             </div>
@@ -591,7 +627,7 @@ export default function Dashboard() {
           <div className="mt-4">
             <div className="flex items-end gap-2">
               <span className="text-3xl font-bold text-slate-900">
-                {(scopeKPIs?.sole3DCount ?? scopeKPIs?.matched3DSoles ?? 0).toLocaleString()}
+                {displaySole3DKpi.toLocaleString()}
               </span>
               {getTrendBadge(stats?.kpis?.deltaMatched3DSoles || 0)}
             </div>

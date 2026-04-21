@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import fse from 'fs-extra';
 import path from 'path';
 import XLSX from 'xlsx';
@@ -1036,13 +1037,35 @@ async function getDateDirsSorted(dataTablesDir) {
     .sort();
 }
 
-async function loadAssetsBaseNames(dir) {
+/** 与磁盘文件名去后缀后一致：trim + 去扩展名 + 小写（与 lastCode 容错比对） */
+function physicalAssetKey(fileOrCodeName) {
+  return String(stripExt(fileOrCodeName)).trim().toLowerCase();
+}
+
+/**
+ * 每次聚合实时扫描 3D 资产目录（同步），避免缓存或异步时序导致漏扫新上传文件。
+ */
+function scan3DAssetDirSync(dirAbs) {
+  const set = new Set();
   try {
-    const files = await listFiles(dir);
-    return new Set(files.map(stripExt).map(normalize).filter(Boolean));
+    if (!fse.pathExistsSync(dirAbs)) return set;
+    const entries = fs.readdirSync(dirAbs, { withFileTypes: true });
+    for (const e of entries) {
+      if (!e.isFile()) continue;
+      const k = physicalAssetKey(e.name);
+      if (k) set.add(k);
+    }
   } catch {
-    return new Set();
+    // ignore：目录不存在或无权限时不阻断聚合
   }
+  return set;
+}
+
+function physicalMatchInAssetSet(assetSet, codeVal) {
+  if (codeVal == null || codeVal === '') return false;
+  const k = physicalAssetKey(codeVal);
+  if (!k) return false;
+  return assetSet.has(k);
 }
 
 function guessStyleMainTable(xlsxTables, requiredCols) {
@@ -1093,7 +1116,7 @@ function computeBrand3DCoverageStats(activeRows) {
     if (hasAny3D) cur.linked += 1;
     else cur.unlinked += 1;
     if (isLinkedCode(r?.lastCode)) cur.lastLinkedCount += 1;
-    if (Boolean(r?.__has3DLast)) cur.last3DMatchedCount += 1;
+    if (r?.has3DLast === true || Boolean(r?.__has3DLast)) cur.last3DMatchedCount += 1;
     map.set(brand, cur);
   }
   return Array.from(map.values())
@@ -1107,7 +1130,10 @@ function computeBrandDigitizationStats(activeRows, dim, allBrands = null) {
     const s = String(v ?? '').trim();
     return s !== '' && s !== '-' && s !== '0';
   };
-  const isHas3D = (r) => (dim === 'last' ? Boolean(r?.__has3DLast) : Boolean(r?.__has3DSole));
+  const isHas3D = (r) =>
+    dim === 'last'
+      ? r?.has3DLast === true || Boolean(r?.__has3DLast)
+      : r?.has3DSole === true || Boolean(r?.__has3DSole);
   const codeField = dim === 'last' ? 'lastCode' : 'soleCode';
 
   for (const r of activeRows || []) {
@@ -1163,8 +1189,8 @@ function computeBucketKPIs(rows) {
     return s !== '' && s !== '-' && s !== '0';
   };
   const totalStyles = rows.length;
-  const matchedLasts = rows.filter((x) => Boolean(x.__has3DLast)).length;
-  const matchedSoles = rows.filter((x) => Boolean(x.__has3DSole)).length;
+  const matchedLasts = rows.filter((x) => x?.has3DLast === true || Boolean(x?.__has3DLast)).length;
+  const matchedSoles = rows.filter((x) => x?.has3DSole === true || Boolean(x?.__has3DSole)).length;
   const stylesWithAny3D = rows.filter((x) => Boolean(x.__has3DAny)).length;
   const lastCodeLinked = rows.filter((x) => isLinkedCode(x?.lastCode)).length;
   const soleCodeLinked = rows.filter((x) => isLinkedCode(x?.soleCode)).length;
@@ -1209,7 +1235,7 @@ function computeBrandBindingStats(activeRows) {
     cur.totalActive += 1;
     if (isLinkedCode(r?.lastCode)) cur.lastLinkedCount += 1;
     if (isLinkedCode(r?.soleCode)) cur.soleLinkedCount += 1;
-    if (Boolean(r?.__has3DLast)) cur.last3DMatchedCount += 1;
+    if (r?.has3DLast === true || Boolean(r?.__has3DLast)) cur.last3DMatchedCount += 1;
     map.set(brand, cur);
   }
   return Array.from(map.values())
@@ -1684,8 +1710,8 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
     };
   }
 
-  const lastsSet = await loadAssetsBaseNames(path.join(storageRoot, 'assets', 'lasts'));
-  const solesSet = await loadAssetsBaseNames(path.join(storageRoot, 'assets', 'soles'));
+  const lastsSet = scan3DAssetDirSync(path.join(storageRoot, 'assets', 'lasts'));
+  const solesSet = scan3DAssetDirSync(path.join(storageRoot, 'assets', 'soles'));
 
   const mainTableName = buildTableNameIndex(main.fileName);
   const traceDim = (msg) => aiTraceLineSync(`[Trace] ${msg}`);
@@ -1929,8 +1955,8 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
       }
     }
 
-    const has3DLast = lastCodeVal ? lastsSet.has(stripExt(lastCodeVal)) || lastsSet.has(lastCodeVal) : false;
-    const has3DSole = soleCodeVal ? solesSet.has(stripExt(soleCodeVal)) || solesSet.has(soleCodeVal) : false;
+    const has3DLast = physicalMatchInAssetSet(lastsSet, lastCodeVal);
+    const has3DSole = physicalMatchInAssetSet(solesSet, soleCodeVal);
     const has3DAny = has3DLast || has3DSole;
 
     const brandVal = resolveFast(standardMap.get('brand'), row, brandCol);
@@ -1966,6 +1992,7 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
       has3DLast,
       soleCode: soleCodeVal || undefined,
       soleStatus: has3DSole ? 'matched' : 'missing',
+      has3DSole,
       data_status: invStatus,
       lastUpdated: dateDirName || '',
       updatedBy: 'Storage',
