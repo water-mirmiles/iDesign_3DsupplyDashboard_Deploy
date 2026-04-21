@@ -95,7 +95,8 @@ export function isTruthyActiveStatus(v) {
 
 /**
  * 将主表 data_status 规范为四态：active | draft | obsolete | other
- * 采用「模糊包含 + 多词库」，顺序：作废 → 草稿 → 生效 → 其他（兜底）。
+ * 照妖镜实测英文枚举优先：effective → active；invalid → obsolete（作废桶）。
+ * Draft 分类保留，当前数据可为 0。
  */
 function normalizeInventoryStatus(v) {
   const raw = normalize(v);
@@ -105,11 +106,11 @@ function normalizeInventoryStatus(v) {
   const isNum1 = (x) => /^1(\.0+)?$/.test(x);
   const isNum9 = (x) => /^9(\.0+)?$/.test(x);
 
-  // —— Obsolete：作废 / 取消 / 无效 / 显式 9 码等
+  // —— 1) 作废/无效：invalid 与扩展词库（先于 effective，避免歧义）
+  if (s === 'invalid' || /\binvalid\b/.test(s)) return 'obsolete';
   if (isNum9(s) || s === '99' || s === '-1') return 'obsolete';
   if (
     s.includes('obsolete') ||
-    s.includes('invalid') ||
     s.includes('作废') ||
     s.includes('取消') ||
     s.includes('失效') ||
@@ -118,21 +119,21 @@ function normalizeInventoryStatus(v) {
   ) {
     return 'obsolete';
   }
-  // 用户要求「包含 9」：仅当单独为 9 或整格为纯 9，避免把含 9 的款号串误杀；纯数字 9 已覆盖
 
-  // —— Draft：草稿 / 待审 / 编辑中等
+  // —— 2) 生效：effective 与扩展（排除 ineffective）
+  if (s === 'effective' || (/\beffective\b/.test(s) && !s.includes('ineffective'))) return 'active';
+  if (isNum1(s) || s === '1') return 'active';
+  if (isTruthyActiveStatus(v)) return 'active';
+  if (s.includes('生效')) return 'active';
+  if (s.includes('active') && !s.includes('inactive')) return 'active';
+
+  // —— 3) Draft（保留分类，当前文件可无）
   if (isNum01(s)) return 'draft';
-  if (s.includes('草稿') || s.includes('draft') || s.includes('pending') || s.includes('编辑中')) {
+  if (s.includes('草稿') || /\bdraft\b/.test(s) || s.includes('pending') || s.includes('编辑中')) {
     return 'draft';
   }
 
-  // —— Effective：生效 / 有效 / active（排除 inactive）/ 显式 1 码等
-  if (isNum1(s) || s === '1') return 'active';
-  if (isTruthyActiveStatus(v)) return 'active';
-  if (s.includes('生效') || s.includes('effective')) return 'active';
-  if (s.includes('active') && !s.includes('inactive')) return 'active';
-
-  // —— 兜底：其他（仍计入全量池，与作废分列）
+  // —— 兜底：其他（仍计入全量池条形图）
   return 'other';
 }
 

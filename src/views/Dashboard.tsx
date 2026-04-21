@@ -135,12 +135,6 @@ export default function Dashboard() {
   const [trendPeriod, setTrendPeriod] = useState<TimePeriod>('week');
   const [chartData, setChartData] = useState<AssetTrendStats[]>([]);
 
-  const rawStatusCategoriesDebug = useMemo(() => {
-    const audit = stats?.rawStatusAudit?.length ? stats.rawStatusAudit : stats?.meta?.rawStatusAudit;
-    if (!audit?.length) return '';
-    return audit.map((x) => x.value).join(', ');
-  }, [stats?.rawStatusAudit, stats?.meta?.rawStatusAudit]);
-
   /** 入库款号按归一化状态计数（与 Tab 求和一致；无分桶快照时回落 scopeKPIs） */
   const invStatusCounts = useMemo(() => {
     const sd: any = stats?.statusBuckets?.total?.kpis?.statusDist ?? stats?.kpis?.statusDist;
@@ -232,6 +226,7 @@ export default function Dashboard() {
     return fallback;
   }, [stats, statusScope]);
 
+  /** 仅生效 / 含草稿 / 全量池：effective + draft + invalid(=obsolete) + other，与入库行数一致 */
   const tabStyleTotalCount = useMemo(() => {
     const c = invStatusCounts;
     if (!c) return Number(scopeKPIs?.styles?.totalAll ?? scopeKPIs?.totalStyles ?? 0);
@@ -549,14 +544,9 @@ export default function Dashboard() {
                   ? '仅生效'
                   : statusScope === 'includeDraft'
                     ? '生效+草稿'
-                    : '所有状态（含作废及其他）'}
+                    : '全量池（effective + draft + invalid）'}
               </span>
             </div>
-            {rawStatusCategoriesDebug ? (
-              <div className="mt-2 text-[11px] leading-snug text-amber-800/90 bg-amber-50/80 border border-amber-100 rounded px-2 py-1 font-mono break-all">
-                Raw Status Categories: [{rawStatusCategoriesDebug}]
-              </div>
-            ) : null}
           </div>
         </div>
 
