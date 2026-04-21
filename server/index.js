@@ -78,6 +78,18 @@ const MAPPING_CONFIG_PATH = path.join(STORAGE_ROOT, 'mapping_config.json');
 const FINAL_DASHBOARD_PATH = path.join(STORAGE_ROOT, 'final_dashboard_data.json');
 const FINAL_RESULTS_PATH = path.join(STORAGE_ROOT, 'final_results.json');
 
+// 静态资源：供前端 Three.js 等直接拉取 .obj / .stl（路径与 STORAGE_ROOT 对齐）
+app.use(
+  '/storage',
+  express.static(STORAGE_ROOT, {
+    etag: true,
+    maxAge: '1h',
+    setHeaders(res) {
+      res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    },
+  })
+);
+
 /** 与 dataEngine 物理对账一致：去后缀 + trim + 小写 */
 const ASSET_3D_EXTS = ['.obj', '.stl', '.3dm'];
 

@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Search, Filter, Download, MoreHorizontal, CheckCircle2, XCircle, Database, Box, Layers, X, DownloadCloud, ChevronDown } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { InventoryItem } from '@/types';
+import ThreeDViewer from '@/components/ThreeDViewer';
 
 type InventoryRealResponse = {
   ok: boolean;
@@ -72,6 +73,8 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType }: PreviewModalPro
   const [loading, setLoading] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [details, setDetails] = useState<AssetDetailsResponse | null>(null);
+  const [viewerReady, setViewerReady] = useState(false);
+  const [viewerError, setViewerError] = useState<string | null>(null);
 
   const apiType = assetType === 'last' ? 'lasts' : 'soles';
 
@@ -97,6 +100,8 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType }: PreviewModalPro
     if (!isOpen || !assetCode.trim()) return;
     setShowAllStyles(false);
     setShowAllSoles(false);
+    setViewerReady(false);
+    setViewerError(null);
     void loadDetails();
   }, [isOpen, assetCode, loadDetails]);
 
@@ -108,6 +113,10 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType }: PreviewModalPro
   const displayedSoles = showAllSoles ? soles : soles.slice(0, 3);
   const file = details?.file;
   const downloadHref = `/api/asset-file?type=${encodeURIComponent(apiType)}&code=${encodeURIComponent(assetCode.trim())}`;
+  const fileUrl =
+    file?.exists && file.fileName
+      ? `/storage/assets/${apiType}/${encodeURIComponent(String(file.fileName))}`
+      : null;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm animate-in fade-in duration-200">
@@ -120,7 +129,28 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType }: PreviewModalPro
             <span className="font-mono">{assetCode}</span>
           </div>
           
-          <div className="text-center px-8 max-w-lg">
+          {/* Three.js Viewer */}
+          {fileUrl ? (
+            <div className="absolute inset-0">
+              <ThreeDViewer
+                fileUrl={fileUrl}
+                className="absolute inset-0"
+                onLoaded={() => setViewerReady(true)}
+                onError={(e) => {
+                  setViewerError(e.message);
+                  setViewerReady(false);
+                }}
+              />
+            </div>
+          ) : null}
+
+          {/* Overlay states */}
+          <div
+            className={cn(
+              'relative z-10 text-center px-8 max-w-lg transition-opacity duration-300',
+              fileUrl && viewerReady ? 'opacity-0 pointer-events-none' : 'opacity-100'
+            )}
+          >
             {loading ? (
               <>
                 <div className="w-16 h-16 border-4 border-slate-700 border-t-blue-500 rounded-full animate-spin mx-auto mb-4" />
@@ -132,11 +162,17 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType }: PreviewModalPro
                 <XCircle className="w-14 h-14 text-red-400 mx-auto mb-4" />
                 <p className="text-red-300 font-medium">{fetchError}</p>
               </>
+            ) : viewerError ? (
+              <>
+                <XCircle className="w-14 h-14 text-red-400 mx-auto mb-4" />
+                <p className="text-red-300 font-medium">{viewerError}</p>
+                <p className="text-slate-500 text-sm mt-2">请确认该文件可通过 /storage 访问且为有效 OBJ</p>
+              </>
             ) : file?.exists && file.fileName ? (
               <>
-                <CheckCircle2 className="w-14 h-14 text-emerald-400 mx-auto mb-4" />
-                <p className="text-slate-200 font-medium text-lg">3D 引擎准备就绪：{file.fileName}</p>
-                <p className="text-slate-500 text-sm mt-2">未来在此挂载 Three.js 画布</p>
+                <div className="w-16 h-16 border-4 border-slate-700 border-t-blue-500 rounded-full animate-spin mx-auto mb-4" />
+                <p className="text-slate-400 font-medium tracking-widest">3D 模型解析中...</p>
+                <p className="text-slate-600 text-sm mt-2">OBJLoader 正在加载：{file.fileName}</p>
               </>
             ) : (
               <>
