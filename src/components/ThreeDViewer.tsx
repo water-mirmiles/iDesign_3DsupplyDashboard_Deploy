@@ -38,6 +38,7 @@ export default function ThreeDViewer({ fileUrl, className, onLoaded, onError }: 
 
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [progress, setProgress] = useState<number | null>(null);
 
   const urlKey = useMemo(() => String(fileUrl || '').trim(), [fileUrl]);
 
@@ -48,6 +49,7 @@ export default function ThreeDViewer({ fileUrl, className, onLoaded, onError }: 
 
     setReady(false);
     setError(null);
+    setProgress(null);
 
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x0b1220);
@@ -104,6 +106,88 @@ export default function ThreeDViewer({ fileUrl, className, onLoaded, onError }: 
       metalness: 0.05,
     });
 
+    const pointsMaterial = new THREE.PointsMaterial({
+      color: new THREE.Color('#e5e7eb'),
+      size: 1.5,
+      sizeAttenuation: true,
+    });
+
+    const applyMaterialAndOptimize = (obj: THREE.Object3D) => {
+      let totalTriangles = 0;
+      let totalVertices = 0;
+      const meshes: THREE.Mesh[] = [];
+      obj.traverse((child) => {
+        const mesh = child as THREE.Mesh;
+        if ((mesh as any).isMesh) meshes.push(mesh);
+      });
+
+      for (const mesh of meshes) {
+        const geom = (mesh as any).geometry as THREE.BufferGeometry | undefined;
+        if (geom && geom.isBufferGeometry) {
+          // 缓冲区优化：法线 + 包围盒（为 fitCamera/缩放提供依据）
+          try {
+            geom.computeVertexNormals();
+          } catch {
+            // ignore
+          }
+          try {
+            geom.computeBoundingBox();
+          } catch {
+            // ignore
+          }
+          const pos = geom.getAttribute('position');
+          if (pos) totalVertices += pos.count || 0;
+          if (geom.index) totalTriangles += Math.floor((geom.index.count || 0) / 3);
+          else if (pos) totalTriangles += Math.floor((pos.count || 0) / 3);
+        }
+      }
+
+      // 工业模型坐标往往很大：对整个对象做一次“中心对齐”
+      try {
+        const box = new THREE.Box3().setFromObject(obj);
+        const center = box.getCenter(new THREE.Vector3());
+        obj.position.sub(center);
+      } catch {
+        // ignore
+      }
+
+      // 面片过多时自动切点云渲染，避免拖拽卡顿
+      const TRIANGLE_POINTS_FALLBACK = 1_500_000;
+      const shouldUsePoints = totalTriangles >= TRIANGLE_POINTS_FALLBACK;
+
+      obj.traverse((child) => {
+        const mesh = child as THREE.Mesh;
+        if (!(mesh as any).isMesh) return;
+
+        const geom = (mesh as any).geometry as THREE.BufferGeometry | undefined;
+        if (geom && geom.isBufferGeometry) {
+          // 按要求强制调用 geometry.center()（点云/网格都受益）
+          try {
+            geom.center();
+          } catch {
+            // ignore
+          }
+        }
+
+        if (shouldUsePoints && geom && geom.isBufferGeometry) {
+          const pts = new THREE.Points(geom, pointsMaterial);
+          pts.position.copy(mesh.position);
+          pts.rotation.copy(mesh.rotation);
+          pts.scale.copy(mesh.scale);
+          if (mesh.parent) mesh.parent.add(pts);
+          if (mesh.parent) mesh.parent.remove(mesh);
+          return;
+        }
+
+        // 默认网格材质（关闭 wireframe）
+        mesh.material = material;
+        mesh.castShadow = false;
+        mesh.receiveShadow = false;
+      });
+
+      return { totalTriangles, totalVertices, usedPoints: shouldUsePoints };
+    };
+
     const applyMaterial = (obj: THREE.Object3D) => {
       obj.traverse((child) => {
         const mesh = child as THREE.Mesh;
@@ -119,13 +203,23 @@ export default function ThreeDViewer({ fileUrl, className, onLoaded, onError }: 
       urlKey,
       (obj) => {
         if (disposed) return;
-        applyMaterial(obj);
+        applyMaterialAndOptimize(obj);
         scene.add(obj);
         fitCameraToObject(camera, obj, controls);
         setReady(true);
         onLoaded?.();
       },
-      undefined,
+      (evt) => {
+        if (disposed) return;
+        const loaded = Number((evt as any)?.loaded || 0);
+        const total = Number((evt as any)?.total || 0);
+        if (total > 0 && loaded >= 0) {
+          const p = Math.max(0, Math.min(100, Math.round((loaded / total) * 100)));
+          setProgress(p);
+        } else {
+          setProgress(null);
+        }
+      },
       (e) => {
         if (disposed) return;
         const err = new Error(e?.message || 'OBJ 加载失败');
@@ -149,12 +243,13 @@ export default function ThreeDViewer({ fileUrl, className, onLoaded, onError }: 
 
       scene.traverse((o) => {
         const m = o as THREE.Mesh;
-        if ((m as any).isMesh) {
-          const geom = (m as any).geometry as THREE.BufferGeometry | undefined;
+        if ((m as any).isMesh || (o as any).isPoints) {
+          const geom = (o as any).geometry as THREE.BufferGeometry | undefined;
           if (geom && typeof geom.dispose === 'function') geom.dispose();
         }
       });
       material.dispose();
+      pointsMaterial.dispose();
 
       try {
         container.removeChild(renderer.domElement);
@@ -169,7 +264,19 @@ export default function ThreeDViewer({ fileUrl, className, onLoaded, onError }: 
   return (
     <div className={className} ref={containerRef}>
       {!ready && !error ? (
-        <div className="absolute inset-0 pointer-events-none" />
+        <div className="absolute inset-0 pointer-events-none">
+          {progress != null ? (
+            <div className="absolute left-4 right-4 bottom-4 text-xs text-slate-200/80">
+              <div className="flex items-center justify-between mb-1">
+                <span>OBJ 下载中</span>
+                <span>{progress}%</span>
+              </div>
+              <div className="h-1.5 bg-white/10 rounded">
+                <div className="h-1.5 bg-blue-500 rounded" style={{ width: `${progress}%` }} />
+              </div>
+            </div>
+          ) : null}
+        </div>
       ) : null}
       {error ? (
         <div className="absolute inset-0 flex items-center justify-center text-sm text-red-300 bg-black/20">

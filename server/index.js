@@ -85,6 +85,8 @@ app.use(
     etag: true,
     maxAge: '1h',
     setHeaders(res) {
+      // 大文件加载：显式声明支持 Range（send 默认支持，但这里确保前端/代理更稳定）
+      res.setHeader('Accept-Ranges', 'bytes');
       res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
     },
   })
