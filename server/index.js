@@ -3687,6 +3687,8 @@ app.get('/api/asset-meta', async (req, res) => {
     const isSole = typeRaw === 'soles' || typeRaw === 'sole';
     const t = isSole ? 'soles' : 'lasts';
     const key = `${t}:${normalizeAssetCodeKey(code)}`;
+    // eslint-disable-next-line no-console
+    console.log('[Server] 正在搜索资产(meta):', key, 'code=', JSON.stringify(code));
     const meta = await readAssetsMeta();
     const entry = meta.byKey?.[key] || null;
     return res.json({ ok: true, key, entry });
@@ -3709,6 +3711,8 @@ app.get('/api/asset-details', async (req, res) => {
     const dir = isSole ? DIRS.soles : DIRS.lasts;
 
     const abs = findPhysicalAssetFileAbs(dir, code);
+    // eslint-disable-next-line no-console
+    console.log('[Server] 正在搜索资产:', abs || `(not found) dir=${dir} code=${JSON.stringify(code)}`);
     let file = {
       exists: false,
       fileName: null,
@@ -3759,6 +3763,19 @@ app.get('/api/asset-details', async (req, res) => {
     }
 
     const linkedSoleCodes = !isSole ? Array.from(soleSet).sort((a, b) => a.localeCompare(b)) : [];
+
+    if (!file.exists) {
+      return res.status(404).json({
+        ok: false,
+        error: 'File not found',
+        type,
+        code,
+        file,
+        uploadedBy: '系统导入 (Storage)',
+        linkedStyles,
+        linkedSoleCodes,
+      });
+    }
 
     return res.json({
       ok: true,

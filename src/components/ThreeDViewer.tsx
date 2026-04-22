@@ -268,6 +268,13 @@ function loadArrayBufferWithXhr(
   });
 }
 
+async function headValidateAssetUrl(resolvedUrl: string) {
+  const resp = await fetch(resolvedUrl, { method: 'HEAD' });
+  const ct = String(resp.headers.get('content-type') || '').toLowerCase();
+  const isHtml = ct.includes('text/html');
+  return { ok: resp.ok, status: resp.status, contentType: ct, isHtml };
+}
+
 function resourcePathForUrl(resolved: string) {
   try {
     const u = new URL(resolved, typeof window !== 'undefined' ? window.location.origin : 'http://local');
@@ -395,6 +402,23 @@ export default function ThreeDViewer({
 
     void (async () => {
       try {
+        // 防止 404 HTML 被 Three.js 当作二进制/文本解析导致黑屏或崩溃
+        const head = await headValidateAssetUrl(isGlb ? glbBustedUrl : urlKey);
+        if (!head.ok) {
+          const msg = `文件路径错误 (HTTP ${head.status})`;
+          setError(msg);
+          onErrorRef.current?.(new Error(msg));
+          setProgress(null);
+          return;
+        }
+        if (head.isHtml) {
+          const msg = '文件路径错误（返回了 HTML）';
+          setError(msg);
+          onErrorRef.current?.(new Error(msg));
+          setProgress(null);
+          return;
+        }
+
         const procBase: Omit<ProcessOpts, 'onMetrics' | 'debugState'> = {
           isGlb,
           precomputed: precomputedMetrics,

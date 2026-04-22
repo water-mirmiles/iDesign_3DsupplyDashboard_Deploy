@@ -99,6 +99,20 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType, targetAudience }:
 
   const apiType = assetType === 'last' ? 'lasts' : 'soles';
 
+  const API_BASE = 'http://localhost:3001';
+
+  async function safeFetchJson<T>(url: string): Promise<{ response: Response; json: T | null }> {
+    const response = await fetch(url);
+    if (!response.ok) {
+      const text = await response.text();
+      // eslint-disable-next-line no-console
+      console.error('服务器返回了非预期内容:', text);
+      throw new Error(`HTTP 错误: ${response.status}`);
+    }
+    const json = (await response.json()) as T;
+    return { response, json };
+  }
+
   const loadPreviewData = useCallback(async () => {
     if (!assetCode.trim()) return;
     setLoading(true);
@@ -109,21 +123,23 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType, targetAudience }:
     setPrecomputedKey('');
     try {
       const qs = new URLSearchParams({ type: apiType, code: assetCode.trim() });
-      const [metaRes, detRes] = await Promise.all([
-        fetch(`/api/asset-meta?${qs.toString()}`),
-        fetch(`/api/asset-details?${qs.toString()}`),
+      const [meta, det] = await Promise.all([
+        safeFetchJson<AssetMetaResponse>(`${API_BASE}/api/asset-meta?${qs.toString()}`),
+        safeFetchJson<AssetDetailsResponse>(`${API_BASE}/api/asset-details?${qs.toString()}`),
       ]);
-      const metaJson = (await metaRes.json()) as AssetMetaResponse;
-      if (metaRes.ok && metaJson.ok && metaJson.entry?.metrics) {
+
+      const metaJson = meta.json;
+      if (metaJson?.ok && metaJson.entry?.metrics) {
         setPrecomputedFromApi(metaJson.entry.metrics);
         setLastMetrics(metaJson.entry.metrics);
         setPrecomputedKey(String(metaJson.entry.updatedAt || metaJson.key || '1'));
       }
-      const detJson = (await detRes.json()) as AssetDetailsResponse;
-      if (!detRes.ok || !detJson.ok) throw new Error(detJson.error || `加载失败（HTTP ${detRes.status}）`);
+      const detJson = det.json;
+      if (!detJson?.ok) throw new Error(detJson?.error || '资产尚未处理');
       setDetails(detJson);
     } catch (e) {
-      setFetchError(e instanceof Error ? e.message : '加载失败');
+      const msg = e instanceof Error ? e.message : '加载失败';
+      setFetchError(msg.includes('HTTP 错误: 404') ? '资产尚未处理' : msg);
     } finally {
       setLoading(false);
     }
@@ -143,6 +159,7 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType, targetAudience }:
   }, [isOpen, assetCode, loadPreviewData]);
 
   const file = details?.file;
+  const notProcessed = Boolean(fetchError) && String(fetchError).includes('资产尚未处理');
   const fileUrl = useMemo(() => {
     if (!isOpen) return null;
     if (!file?.exists || !file.fileName) return null;
@@ -282,7 +299,7 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType, targetAudience }:
                 <div>
                   <label className="text-xs font-medium text-slate-500 uppercase tracking-wider">上传日期</label>
                   <p className="text-sm text-slate-900 mt-1">
-                    {loading ? '…' : file?.modifiedLabel || '—'}
+                    {loading ? '…' : notProcessed ? '资产尚未处理' : file?.modifiedLabel || '—'}
                   </p>
                 </div>
                 <div>
@@ -292,7 +309,7 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType, targetAudience }:
                 <div>
                   <label className="text-xs font-medium text-slate-500 uppercase tracking-wider">文件大小</label>
                   <p className="text-sm text-slate-900 mt-1">
-                    {loading ? '…' : file?.sizeLabel || '—'}
+                    {loading ? '…' : notProcessed ? '资产尚未处理' : file?.sizeLabel || '—'}
                   </p>
                 </div>
               </div>
