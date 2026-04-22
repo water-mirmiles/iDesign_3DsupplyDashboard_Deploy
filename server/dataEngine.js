@@ -1960,6 +1960,11 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
     const has3DAny = has3DLast || has3DSole;
 
     const brandVal = resolveFast(standardMap.get('brand'), row, brandCol);
+    const targetAudienceRaw = getRowFieldLoose(row, 'target_audience', main.headers);
+    const target_audience =
+      targetAudienceRaw == null || String(targetAudienceRaw).trim() === ''
+        ? undefined
+        : String(targetAudienceRaw).trim();
 
     // 编号绑定口径：仅统计生效款中，“FK 非空且在维表能命中 code” 的数量
     if (invStatus === 'active') {
@@ -1997,6 +2002,7 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
       lastUpdated: dateDirName || '',
       updatedBy: 'Storage',
       sourceTable: main.fileName,
+      target_audience,
       __has3DAny: has3DAny,
       __has3DLast: has3DLast,
       __has3DSole: has3DSole,

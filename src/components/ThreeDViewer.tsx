@@ -4,9 +4,14 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
 import { getStorageBaseUrl } from '@/lib/storageBaseUrl';
 import { extractLast3DMetrics, type Last3DMetrics } from '@/lib/last3dMetrics';
+import { audienceLabelZh, getTargetLengthMm, parseAudience, type ShoeAudience } from '@/lib/shoeStandards';
 
 type Props = {
   fileUrl: string;
+  /**
+   * 与清单行 `target_audience` 对齐；未传时按 MEN(275mm) 处理。
+   */
+  targetAudience?: string;
   className?: string;
   onLoaded?: () => void;
   onError?: (err: Error) => void;
@@ -21,10 +26,8 @@ function resolveAssetUrl(fileUrl: string) {
   return `${getStorageBaseUrl()}/${u.replace(/^\//, '')}`;
 }
 
-const TARGET_MAX = 5;
-
 /**
- * 先居中（物理坐标可极大），物性在缩放前计算；再统一缩放到标准尺度便于入镜
+ * 世界单位采用 mm，便于与行业 Target 对齐
  */
 function centerObject(obj: THREE.Object3D) {
   const box = new THREE.Box3().setFromObject(obj);
@@ -33,22 +36,39 @@ function centerObject(obj: THREE.Object3D) {
   obj.updateMatrixWorld(true);
 }
 
-function displayNormalizeScale(obj: THREE.Object3D) {
+function maxAxisLength(obj: THREE.Object3D) {
   obj.updateMatrixWorld(true);
-  const box = new THREE.Box3().setFromObject(obj);
-  const size = box.getSize(new THREE.Vector3());
-  const maxDim = Math.max(size.x, size.y, size.z, 1e-9);
-  const s = TARGET_MAX / maxDim;
-  obj.scale.multiplyScalar(s);
-  obj.updateMatrixWorld(true);
-  const b2 = new THREE.Box3().setFromObject(obj);
-  const c2 = b2.getCenter(new THREE.Vector3());
-  obj.position.sub(c2);
-  obj.updateMatrixWorld(true);
-  return { scale: s, maxDim, size: b2.getSize(new THREE.Vector3()) };
+  const s = new THREE.Box3().setFromObject(obj).getSize(new THREE.Vector3());
+  return Math.max(s.x, s.y, s.z, 0);
 }
 
-function applyDebugWireframeMaterial(obj: THREE.Object3D, mat: THREE.MeshBasicMaterial) {
+/**
+ * 米制(≈0.27) → ×1000；异常大数(2700) → ÷10；再强制缩放到行业目标长度 (mm)
+ */
+function applyIndustryMmNormalization(
+  obj: THREE.Object3D,
+  audience: ShoeAudience
+): { rawMax: number; lenBeforeTargetMm: number; scaleToTarget: number; targetMm: number; audience: ShoeAudience } {
+  const targetMm = getTargetLengthMm(audience);
+  const raw0 = maxAxisLength(obj);
+  if (raw0 < 0.5 && raw0 > 0.05) {
+    obj.scale.multiplyScalar(1000);
+  }
+  obj.updateMatrixWorld(true);
+  let m = maxAxisLength(obj);
+  if (m > 1500 && m < 5000) {
+    obj.scale.multiplyScalar(0.1);
+  }
+  obj.updateMatrixWorld(true);
+  const lenBeforeTargetMm = maxAxisLength(obj);
+  const scaleToTarget = lenBeforeTargetMm < 1e-9 ? 1 : targetMm / lenBeforeTargetMm;
+  obj.scale.multiplyScalar(scaleToTarget);
+  obj.updateMatrixWorld(true);
+  centerObject(obj);
+  return { rawMax: raw0, lenBeforeTargetMm, scaleToTarget, targetMm, audience };
+}
+
+function applyPhongShading(obj: THREE.Object3D, mat: THREE.MeshPhongMaterial) {
   obj.traverse((ch) => {
     const o = ch as THREE.Mesh;
     if ((o as any).isMesh) {
@@ -218,7 +238,7 @@ function loadTextWithXhr(
   });
 }
 
-export default function ThreeDViewer({ fileUrl, className, onLoaded, onError, onMetrics }: Props) {
+export default function ThreeDViewer({ fileUrl, targetAudience, className, onLoaded, onError, onMetrics }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const onMetricsRef = useRef(onMetrics);
   const onLoadedRef = useRef(onLoaded);
@@ -245,7 +265,7 @@ export default function ThreeDViewer({ fileUrl, className, onLoaded, onError, on
     setProgress(0);
 
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x333333);
+    scene.background = new THREE.Color(0xeeeeee);
 
     const camera = new THREE.PerspectiveCamera(50, 1, 0.001, 1_000_000);
     camera.position.set(8, 8, 8);
@@ -258,24 +278,17 @@ export default function ThreeDViewer({ fileUrl, className, onLoaded, onError, on
     renderer.shadowMap.enabled = false;
     container.appendChild(renderer.domElement);
 
-    // —— 强力光照：环境 + 半球 + 大平行光 + 点光（强度为原先量级约 3–4 倍）
-    const ambient = new THREE.AmbientLight(0xffffff, 2.0);
+    const ambient = new THREE.AmbientLight(0xffffff, 0.75);
     scene.add(ambient);
-    const hemi = new THREE.HemisphereLight(0xffffff, 0x6b7280, 1.2);
-    hemi.position.set(0, 200, 0);
+    const hemi = new THREE.HemisphereLight(0xffffff, 0xe5e5e5, 0.45);
+    hemi.position.set(0, 1, 0);
     scene.add(hemi);
-    const dir = new THREE.DirectionalLight(0xffffff, 2.4);
-    dir.position.set(200, 400, 250);
+    const dir = new THREE.DirectionalLight(0xffffff, 0.9);
+    dir.position.set(400, 800, 500);
     scene.add(dir);
-    const dir2 = new THREE.DirectionalLight(0xffffff, 1.5);
-    dir2.position.set(-300, 100, -200);
-    scene.add(dir2);
-    const pt = new THREE.PointLight(0xffffff, 3.0, 0, 0.3);
-    pt.position.set(0, 80, 0);
-    scene.add(pt);
-    const pt2 = new THREE.PointLight(0xffeedd, 2.0, 0, 0.2);
-    pt2.position.set(200, 50, 200);
-    scene.add(pt2);
+    const fill = new THREE.DirectionalLight(0xffffff, 0.4);
+    fill.position.set(-300, 200, -200);
+    scene.add(fill);
 
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
@@ -285,15 +298,21 @@ export default function ThreeDViewer({ fileUrl, className, onLoaded, onError, on
     controls.minDistance = 0.05;
     controls.maxDistance = 5e3;
 
-    /** 全白线框，不依赖光照，便于判断是否为打光/材质问题 */
-    const wireMat = new THREE.MeshBasicMaterial({ color: 0xffffff, wireframe: true, side: THREE.DoubleSide });
-    const pointsMaterial = new THREE.PointsMaterial({ color: 0xffffff, size: 2.5, sizeAttenuation: true });
+    const phongMat = new THREE.MeshPhongMaterial({
+      color: 0x888888,
+      flatShading: true,
+      side: THREE.DoubleSide,
+      shininess: 24,
+    });
+    const pointsMaterial = new THREE.PointsMaterial({ color: 0x666666, size: 2.5, sizeAttenuation: true });
 
     const debugState = { boxHelper: null as THREE.BoxHelper | null };
 
-    const grid = new THREE.GridHelper(100, 10, 0x666666, 0x4a4a4a);
+    // 1 world unit = 1mm，格线每格 10mm（200/20=10）
+    const grid = new THREE.GridHelper(200, 20, 0xbbbbbb, 0xcccccc);
+    grid.position.y = 0;
     scene.add(grid);
-    const axes = new THREE.AxesHelper(100);
+    const axes = new THREE.AxesHelper(150);
     scene.add(axes);
 
     const resize = () => {
@@ -353,6 +372,16 @@ export default function ThreeDViewer({ fileUrl, className, onLoaded, onError, on
         return false;
       }
 
+      const aud = parseAudience(targetAudience);
+      const sync = applyIndustryMmNormalization(obj, aud);
+      // eslint-disable-next-line no-console
+      console.log(
+        `[StandardSync] 类别: ${audienceLabelZh(sync.audience)} | 原始长度: ${sync.rawMax} | 缩放系数: ${sync.scaleToTarget.toFixed(4)} | 最终长度: ${sync.targetMm}mm`
+      );
+
+      const auditNorm = collectGeometryAudit(obj);
+      logGeometryDiagnostics(urlKey, '行业归一化后 (mm)', auditNorm, undefined);
+
       const metrics = extractLast3DMetrics(obj);
       onMetricsRef.current?.(metrics);
 
@@ -370,21 +399,18 @@ export default function ThreeDViewer({ fileUrl, className, onLoaded, onError, on
           }
         });
       } else {
-        applyDebugWireframeMaterial(obj, wireMat);
+        applyPhongShading(obj, phongMat);
       }
 
-      const { size } = displayNormalizeScale(obj);
-      const auditNorm = collectGeometryAudit(obj);
-      logGeometryDiagnostics(urlKey, '显示归一化后 (TARGET_MAX=5)', auditNorm, undefined);
-
       scene.add(obj);
-      debugState.boxHelper = new THREE.BoxHelper(obj, 0xffff00);
+      debugState.boxHelper = new THREE.BoxHelper(obj, 0xff8800);
       scene.add(debugState.boxHelper);
 
-      const m = Math.max(size.x, size.y, size.z, 1e-6);
-      camera.position.set(m, m, m);
-      camera.near = Math.max(0.0001, m / 5e3);
-      camera.far = Math.max(500, m * 1e3);
+      const D = sync.targetMm * 1.5;
+      const off = new THREE.Vector3(0.7, 0.45, 0.8).normalize().multiplyScalar(D);
+      camera.position.copy(off);
+      camera.near = Math.max(0.1, D / 2000);
+      camera.far = D * 80;
       camera.lookAt(0, 0, 0);
       camera.updateProjectionMatrix();
       controls.target.set(0, 0, 0);
@@ -456,7 +482,7 @@ export default function ThreeDViewer({ fileUrl, className, onLoaded, onError, on
       }
       disposeGeometries(scene);
       scene.clear();
-      wireMat.dispose();
+      phongMat.dispose();
       pointsMaterial.dispose();
       controls.dispose();
       try {
@@ -466,7 +492,7 @@ export default function ThreeDViewer({ fileUrl, className, onLoaded, onError, on
       }
       renderer.dispose();
     };
-  }, [urlKey]);
+  }, [urlKey, targetAudience]);
 
   return (
     <div className={className} ref={containerRef} style={{ position: 'relative', minHeight: 120 }}>

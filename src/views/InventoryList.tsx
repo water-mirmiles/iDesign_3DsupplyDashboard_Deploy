@@ -67,9 +67,11 @@ interface PreviewModalProps {
   onClose: () => void;
   assetCode: string;
   assetType: 'last' | 'sole';
+  /** 行数据 target_audience，供 3D 行业归一化 */
+  targetAudience?: string;
 }
 
-const PreviewModal = ({ isOpen, onClose, assetCode, assetType }: PreviewModalProps) => {
+const PreviewModal = ({ isOpen, onClose, assetCode, assetType, targetAudience }: PreviewModalProps) => {
   const [showAllStyles, setShowAllStyles] = useState(false);
   const [showAllSoles, setShowAllSoles] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -150,9 +152,10 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType }: PreviewModalPro
           
           {/* Three.js Viewer */}
           {fileUrl ? (
-            <div className="absolute inset-0" key={fileUrl}>
+            <div className="absolute inset-0" key={`${fileUrl}__${String(targetAudience ?? '')}`}>
               <ThreeDViewer
                 fileUrl={fileUrl}
+                targetAudience={targetAudience}
                 className="absolute inset-0 relative"
                 onMetrics={(m) => {
                   setLastMetrics(m);
@@ -403,7 +406,12 @@ function pathBasenameOnly(name: string) {
 }
 
 export default function InventoryList() {
-  const [previewModal, setPreviewModal] = useState<{isOpen: boolean, assetCode: string, type: 'last'|'sole'}>({ isOpen: false, assetCode: '', type: 'last' });
+  const [previewModal, setPreviewModal] = useState<{
+    isOpen: boolean;
+    assetCode: string;
+    type: 'last' | 'sole';
+    targetAudience?: string;
+  }>({ isOpen: false, assetCode: '', type: 'last' });
   const [has3DFilter, setHas3DFilter] = useState<string>('all');
   const [brandFilter, setBrandFilter] = useState<string>('all');
   const [searchTerm, setSearchTerm] = useState<string>('');
@@ -412,9 +420,9 @@ export default function InventoryList() {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const openPreview = (assetCode: string | undefined, type: 'last' | 'sole') => {
+  const openPreview = (assetCode: string | undefined, type: 'last' | 'sole', targetAudience?: string) => {
     if (assetCode) {
-      setPreviewModal({ isOpen: true, assetCode, type });
+      setPreviewModal({ isOpen: true, assetCode, type, targetAudience });
     }
   };
 
@@ -654,7 +662,13 @@ export default function InventoryList() {
                   <td className="px-5 py-4">
                     {item.lastStatus === 'matched' ? (
                       <button 
-                        onClick={() => openPreview(item.lastCode ? String(item.lastCode).trim() : undefined, 'last')}
+                        onClick={() =>
+                          openPreview(
+                            item.lastCode ? String(item.lastCode).trim() : undefined,
+                            'last',
+                            item.target_audience
+                          )
+                        }
                         className="flex items-center gap-1.5 text-emerald-600 bg-emerald-50 hover:bg-emerald-100 px-2 py-1 rounded-md w-fit transition-colors cursor-pointer group/btn"
                       >
                         <CheckCircle2 className="w-4 h-4 group-hover/btn:scale-110 transition-transform" />
@@ -673,7 +687,13 @@ export default function InventoryList() {
                   <td className="px-5 py-4">
                     {item.soleStatus === 'matched' ? (
                       <button 
-                        onClick={() => openPreview(item.soleCode ? String(item.soleCode).trim() : undefined, 'sole')}
+                        onClick={() =>
+                          openPreview(
+                            item.soleCode ? String(item.soleCode).trim() : undefined,
+                            'sole',
+                            item.target_audience
+                          )
+                        }
                         className="flex items-center gap-1.5 text-emerald-600 bg-emerald-50 hover:bg-emerald-100 px-2 py-1 rounded-md w-fit transition-colors cursor-pointer group/btn"
                       >
                         <CheckCircle2 className="w-4 h-4 group-hover/btn:scale-110 transition-transform" />
@@ -706,11 +726,12 @@ export default function InventoryList() {
         </div>
       </div>
 
-      <PreviewModal 
-        isOpen={previewModal.isOpen} 
-        onClose={() => setPreviewModal({ ...previewModal, isOpen: false })} 
+      <PreviewModal
+        isOpen={previewModal.isOpen}
+        onClose={() => setPreviewModal({ ...previewModal, isOpen: false })}
         assetCode={previewModal.assetCode}
         assetType={previewModal.type}
+        targetAudience={previewModal.targetAudience}
       />
     </div>
   );
