@@ -180,6 +180,47 @@ function printRawStatusAuditTable(rawStatusAudit, main, statusCol) {
   }
 }
 
+/** 终端公示：effective/invalid/raw 以及归一化四态分布（全物理行） */
+function printStatusScopeCensus(main, statusCol, rawStatusAudit) {
+  const physical = main?.rows?.length || 0;
+  const norm = (v) => String(v ?? '').trim().toLowerCase();
+
+  let rawEffective = 0;
+  let rawInvalid = 0;
+  for (const it of rawStatusAudit || []) {
+    const v = norm(it?.value);
+    const n = Number(it?.rowCount || 0);
+    if (v === 'effective') rawEffective += n;
+    else if (v === 'invalid') rawInvalid += n;
+  }
+  const rawOther = Math.max(0, physical - rawEffective - rawInvalid);
+
+  const mapped = { active: 0, draft: 0, obsolete: 0, other: 0 };
+  for (const row of main?.rows || []) {
+    const raw = statusCol ? row?.[statusCol] : undefined;
+    const b = normalizeInventoryStatus(raw);
+    mapped[b] = (mapped[b] || 0) + 1;
+  }
+  const mappedSum = Number(mapped.active || 0) + Number(mapped.draft || 0) + Number(mapped.obsolete || 0) + Number(mapped.other || 0);
+
+  // eslint-disable-next-line no-console
+  console.log('--- 实时数据口径检查 ---');
+  // eslint-disable-next-line no-console
+  console.log(`[effective] -> ${rawEffective} 行 (映射为：生效/active)`);
+  // eslint-disable-next-line no-console
+  console.log(`[invalid]   -> ${rawInvalid} 行 (映射为：作废/无效/obsolete)`);
+  // eslint-disable-next-line no-console
+  console.log(`[其他值]     -> ${rawOther} 行`);
+  // eslint-disable-next-line no-console
+  console.log('----------------------');
+  // eslint-disable-next-line no-console
+  console.log('[Mapped] active/draft/obsolete/other =', mapped, `sum=${mappedSum} (physical=${physical})`);
+  if (mappedSum !== physical) {
+    // eslint-disable-next-line no-console
+    console.warn(`[Engine] 归一化状态四态合计 ${mappedSum} 与物理行 ${physical} 不一致（请检查 style_wms 空行/重复表头/筛选逻辑）`);
+  }
+}
+
 function safeJsonRead(filePath) {
   try {
     if (!fse.existsSync(filePath)) return null;
@@ -1830,8 +1871,10 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
   // aggregateFinalDashboardData 等价入口：入库前强制原始状态普查（全表物理行，无过滤）
   const rawStatusAudit = auditMainTableRawStatusDistribution(main, statusCol);
   printRawStatusAuditTable(rawStatusAudit, main, statusCol);
+  printStatusScopeCensus(main, statusCol, rawStatusAudit);
 
   const inventory = [];
+  // 归一化四态：全物理行计数（用于 Dashboard 三档 Tab 的加法原则校验）
   const statusDist = { active: 0, draft: 0, obsolete: 0, other: 0 };
   let traceFailCount = 0;
   let lastCodeLinked = 0;
@@ -2010,6 +2053,11 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
   }
 
   const totalStyles = inventory.length;
+  const statusSum = Number(statusDist.active || 0) + Number(statusDist.draft || 0) + Number(statusDist.obsolete || 0) + Number(statusDist.other || 0);
+  if (statusSum !== totalStyles) {
+    // eslint-disable-next-line no-console
+    console.warn(`[Engine] 状态分桶合计 ${statusSum} 与入库行 totalStyles=${totalStyles} 不一致（可能存在 style_wms 空行过滤）`);
+  }
 
   // eslint-disable-next-line no-console
   console.log('归一化状态桶（仅含已入库款号行）：', [...new Set(inventory.map((r) => r.data_status))]);
