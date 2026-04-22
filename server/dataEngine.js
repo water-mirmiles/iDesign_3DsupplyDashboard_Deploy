@@ -1721,6 +1721,9 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
   const dataTablesDir = path.join(storageRoot, 'data_tables');
   const dateDir = dateDirName ? path.join(dataTablesDir, dateDirName) : dataTablesDir;
 
+  // eslint-disable-next-line no-console
+  console.log('📁 [Critical] latestDir =', dateDir);
+
   const excelFiles = (await listFiles(dateDir)).filter((n) => ['.xlsx', '.xls'].includes(path.extname(n).toLowerCase()));
   const xlsxTables = excelFiles.map((fileName) => {
     const fullPath = path.join(dateDir, fileName);
@@ -1742,7 +1745,41 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
   // 生产看板强制主表：ods_pdm_pdm_product_info_df（逻辑名）
   const forcedMain =
     xlsxTables.find((t) => normalizeLower(getLogicalTableName(t.fileName)) === 'ods_pdm_pdm_product_info_df') || null;
-  const main = forcedMain || (required.length ? guessStyleMainTable(xlsxTables, required) : null);
+  let main = forcedMain || (required.length ? guessStyleMainTable(xlsxTables, required) : null);
+
+  if (main) {
+    // eslint-disable-next-line no-console
+    console.log('📂 [Critical] 当前正在读取的主文件路径:', main.fullPath);
+    // eslint-disable-next-line no-console
+    console.log('📊 [Critical] 该文件实际物理行数 (含表头):', main.sheetRef || '(unknown !ref)');
+    // eslint-disable-next-line no-console
+    console.log('📊 [Critical] sheet_to_json(sheet).length =', Number(main.sheetJsonLen || 0));
+
+    const maxByLen = (xlsxTables || [])
+      .map((t) => ({ t, n: Number(t?.sheetJsonLen || 0) }))
+      .sort((a, b) => b.n - a.n)[0];
+    if (maxByLen?.t && maxByLen.n > 0 && Number(main.sheetJsonLen || 0) !== maxByLen.n) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[Critical] 主表行数(${Number(main.sheetJsonLen || 0)}) != 同目录最大行数(${maxByLen.n})，将扫描并在必要时切换到最大表`
+      );
+      // eslint-disable-next-line no-console
+      for (const t of xlsxTables) {
+        console.log(`- [RowCount] ${t.fileName}: sheet_to_json.len=${Number(t.sheetJsonLen || 0)} !ref=${t.sheetRef || '(n/a)'}`);
+      }
+      if (maxByLen.n >= 5600 && Number(main.sheetJsonLen || 0) < 5600) {
+        main = maxByLen.t;
+        // eslint-disable-next-line no-console
+        console.log('✅ [Critical] 已切换主表为行数最多文件:', main.fileName);
+        // eslint-disable-next-line no-console
+        console.log('📂 [Critical] 当前正在读取的主文件路径:', main.fullPath);
+        // eslint-disable-next-line no-console
+        console.log('📊 [Critical] 该文件实际物理行数 (含表头):', main.sheetRef || '(unknown !ref)');
+        // eslint-disable-next-line no-console
+        console.log('📊 [Critical] sheet_to_json(sheet).length =', Number(main.sheetJsonLen || 0));
+      }
+    }
+  }
 
   if (!main) {
     return {
