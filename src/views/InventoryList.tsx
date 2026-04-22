@@ -94,6 +94,7 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType, targetAudience }:
   /** 仅当 GET /api/asset-meta 有 metrics 时设置，供 GLB 跳过前端重复测画 */
   const [precomputedFromApi, setPrecomputedFromApi] = useState<Last3DMetrics | null>(null);
   const [precomputedKey, setPrecomputedKey] = useState<string>('');
+  const [glbBust, setGlbBust] = useState(() => Date.now());
   const [scan3d, setScan3d] = useState(false);
 
   const apiType = assetType === 'last' ? 'lasts' : 'soles';
@@ -149,6 +150,11 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType, targetAudience }:
   }, [isOpen, file?.exists, file?.fileName, apiType]);
 
   useEffect(() => {
+    if (!isOpen || !fileUrl) return;
+    setGlbBust(Date.now());
+  }, [isOpen, fileUrl, precomputedKey]);
+
+  useEffect(() => {
     if (!isOpen) return;
     if (!fileUrl) {
       setScan3d(false);
@@ -188,6 +194,7 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType, targetAudience }:
                 targetAudience={targetAudience}
                 precomputedMetrics={fileUrl && fileUrl.toLowerCase().endsWith('.glb') ? precomputedFromApi : null}
                 precomputedKey={precomputedKey}
+                glbCacheToken={glbBust}
                 className="absolute inset-0 relative"
                 onMetrics={(m) => {
                   setLastMetrics(m);
@@ -458,8 +465,22 @@ export default function InventoryList() {
     }
   };
 
+  const loadInventory = useCallback(async () => {
+    setIsLoading(true);
+    setError(null);
+    try {
+      const resp = await fetch('/api/inventory-real');
+      const json = (await resp.json()) as InventoryRealResponse;
+      if (!resp.ok || !json.ok) throw new Error(json.error || `加载失败（HTTP ${resp.status}）`);
+      setItems(json.items || []);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '加载失败');
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
-    let cancelled = false;
     // Dashboard 点击品牌跳转：通过 localStorage 预设过滤
     try {
       const preset = localStorage.getItem('inventoryBrandFilter');
@@ -481,25 +502,16 @@ export default function InventoryList() {
     } catch {
       // ignore
     }
-    const run = async () => {
-      setIsLoading(true);
-      setError(null);
-      try {
-        const resp = await fetch('/api/inventory-real');
-        const json = (await resp.json()) as InventoryRealResponse;
-        if (!resp.ok || !json.ok) throw new Error(json.error || `加载失败（HTTP ${resp.status}）`);
-        if (!cancelled) setItems(json.items || []);
-      } catch (e) {
-        if (!cancelled) setError(e instanceof Error ? e.message : '加载失败');
-      } finally {
-        if (!cancelled) setIsLoading(false);
-      }
+    void loadInventory();
+  }, [loadInventory]);
+
+  useEffect(() => {
+    const onRefresh = () => {
+      void loadInventory();
     };
-    void run();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+    window.addEventListener('3d-assets-refresh', onRefresh);
+    return () => window.removeEventListener('3d-assets-refresh', onRefresh);
+  }, [loadInventory]);
 
   const brandOptions = useMemo(() => {
     const set = new Set<string>();

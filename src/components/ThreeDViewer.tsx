@@ -17,6 +17,8 @@ type Props = {
   precomputedMetrics?: Last3DMetrics | null;
   /** 变更时与 key 同用，强制重挂 viewer（如 meta `updatedAt`） */
   precomputedKey?: string;
+  /** 每次变化会刷新 .glb 的 cache buster，例如资源更新后重开弹窗 */
+  glbCacheToken?: string | number;
   className?: string;
   onLoaded?: () => void;
   onError?: (err: Error) => void;
@@ -281,6 +283,7 @@ export default function ThreeDViewer({
   targetAudience,
   precomputedMetrics,
   precomputedKey,
+  glbCacheToken,
   className,
   onLoaded,
   onError,
@@ -384,6 +387,11 @@ export default function ThreeDViewer({
     };
 
     const isGlb = urlKey.toLowerCase().endsWith('.glb');
+    const glbBustedUrl = isGlb
+      ? `${urlKey.split('#')[0]}${urlKey.includes('?') ? '&' : '?'}_cb=${
+          typeof glbCacheToken === 'number' || typeof glbCacheToken === 'string' ? String(glbCacheToken) : Date.now()
+        }`
+      : urlKey;
 
     void (async () => {
       try {
@@ -404,7 +412,7 @@ export default function ThreeDViewer({
 
         if (isGlb) {
           const ab = await loadArrayBufferWithXhr(
-            urlKey,
+            glbBustedUrl,
             (p) => {
               if (!signal.aborted) setProgress(p);
             },
@@ -505,7 +513,7 @@ export default function ThreeDViewer({
       }
       renderer.dispose();
     };
-  }, [urlKey, targetAudience, precomputedMetrics, precomputedKey]);
+  }, [urlKey, targetAudience, precomputedMetrics, precomputedKey, glbCacheToken]);
 
   return (
     <div className={className} ref={containerRef} style={{ position: 'relative', minHeight: 120, width: '100%', height: '100%' }}>

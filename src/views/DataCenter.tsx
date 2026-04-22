@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { UploadCloud, FileSpreadsheet, Box, CheckCircle2, Clock, FileWarning, Search, Info, Calendar, Play, Trash2 } from 'lucide-react';
+import { UploadCloud, FileSpreadsheet, Box, CheckCircle2, Clock, FileWarning, Search, Info, Calendar, Play, Trash2, RefreshCw } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { ImportHistory } from '@/types';
 
@@ -17,6 +17,10 @@ type UploadQueueItem = {
   status: UploadStatus;
   progress: number; // 0-100
   error?: string;
+  /** 3D 且服务端已有同名文件 */
+  willOverwrite?: boolean;
+  /** 3D 重名检查中 */
+  existsCheckPending?: boolean;
 };
 
 function formatBytes(bytes: number) {
@@ -35,6 +39,8 @@ export default function DataCenter() {
   const [queue, setQueue] = useState<UploadQueueItem[]>([]);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [autoOverwrite, setAutoOverwrite] = useState(true);
+  const [pipelineSyncing, setPipelineSyncing] = useState(false);
   const [history, setHistory] = useState<ImportHistory[]>(mockHistory);
 
   const xlsxInputRef = useRef<HTMLInputElement | null>(null);
@@ -88,7 +94,7 @@ export default function DataCenter() {
     else assetInputRef.current?.click();
   };
 
-  const addFilesToQueue = (files: File[]) => {
+  const addFilesToQueue = async (files: File[]) => {
     const allowedExts = activeTab === 'xlsx'
       ? new Set(['xlsx', 'xls'])
       : new Set(['obj', 'stl', '3dm']);
@@ -99,27 +105,50 @@ export default function DataCenter() {
     });
     if (picked.length === 0) return;
 
+    const toAdd: UploadQueueItem[] = [];
+    for (const f of picked) {
+      toAdd.push({
+        id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        file: f,
+        status: 'queued',
+        progress: 0,
+        existsCheckPending: activeTab === '3d' && /\.(obj|stl|3dm|glb)$/i.test(f.name),
+      });
+    }
+    if (toAdd.length === 0) return;
+
     setQueue((prev) => {
       const existing = new Set(prev.map((p) => `${p.file.name}::${p.file.size}`));
       const next = [...prev];
-      for (const f of picked) {
-        const key = `${f.name}::${f.size}`;
+      for (const item of toAdd) {
+        const key = `${item.file.name}::${item.file.size}`;
         if (existing.has(key)) continue;
-        next.push({
-          id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-          file: f,
-          status: 'queued',
-          progress: 0,
-        });
+        existing.add(key);
+        next.push(item);
       }
       return next;
     });
+
+    if (activeTab === '3d') {
+      for (const it of toAdd) {
+        if (!it.existsCheckPending) continue;
+        let willOverwrite = false;
+        try {
+          const r = await fetch(`/api/check-exists?${new URLSearchParams({ name: it.file.name })}`);
+          const j = (await r.json()) as { ok: boolean; checked?: boolean; exists?: boolean };
+          willOverwrite = Boolean(r.ok && j?.checked && j?.exists);
+        } catch {
+          willOverwrite = false;
+        }
+        setQueue((p) => p.map((q) => (q.id === it.id ? { ...q, willOverwrite, existsCheckPending: false } : q)));
+      }
+    }
   };
 
   const handleFileSelected = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || []) as File[];
     e.target.value = '';
-    addFilesToQueue(files);
+    void addFilesToQueue(files);
   };
 
   const onDragOver = (e: React.DragEvent) => {
@@ -132,7 +161,7 @@ export default function DataCenter() {
     e.stopPropagation();
     if (isUploading) return;
     const files = Array.from(e.dataTransfer.files || []) as File[];
-    addFilesToQueue(files);
+    void addFilesToQueue(files);
   };
 
   const uploadOneWithProgress = (itemId: string, file: File) => {
@@ -180,8 +209,19 @@ export default function DataCenter() {
     const toUpload = queue.filter((q) => q.status === 'queued' || q.status === 'failed');
     if (toUpload.length === 0) return;
 
+    if (activeTab === '3d' && !autoOverwrite) {
+      const blocked = toUpload.find((q) => q.willOverwrite);
+      if (blocked) {
+        setUploadError('队列中存在将覆盖的同名文件。请打开「自动覆盖同名文件」或重命名后重试。');
+        return;
+      }
+    }
+
     setIsUploading(true);
     setUploadError(null);
+    if (activeTab === '3d') {
+      setPipelineSyncing(true);
+    }
 
     try {
       let anyUploadOk = false;
@@ -197,12 +237,27 @@ export default function DataCenter() {
         }
       }
       await loadHistory();
-      if (anyUploadOk) await triggerDashboardPhysicalSync();
+      if (anyUploadOk) {
+        try {
+          await triggerDashboardPhysicalSync();
+        } finally {
+          if (activeTab === '3d' && anyUploadOk) {
+            try {
+              window.dispatchEvent(new Event('3d-assets-refresh'));
+            } catch {
+              // ignore
+            }
+          }
+        }
+      }
     } catch (e) {
       const message = e instanceof Error ? e.message : '上传失败';
       setUploadError(message);
     } finally {
       setIsUploading(false);
+      if (activeTab === '3d') {
+        setPipelineSyncing(false);
+      }
     }
   };
 
@@ -216,6 +271,12 @@ export default function DataCenter() {
       <div>
         <h1 className="text-2xl font-semibold text-slate-900">数据导入中心</h1>
         <p className="text-sm text-slate-500 mt-1">上传业务表格与 3D 资产文件，系统将自动进行匹配</p>
+        {activeTab === '3d' && pipelineSyncing && (
+          <div className="mt-3 flex items-center gap-2 text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 w-full max-w-2xl">
+            <RefreshCw className="w-4 h-4 shrink-0 animate-spin" />
+            正在重算 3D 对账、看板与清单数据（与后端物理文件对齐）…
+          </div>
+        )}
       </div>
 
       <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden w-full">
@@ -247,6 +308,22 @@ export default function DataCenter() {
 
         {/* Upload Area */}
         <div className="p-8">
+          {activeTab === '3d' && (
+            <div className="mb-4 flex flex-wrap items-center justify-between gap-3 p-3 rounded-lg border border-amber-100 bg-amber-50/50">
+              <label className="flex items-center gap-2.5 text-sm text-slate-800 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  className="rounded border-amber-300 text-amber-600 focus:ring-amber-500"
+                  checked={autoOverwrite}
+                  onChange={(e) => setAutoOverwrite(e.target.checked)}
+                />
+                <span>
+                  <span className="font-medium">自动覆盖同名文件</span>
+                  <span className="text-slate-500">（关：若服务端已有同名 3D 将阻止上传）</span>
+                </span>
+              </label>
+            </div>
+          )}
           <input
             ref={xlsxInputRef}
             type="file"
@@ -355,7 +432,15 @@ export default function DataCenter() {
                         <div className="font-medium text-slate-900 truncate max-w-[70vw]">{q.file.name}</div>
                         <div className="text-xs text-slate-500">{formatBytes(q.file.size)}</div>
                       </div>
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-center flex-wrap gap-2">
+                        {activeTab === '3d' && q.willOverwrite && (q.status === 'queued' || q.status === 'failed') && (
+                          <span className="text-xs px-2 py-0.5 rounded-md bg-amber-50 text-amber-800 border border-amber-200 font-medium">
+                            覆盖更新
+                          </span>
+                        )}
+                        {activeTab === '3d' && q.existsCheckPending && (q.status === 'queued' || q.status === 'failed') && (
+                          <span className="text-xs text-slate-500">检查重名…</span>
+                        )}
                         {q.status === 'queued' && <span className="text-xs px-2 py-1 rounded-md bg-slate-100 text-slate-600 border border-slate-200">等待中</span>}
                         {q.status === 'uploading' && <span className="text-xs px-2 py-1 rounded-md bg-blue-50 text-blue-700 border border-blue-200">上传中</span>}
                         {q.status === 'success' && <span className="text-xs px-2 py-1 rounded-md bg-emerald-50 text-emerald-700 border border-emerald-200">成功</span>}

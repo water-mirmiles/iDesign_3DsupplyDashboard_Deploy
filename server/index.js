@@ -96,6 +96,37 @@ const FINAL_DASHBOARD_PATH = path.join(STORAGE_ROOT, 'final_dashboard_data.json'
 const FINAL_RESULTS_PATH = path.join(STORAGE_ROOT, 'final_results.json');
 const ASSETS_META_PATH = path.join(STORAGE_ROOT, 'assets_meta.json');
 
+/** 与 multer 目的地规则一致：3D 文件名应落到 lasts 或 soles 哪个目录 */
+function resolve3dAssetDirByFileName(originalName) {
+  const base = path.basename(String(originalName || ''));
+  const u = base.toUpperCase();
+  if (u.includes('SOLE')) return { dir: DIRS.soles, kind: 'soles' };
+  if (u.includes('LST') || u.includes('LAST')) return { dir: DIRS.lasts, kind: 'lasts' };
+  return { dir: DIRS.lasts, kind: 'lasts' };
+}
+
+/**
+ * 覆盖上传 3D 源文件（.obj/.stl/.3dm）时：删除同目录下同名 .glb，确保后续 obj2gltf 能写出新预览。
+ * 注意：不处理「直接覆盖 .glb」——那是同一文件，multer 已写盘。
+ * @param {string} absoluteFilePath
+ */
+function removeSiblingGlbOn3dAssetOverwrite(absoluteFilePath) {
+  const ext = path.extname(absoluteFilePath).toLowerCase();
+  if (ext === '.glb' || !['.obj', '.stl', '.3dm'].includes(ext)) return;
+  const baseNoExt = path.basename(absoluteFilePath, ext);
+  const glbPath = path.join(path.dirname(absoluteFilePath), `${baseNoExt}.glb`);
+  if (fs.existsSync(glbPath)) {
+    try {
+      fs.unlinkSync(glbPath);
+      // eslint-disable-next-line no-console
+      console.log('[upload] 已删除旧 GLB 以准备重转:', path.basename(glbPath));
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.warn('[upload] 删除旧 GLB 失败', glbPath, e instanceof Error ? e.message : e);
+    }
+  }
+}
+
 /** 与 dataEngine 物理对账一致：去后缀 + trim + 小写 */
 const ASSET_3D_EXTS = ['.glb', '.obj', '.stl', '.3dm'];
 
@@ -974,6 +1005,27 @@ const sandboxUpload = multer({
 
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true });
+});
+
+/** 上传队列：检查目标 3D 文件是否已存在（与 multer 归档规则一致） */
+app.get('/api/check-exists', (req, res) => {
+  try {
+    const raw = String(req.query.name || '').trim();
+    if (!raw) return res.status(400).json({ ok: false, error: 'missing name' });
+    if (!/\.(obj|stl|3dm|glb)$/i.test(raw)) {
+      return res.json({ ok: true, name: path.basename(raw), kind: 'unknown', exists: false, checked: false });
+    }
+    const base = path.basename(raw);
+    const { dir, kind } = resolve3dAssetDirByFileName(base);
+    const abs = path.join(dir, base);
+    if (!isPathInsideAssetDir(abs, DIRS.lasts) && !isPathInsideAssetDir(abs, DIRS.soles)) {
+      return res.status(400).json({ ok: false, error: 'invalid path' });
+    }
+    const exists = fs.existsSync(abs);
+    return res.json({ ok: true, name: base, kind, exists, checked: true });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e instanceof Error ? e.message : 'check-exists failed' });
+  }
 });
 
 // 本地快速解析：从多表 DDL 中提取表名 + 字段名列表（供前端动态样本配置下拉框使用）
@@ -3290,6 +3342,10 @@ app.post('/api/upload', upload.array('files', 200), async (req, res) => {
   const files = req.files;
   if (!files || !Array.isArray(files) || files.length === 0) {
     return res.status(400).json({ ok: false, error: 'No files uploaded' });
+  }
+
+  for (const f of files) {
+    if (f.path) removeSiblingGlbOn3dAssetOverwrite(f.path);
   }
 
   await refreshAssetsCache();
