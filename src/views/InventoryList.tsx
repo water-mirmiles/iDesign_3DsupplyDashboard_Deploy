@@ -193,10 +193,19 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType, targetAudience }:
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm animate-in fade-in duration-200">
-      <div className="bg-white w-[90vw] h-[85vh] rounded-2xl shadow-2xl overflow-hidden flex animate-in zoom-in-95 duration-200">
+      <div className="bg-white w-[90vw] h-[85vh] rounded-2xl shadow-2xl overflow-hidden flex animate-in zoom-in-95 duration-200 relative">
+        {/* 全局关闭按钮：始终置顶，不被 3D 画布遮挡 */}
+        <button
+          type="button"
+          onClick={onClose}
+          className="absolute top-4 right-4 z-50 p-2 bg-black/30 hover:bg-black/40 backdrop-blur rounded-full text-white/90 hover:text-white transition-colors"
+          aria-label="关闭预览"
+        >
+          <X className="w-5 h-5" />
+        </button>
         
         {/* Left: 3D Canvas Area (70%) */}
-        <div className="w-[70%] bg-slate-900 relative flex items-center justify-center">
+        <div className="flex-[7] min-w-0 bg-slate-900 relative flex items-center justify-center border-r border-slate-700">
           <div className="absolute top-4 left-4 flex items-center gap-2 bg-black/40 backdrop-blur-md px-3 py-1.5 rounded-lg text-white/80 text-sm">
             {assetType === 'last' ? <Box className="w-4 h-4" /> : <Layers className="w-4 h-4" />}
             <span className="font-mono">{assetCode}</span>
@@ -274,15 +283,12 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType, targetAudience }:
         </div>
 
         {/* Right: Asset Details (30%) */}
-        <div className="w-[30%] bg-white flex flex-col border-l border-slate-200">
+        <div className="flex-[3] min-w-[350px] max-w-[520px] shrink-0 bg-white flex flex-col">
           <div className="p-6 border-b border-slate-100 flex justify-between items-start">
             <div>
               <h2 className="text-xl font-bold text-slate-900">资产详情</h2>
               <p className="text-sm text-slate-500 mt-1">{assetType === 'last' ? '3D 楦头模型' : '3D 大底模型'}</p>
             </div>
-            <button type="button" onClick={onClose} className="p-2 hover:bg-slate-100 rounded-full text-slate-400 hover:text-slate-600 transition-colors">
-              <X className="w-5 h-5" />
-            </button>
           </div>
 
           <div className="p-6 flex-1 overflow-y-auto space-y-6">
