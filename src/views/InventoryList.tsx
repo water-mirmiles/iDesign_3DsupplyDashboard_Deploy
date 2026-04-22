@@ -32,6 +32,17 @@ type AssetDetailsResponse = {
   error?: string;
 };
 
+type AssetMetaResponse = {
+  ok: boolean;
+  key: string;
+  entry: {
+    metrics: Last3DMetrics;
+    glbName?: string;
+    updatedAt?: string;
+  } | null;
+  error?: string;
+};
+
 function styleStatusLabel(status: string) {
   switch (status) {
     case 'active':
@@ -80,21 +91,36 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType, targetAudience }:
   const [viewerReady, setViewerReady] = useState(false);
   const [viewerError, setViewerError] = useState<string | null>(null);
   const [lastMetrics, setLastMetrics] = useState<Last3DMetrics | null>(null);
+  /** 仅当 GET /api/asset-meta 有 metrics 时设置，供 GLB 跳过前端重复测画 */
+  const [precomputedFromApi, setPrecomputedFromApi] = useState<Last3DMetrics | null>(null);
+  const [precomputedKey, setPrecomputedKey] = useState<string>('');
   const [scan3d, setScan3d] = useState(false);
 
   const apiType = assetType === 'last' ? 'lasts' : 'soles';
 
-  const loadDetails = useCallback(async () => {
+  const loadPreviewData = useCallback(async () => {
     if (!assetCode.trim()) return;
     setLoading(true);
     setFetchError(null);
     setDetails(null);
+    setLastMetrics(null);
+    setPrecomputedFromApi(null);
+    setPrecomputedKey('');
     try {
       const qs = new URLSearchParams({ type: apiType, code: assetCode.trim() });
-      const resp = await fetch(`/api/asset-details?${qs.toString()}`);
-      const json = (await resp.json()) as AssetDetailsResponse;
-      if (!resp.ok || !json.ok) throw new Error(json.error || `加载失败（HTTP ${resp.status}）`);
-      setDetails(json);
+      const [metaRes, detRes] = await Promise.all([
+        fetch(`/api/asset-meta?${qs.toString()}`),
+        fetch(`/api/asset-details?${qs.toString()}`),
+      ]);
+      const metaJson = (await metaRes.json()) as AssetMetaResponse;
+      if (metaRes.ok && metaJson.ok && metaJson.entry?.metrics) {
+        setPrecomputedFromApi(metaJson.entry.metrics);
+        setLastMetrics(metaJson.entry.metrics);
+        setPrecomputedKey(String(metaJson.entry.updatedAt || metaJson.key || '1'));
+      }
+      const detJson = (await detRes.json()) as AssetDetailsResponse;
+      if (!detRes.ok || !detJson.ok) throw new Error(detJson.error || `加载失败（HTTP ${detRes.status}）`);
+      setDetails(detJson);
     } catch (e) {
       setFetchError(e instanceof Error ? e.message : '加载失败');
     } finally {
@@ -109,9 +135,11 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType, targetAudience }:
     setViewerReady(false);
     setViewerError(null);
     setLastMetrics(null);
+    setPrecomputedFromApi(null);
+    setPrecomputedKey('');
     setScan3d(false);
-    void loadDetails();
-  }, [isOpen, assetCode, loadDetails]);
+    void loadPreviewData();
+  }, [isOpen, assetCode, loadPreviewData]);
 
   const file = details?.file;
   const fileUrl = useMemo(() => {
@@ -126,9 +154,8 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType, targetAudience }:
       setScan3d(false);
       return;
     }
-    setLastMetrics(null);
-    setScan3d(true);
-  }, [isOpen, fileUrl]);
+    setScan3d(!lastMetrics);
+  }, [isOpen, fileUrl, lastMetrics]);
 
   if (!isOpen) return null;
 
@@ -152,10 +179,15 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType, targetAudience }:
           
           {/* Three.js Viewer */}
           {fileUrl ? (
-            <div className="absolute inset-0" key={`${fileUrl}__${String(targetAudience ?? '')}`}>
+            <div
+              className="absolute inset-0"
+              key={`${fileUrl}__${String(targetAudience ?? '')}__${precomputedKey || '0'}`}
+            >
               <ThreeDViewer
                 fileUrl={fileUrl}
                 targetAudience={targetAudience}
+                precomputedMetrics={fileUrl && fileUrl.toLowerCase().endsWith('.glb') ? precomputedFromApi : null}
+                precomputedKey={precomputedKey}
                 className="absolute inset-0 relative"
                 onMetrics={(m) => {
                   setLastMetrics(m);
@@ -194,14 +226,14 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType, targetAudience }:
               <>
                 <XCircle className="w-14 h-14 text-red-400 mx-auto mb-4" />
                 <p className="text-red-300 font-medium">{viewerError}</p>
-                <p className="text-slate-500 text-sm mt-2">请确认该文件可通过 /storage 访问且为有效 OBJ</p>
+                <p className="text-slate-500 text-sm mt-2">请确认该文件可通过 /storage 访问且为有效 GLB/OBJ</p>
               </>
             ) : file?.exists && file.fileName ? (
               <>
                 <div className="w-16 h-16 border-4 border-slate-700 border-t-blue-500 rounded-full animate-spin mx-auto mb-4" />
                 <p className="text-slate-400 font-medium tracking-widest">3D 模型解析中...</p>
                 <p className="text-slate-600 text-sm mt-2">
-                  {scan3d ? '正在进行三维特征扫描…' : '正在下载/解析 OBJ…'}
+                  {scan3d ? '正在进行三维特征扫描…' : '正在下载/解析模型…'}
                 </p>
                 <p className="text-slate-500 text-xs mt-1 font-mono break-all px-2">{file.fileName}</p>
               </>

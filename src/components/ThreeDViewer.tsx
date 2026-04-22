@@ -2,16 +2,21 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { getStorageBaseUrl } from '@/lib/storageBaseUrl';
 import { extractLast3DMetrics, type Last3DMetrics } from '@/lib/last3dMetrics';
 import { audienceLabelZh, getTargetLengthMm, parseAudience, type ShoeAudience } from '@/lib/shoeStandards';
 
 type Props = {
   fileUrl: string;
-  /**
-   * 与清单行 `target_audience` 对齐；未传时按 MEN(275mm) 处理。
-   */
+  /** 与清单行 `target_audience` 对齐；未传时按 MEN(275mm) 处理。仅对 legacy OBJ 路径生效。 */
   targetAudience?: string;
+  /**
+   * 来自 GET /api/asset-meta 的预处理测绘；与 .glb 同用时跳过后端已算过的 L/W/H 与前端重复几何扫描。
+   */
+  precomputedMetrics?: Last3DMetrics | null;
+  /** 变更时与 key 同用，强制重挂 viewer（如 meta `updatedAt`） */
+  precomputedKey?: string;
   className?: string;
   onLoaded?: () => void;
   onError?: (err: Error) => void;
@@ -26,9 +31,6 @@ function resolveAssetUrl(fileUrl: string) {
   return `${getStorageBaseUrl()}/${u.replace(/^\//, '')}`;
 }
 
-/**
- * 世界单位采用 mm，便于与行业 Target 对齐
- */
 function centerObject(obj: THREE.Object3D) {
   const box = new THREE.Box3().setFromObject(obj);
   const c = box.getCenter(new THREE.Vector3());
@@ -42,9 +44,6 @@ function maxAxisLength(obj: THREE.Object3D) {
   return Math.max(s.x, s.y, s.z, 0);
 }
 
-/**
- * 米制(≈0.27) → ×1000；异常大数(2700) → ÷10；再强制缩放到行业目标长度 (mm)
- */
 function applyIndustryMmNormalization(
   obj: THREE.Object3D,
   audience: ShoeAudience
@@ -68,6 +67,37 @@ function applyIndustryMmNormalization(
   return { rawMax: raw0, lenBeforeTargetMm, scaleToTarget, targetMm, audience };
 }
 
+function isGeometryEmpty(obj: THREE.Object3D) {
+  let n = 0;
+  obj.traverse((ch) => {
+    if ((ch as any).isMesh) {
+      const p = (ch as THREE.Mesh).geometry?.getAttribute('position');
+      if (p) n += p.count;
+    }
+  });
+  if (n === 0) return true;
+  obj.updateMatrixWorld(true);
+  const s = new THREE.Box3().setFromObject(obj).getSize(new THREE.Vector3());
+  return Math.max(s.x, s.y, s.z) < 1e-12;
+}
+
+type ProcessOpts = {
+  isGlb: boolean;
+  precomputed: Last3DMetrics | null | undefined;
+  targetAudience: string | undefined;
+  urlKey: string;
+  scene: THREE.Scene;
+  camera: THREE.PerspectiveCamera;
+  controls: OrbitControls;
+  container: HTMLDivElement;
+  resize: () => void;
+  phongMat: THREE.MeshPhongMaterial;
+  setError: (s: string | null) => void;
+  onError: (e: Error) => void;
+  onMetrics: (m: Last3DMetrics) => void;
+  debugState: { boxHelper: THREE.BoxHelper | null };
+};
+
 function applyPhongShading(obj: THREE.Object3D, mat: THREE.MeshPhongMaterial) {
   obj.traverse((ch) => {
     const o = ch as THREE.Mesh;
@@ -80,124 +110,92 @@ function applyPhongShading(obj: THREE.Object3D, mat: THREE.MeshPhongMaterial) {
   });
 }
 
-type GeometryAudit = {
-  meshCount: number;
-  pointsCount: number;
-  vertexCount: number;
-  faceCount: number;
-  min: THREE.Vector3;
-  max: THREE.Vector3;
-  center: THREE.Vector3;
-  size: THREE.Vector3;
-};
+function processLoadedObject(obj: THREE.Object3D, o: ProcessOpts) {
+  const { isGlb, precomputed, targetAudience, camera, controls, phongMat, setError, onError, resize, container, onMetrics, debugState, scene, urlKey } = o;
 
-function collectGeometryAudit(obj: THREE.Object3D): GeometryAudit {
-  let meshCount = 0;
-  let pointsCount = 0;
-  let vertexCount = 0;
-  let faceCount = 0;
-  obj.updateMatrixWorld(true);
+  const meshes: THREE.Mesh[] = [];
   obj.traverse((ch) => {
-    if ((ch as any).isMesh) {
-      meshCount += 1;
-      const g = (ch as THREE.Mesh).geometry as THREE.BufferGeometry;
-      const pos = g.getAttribute('position');
-      if (pos) {
-        const vc = pos.count;
-        vertexCount += vc;
-        if (g.index) faceCount += g.index.count / 3;
-        else faceCount += vc / 3;
+    if ((ch as any).isMesh) meshes.push(ch as THREE.Mesh);
+  });
+  for (const mesh of meshes) {
+    const g = (mesh as any).geometry as THREE.BufferGeometry | undefined;
+    if (g?.isBufferGeometry) {
+      try {
+        g.computeVertexNormals();
+      } catch {
+        // ignore
       }
-    } else if ((ch as any).isPoints) {
-      pointsCount += 1;
-      const g = (ch as THREE.Points).geometry as THREE.BufferGeometry;
-      const pos = g.getAttribute('position');
-      if (pos) vertexCount += pos.count;
     }
-  });
-  const box = new THREE.Box3().setFromObject(obj);
-  const center = box.getCenter(new THREE.Vector3());
-  const size = box.getSize(new THREE.Vector3());
-  return {
-    meshCount,
-    pointsCount,
-    vertexCount: Math.floor(vertexCount),
-    faceCount: Math.floor(faceCount),
-    min: box.min.clone(),
-    max: box.max.clone(),
-    center,
-    size,
-  };
-}
-
-function isGeometryInvalid(a: GeometryAudit) {
-  const s = a.size;
-  const vol = s.x * s.y * s.z;
-  if (a.vertexCount <= 0 && a.faceCount <= 0) return true;
-  if (vol < 1e-18) return true;
-  if (Math.max(s.x, s.y, s.z) < 1e-12) return true;
-  return false;
-}
-
-function logPerMeshTable(obj: THREE.Object3D) {
-  const rows: { name: string; vertices: number; faces: string }[] = [];
-  obj.traverse((ch) => {
-    if ((ch as any).isMesh) {
-      const g = (ch as THREE.Mesh).geometry as THREE.BufferGeometry;
-      const pos = g.getAttribute('position');
-      const v = pos?.count ?? 0;
-      const f = g.index ? g.index.count / 3 : pos ? pos.count / 3 : 0;
-      rows.push({ name: ch.name || '(unnamed)', vertices: v, faces: String(Math.floor(f)) });
-    }
-  });
-  if (rows.length) {
-    // eslint-disable-next-line no-console
-    console.log('%c[ThreeDViewer] Per-Mesh 明细', 'color:#22c55e;font-weight:bold');
-    // eslint-disable-next-line no-console
-    console.table(rows);
   }
-}
 
-function logGeometryDiagnostics(
-  fileUrlResolved: string,
-  label: string,
-  audit: GeometryAudit,
-  obj?: THREE.Object3D
-) {
-  const gRows = [
-    {
-      阶段: label,
-      文件: fileUrlResolved,
-      网格数: audit.meshCount,
-      点云子对象数: audit.pointsCount,
-      顶点总数: audit.vertexCount,
-      面片总数: audit.faceCount,
-      'box.min': `${audit.min.x.toFixed(6)}, ${audit.min.y.toFixed(6)}, ${audit.min.z.toFixed(6)}`,
-      'box.max': `${audit.max.x.toFixed(6)}, ${audit.max.y.toFixed(6)}, ${audit.max.z.toFixed(6)}`,
-      'size(长宽高)': `${audit.size.x.toFixed(6)}, ${audit.size.y.toFixed(6)}, ${audit.size.z.toFixed(6)}`,
-      中心: `${audit.center.x.toFixed(6)}, ${audit.center.y.toFixed(6)}, ${audit.center.z.toFixed(6)}`,
-    },
-  ];
-  // eslint-disable-next-line no-console
-  console.log(`%c[ThreeDViewer] Geometry — ${label}`, 'color:#0ea5e9;font-weight:bold');
-  // eslint-disable-next-line no-console
-  console.table(gRows);
-  if (obj) logPerMeshTable(obj);
-}
+  centerObject(obj);
 
-function logCameraDiagnostics(camera: THREE.PerspectiveCamera) {
-  // eslint-disable-next-line no-console
-  console.log('%c[ThreeDViewer] Camera (当前帧)', 'color:#a855f7;font-weight:bold');
-  // eslint-disable-next-line no-console
-  console.table([
-    {
-      'camera.position': `${camera.position.x.toFixed(4)}, ${camera.position.y.toFixed(4)}, ${camera.position.z.toFixed(4)}`,
-      'camera.near': camera.near,
-      'camera.far': camera.far,
-      fov: camera.fov,
-      aspect: camera.aspect,
-    },
-  ]);
+  if (isGeometryEmpty(obj)) {
+    const msg = '错误：模型几何体数据为空或尺寸异常';
+    setError(msg);
+    onError(new Error(msg));
+    return false;
+  }
+
+  const usePre = Boolean(precomputed) && isGlb;
+  if (!isGlb) {
+    const aud = parseAudience(targetAudience);
+    const sync = applyIndustryMmNormalization(obj, aud);
+    // eslint-disable-next-line no-console
+    console.log(
+      `[StandardSync] 类别: ${audienceLabelZh(sync.audience)} | 原始长度: ${sync.rawMax} | 缩放系数: ${sync.scaleToTarget.toFixed(4)} | 最终长度: ${sync.targetMm}mm`
+    );
+  }
+
+  let metrics: Last3DMetrics;
+  if (usePre && precomputed) {
+    metrics = precomputed;
+  } else {
+    metrics = extractLast3DMetrics(obj);
+  }
+
+  applyPhongShading(obj, phongMat);
+
+  const box = new THREE.Box3().setFromObject(obj);
+  const size = box.getSize(new THREE.Vector3());
+  const target = new THREE.Vector3();
+  box.getCenter(target);
+  controls.target.copy(target);
+
+  let d: number;
+  if (!isGlb) {
+    const aud2 = parseAudience(targetAudience);
+    d = getTargetLengthMm(aud2) * 1.5;
+  } else {
+    d = Math.max(size.x, size.y, size.z, 1) * 1.5;
+  }
+  const off = new THREE.Vector3(0.7, 0.45, 0.8).normalize().multiplyScalar(d);
+  camera.position.copy(target.clone().add(off));
+  camera.near = Math.max(0.1, d / 2000);
+  camera.far = d * 80;
+  camera.lookAt(target);
+  camera.updateProjectionMatrix();
+  controls.update();
+
+  scene.add(obj);
+  debugState.boxHelper = new THREE.BoxHelper(obj, 0xff8800);
+  scene.add(debugState.boxHelper);
+  onMetrics(metrics);
+
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      resize();
+      const w = container.clientWidth;
+      const h = container.clientHeight;
+      if (w > 0 && h > 0) {
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+      }
+    });
+  });
+
+  void urlKey;
+  return true;
 }
 
 function loadTextWithXhr(
@@ -224,21 +222,70 @@ function loadTextWithXhr(
         resolve(xhr.responseText as string);
         return;
       }
-      // eslint-disable-next-line no-console
-      console.error('[ThreeDViewer] OBJ HTTP error', xhr.status, xhr.statusText, url);
       reject(new Error(`HTTP ${xhr.status} ${String(xhr.statusText || '').trim()}`));
     };
     xhr.onerror = () => {
       if (signal.aborted) return;
-      // eslint-disable-next-line no-console
-      console.error('[ThreeDViewer] XHR network error', url);
       reject(new Error('网络错误或无法访问资源（CORS/代理）'));
     };
     xhr.send();
   });
 }
 
-export default function ThreeDViewer({ fileUrl, targetAudience, className, onLoaded, onError, onMetrics }: Props) {
+function loadArrayBufferWithXhr(
+  url: string,
+  onProgress: (pct: number | null) => void,
+  signal: { aborted: boolean }
+): Promise<ArrayBuffer> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', url, true);
+    xhr.responseType = 'arraybuffer';
+    xhr.onprogress = (e) => {
+      if (signal.aborted) return;
+      if (e.lengthComputable && e.total > 0) {
+        onProgress(Math.max(0, Math.min(100, Math.round((e.loaded / e.total) * 100))));
+      } else {
+        onProgress(null);
+      }
+    };
+    xhr.onload = () => {
+      if (signal.aborted) return;
+      onProgress(100);
+      if (xhr.status >= 200 && xhr.status < 300 && xhr.response) {
+        resolve(xhr.response as ArrayBuffer);
+        return;
+      }
+      reject(new Error(`HTTP ${xhr.status} ${String(xhr.statusText || '').trim()}`));
+    };
+    xhr.onerror = () => {
+      if (signal.aborted) return;
+      reject(new Error('网络错误或无法访问资源（CORS/代理）'));
+    };
+    xhr.send();
+  });
+}
+
+function resourcePathForUrl(resolved: string) {
+  try {
+    const u = new URL(resolved, typeof window !== 'undefined' ? window.location.origin : 'http://local');
+    const s = u.pathname;
+    return s.replace(/\/[^/]+$/, '/');
+  } catch {
+    return '';
+  }
+}
+
+export default function ThreeDViewer({
+  fileUrl,
+  targetAudience,
+  precomputedMetrics,
+  precomputedKey,
+  className,
+  onLoaded,
+  onError,
+  onMetrics,
+}: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const onMetricsRef = useRef(onMetrics);
   const onLoadedRef = useRef(onLoaded);
@@ -294,7 +341,6 @@ export default function ThreeDViewer({ fileUrl, targetAudience, className, onLoa
     controls.enableDamping = true;
     controls.dampingFactor = 0.06;
     controls.screenSpacePanning = true;
-    controls.target.set(0, 0, 0);
     controls.minDistance = 0.05;
     controls.maxDistance = 5e3;
 
@@ -304,11 +350,9 @@ export default function ThreeDViewer({ fileUrl, targetAudience, className, onLoa
       side: THREE.DoubleSide,
       shininess: 24,
     });
-    const pointsMaterial = new THREE.PointsMaterial({ color: 0x666666, size: 2.5, sizeAttenuation: true });
 
-    const debugState = { boxHelper: null as THREE.BoxHelper | null };
+    const debugState: { boxHelper: THREE.BoxHelper | null } = { boxHelper: null };
 
-    // 1 world unit = 1mm，格线每格 10mm（200/20=10）
     const grid = new THREE.GridHelper(200, 20, 0xbbbbbb, 0xcccccc);
     grid.position.y = 0;
     scene.add(grid);
@@ -323,127 +367,97 @@ export default function ThreeDViewer({ fileUrl, targetAudience, className, onLoa
       renderer.setSize(w, h, false);
     };
 
-    const ro = new ResizeObserver(() => resize());
+    const ro = new ResizeObserver(() => {
+      resize();
+    });
     ro.observe(container);
     resize();
 
-    const loader = new OBJLoader();
+    const loaderObj = new OBJLoader();
+    const loaderGltf = new GLTFLoader();
+
     const disposeGeometries = (o: THREE.Object3D) => {
       o.traverse((n) => {
-        const m = n as any;
-        if (m.geometry && m.geometry.dispose) m.geometry.dispose();
-        // 材质为共享 forcedMat / pointsMaterial，不逐节点 dispose
+        const m = n as { geometry?: THREE.BufferGeometry | null } & { material?: unknown };
+        if (m.geometry) m.geometry.dispose();
       });
     };
 
-    const processObj = (obj: THREE.Object3D): boolean => {
-      let tri = 0;
-      const meshes: THREE.Mesh[] = [];
-      obj.traverse((ch) => {
-        const m = ch as THREE.Mesh;
-        if ((m as any).isMesh) meshes.push(m);
-      });
-      for (const mesh of meshes) {
-        const geom = (mesh as any).geometry as THREE.BufferGeometry | undefined;
-        if (geom?.isBufferGeometry) {
-          try {
-            geom.computeVertexNormals();
-          } catch {
-            // ignore
-          }
-          if (geom.index) tri += Math.floor(geom.index.count / 3);
-          else {
-            const p = geom.getAttribute('position');
-            if (p) tri += Math.floor(p.count / 3);
-          }
-        }
-      }
-
-      centerObject(obj);
-      const auditCentered = collectGeometryAudit(obj);
-      logGeometryDiagnostics(urlKey, '已居中，未做显示缩放', auditCentered, obj);
-
-      if (isGeometryInvalid(auditCentered)) {
-        const msg = '错误：模型几何体数据为空或尺寸异常';
-        setError(msg);
-        onErrorRef.current?.(new Error(msg));
-        // eslint-disable-next-line no-console
-        console.error('[ThreeDViewer] Geometry invalid', auditCentered);
-        return false;
-      }
-
-      const aud = parseAudience(targetAudience);
-      const sync = applyIndustryMmNormalization(obj, aud);
-      // eslint-disable-next-line no-console
-      console.log(
-        `[StandardSync] 类别: ${audienceLabelZh(sync.audience)} | 原始长度: ${sync.rawMax} | 缩放系数: ${sync.scaleToTarget.toFixed(4)} | 最终长度: ${sync.targetMm}mm`
-      );
-
-      const auditNorm = collectGeometryAudit(obj);
-      logGeometryDiagnostics(urlKey, '行业归一化后 (mm)', auditNorm, undefined);
-
-      const metrics = extractLast3DMetrics(obj);
-      onMetricsRef.current?.(metrics);
-
-      const huge = tri >= 1_500_000;
-      if (huge) {
-        obj.traverse((ch) => {
-          const m = ch as THREE.Mesh;
-          if (!(m as any).isMesh) return;
-          const geom = m.geometry;
-          if (!geom) return;
-          const pts = new THREE.Points(geom, pointsMaterial);
-          if (m.parent) {
-            m.parent.add(pts);
-            m.parent.remove(m);
-          }
-        });
-      } else {
-        applyPhongShading(obj, phongMat);
-      }
-
-      scene.add(obj);
-      debugState.boxHelper = new THREE.BoxHelper(obj, 0xff8800);
-      scene.add(debugState.boxHelper);
-
-      const D = sync.targetMm * 1.5;
-      const off = new THREE.Vector3(0.7, 0.45, 0.8).normalize().multiplyScalar(D);
-      camera.position.copy(off);
-      camera.near = Math.max(0.1, D / 2000);
-      camera.far = D * 80;
-      camera.lookAt(0, 0, 0);
-      camera.updateProjectionMatrix();
-      controls.target.set(0, 0, 0);
-      controls.update();
-      logCameraDiagnostics(camera);
-      return true;
-    };
+    const isGlb = urlKey.toLowerCase().endsWith('.glb');
 
     void (async () => {
       try {
-        const text = await loadTextWithXhr(
+        const procBase: Omit<ProcessOpts, 'onMetrics' | 'debugState'> = {
+          isGlb,
+          precomputed: precomputedMetrics,
+          targetAudience,
           urlKey,
-          (p) => {
-            if (!signal.aborted) setProgress(p);
-          },
-          signal
-        );
-        if (signal.aborted) return;
-        const obj = loader.parse(text);
-        // eslint-disable-next-line no-console
-        console.log('%c[ThreeDViewer] OBJ 文本已解析，fileUrl:', 'color:#f59e0b', urlKey, ' 长度:', text.length);
-        const ok = processObj(obj);
-        if (!ok) {
-          setProgress(null);
-          return;
+          scene,
+          camera,
+          controls,
+          container,
+          resize,
+          phongMat,
+          setError,
+          onError: (e) => onErrorRef.current?.(e),
+        };
+
+        if (isGlb) {
+          const ab = await loadArrayBufferWithXhr(
+            urlKey,
+            (p) => {
+              if (!signal.aborted) setProgress(p);
+            },
+            signal
+          );
+          if (signal.aborted) return;
+          const basePath = resourcePathForUrl(urlKey);
+          const gltf = await new Promise<{
+            scene: THREE.Object3D;
+          }>((resolve, reject) => {
+            loaderGltf.parse(
+              ab,
+              basePath,
+              (g) => resolve(g as { scene: THREE.Object3D }),
+              (err) => reject(err ?? new Error('GLB parse error'))
+            );
+          });
+          if (signal.aborted) return;
+          const ok = processLoadedObject(gltf.scene, {
+            ...procBase,
+            onMetrics: (m) => onMetricsRef.current?.(m),
+            debugState,
+          });
+          if (!ok) {
+            setProgress(null);
+            return;
+          }
+        } else {
+          const text = await loadTextWithXhr(
+            urlKey,
+            (p) => {
+              if (!signal.aborted) setProgress(p);
+            },
+            signal
+          );
+          if (signal.aborted) return;
+          const obj = loaderObj.parse(text);
+          const ok = processLoadedObject(obj, {
+            ...procBase,
+            onMetrics: (m) => onMetricsRef.current?.(m),
+            debugState,
+          });
+          if (!ok) {
+            setProgress(null);
+            return;
+          }
         }
         setReady(true);
         onLoadedRef.current?.();
+        setProgress(null);
       } catch (e) {
         if (signal.aborted) return;
         const err = e instanceof Error ? e : new Error('加载失败');
-        // eslint-disable-next-line no-console
-        console.error('[ThreeDViewer] load/parse', err);
         setError(err.message);
         onErrorRef.current?.(err);
         setProgress(null);
@@ -468,11 +482,11 @@ export default function ThreeDViewer({ fileUrl, targetAudience, className, onLoa
         try {
           scene.remove(debugState.boxHelper);
           debugState.boxHelper.traverse((n) => {
-            const m = n as any;
+            const m = n as { geometry?: THREE.BufferGeometry; material?: unknown };
             if (m.geometry) m.geometry.dispose();
             if (m.material) {
-              if (Array.isArray(m.material)) m.material.forEach((x: THREE.Material) => x.dispose());
-              else m.material.dispose();
+              if (Array.isArray(m.material)) m.material.forEach((x) => (x as THREE.Material).dispose());
+              else (m.material as THREE.Material).dispose();
             }
           });
         } catch {
@@ -483,7 +497,6 @@ export default function ThreeDViewer({ fileUrl, targetAudience, className, onLoa
       disposeGeometries(scene);
       scene.clear();
       phongMat.dispose();
-      pointsMaterial.dispose();
       controls.dispose();
       try {
         container.removeChild(renderer.domElement);
@@ -492,20 +505,20 @@ export default function ThreeDViewer({ fileUrl, targetAudience, className, onLoa
       }
       renderer.dispose();
     };
-  }, [urlKey, targetAudience]);
+  }, [urlKey, targetAudience, precomputedMetrics, precomputedKey]);
 
   return (
-    <div className={className} ref={containerRef} style={{ position: 'relative', minHeight: 120 }}>
+    <div className={className} ref={containerRef} style={{ position: 'relative', minHeight: 120, width: '100%', height: '100%' }}>
       {!ready && !error ? (
         <div className="absolute inset-0 pointer-events-none z-[1]">
           {progress != null && progress < 100 ? (
-            <div className="absolute left-4 right-4 bottom-4 text-xs text-slate-200/90">
+            <div className="absolute left-4 right-4 bottom-4 text-xs text-slate-600/90">
               <div className="flex items-center justify-between mb-1">
-                <span>OBJ 拉取中</span>
+                <span>模型拉取中</span>
                 <span>{typeof progress === 'number' ? `${progress}%` : '—'}</span>
               </div>
               {typeof progress === 'number' ? (
-                <div className="h-1.5 bg-white/10 rounded">
+                <div className="h-1.5 bg-slate-200 rounded">
                   <div className="h-1.5 bg-blue-500 rounded" style={{ width: `${progress}%` }} />
                 </div>
               ) : null}

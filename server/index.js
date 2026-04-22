@@ -2,8 +2,13 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import express from 'express';
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import { execSync } from 'node:child_process';
 import fse from 'fs-extra';
+import { computeMetricsFromGlbPath } from './last3dMetricsNode.mjs';
+
+const require = createRequire(import.meta.url);
+const obj2gltf = require('obj2gltf');
 import multer from 'multer';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -89,9 +94,10 @@ const DIRS = {
 const MAPPING_CONFIG_PATH = path.join(STORAGE_ROOT, 'mapping_config.json');
 const FINAL_DASHBOARD_PATH = path.join(STORAGE_ROOT, 'final_dashboard_data.json');
 const FINAL_RESULTS_PATH = path.join(STORAGE_ROOT, 'final_results.json');
+const ASSETS_META_PATH = path.join(STORAGE_ROOT, 'assets_meta.json');
 
 /** 与 dataEngine 物理对账一致：去后缀 + trim + 小写 */
-const ASSET_3D_EXTS = ['.obj', '.stl', '.3dm'];
+const ASSET_3D_EXTS = ['.glb', '.obj', '.stl', '.3dm'];
 
 function stripExtAssetName(name) {
   return String(name ?? '').trim().replace(/\.[^.]+$/, '');
@@ -843,6 +849,66 @@ async function refreshAssetsCache() {
     files: [...lasts, ...soles],
   };
   return cachedAssets;
+}
+
+async function readAssetsMeta() {
+  try {
+    if (await fse.pathExists(ASSETS_META_PATH)) {
+      return await fse.readJson(ASSETS_META_PATH);
+    }
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.warn('[assets_meta] read failed', e instanceof Error ? e.message : e);
+  }
+  return { version: 1, byKey: {} };
+}
+
+/**
+ * 上传 .obj 后：异步转 .glb + 预计算 3D 指标，写入 assets_meta.json
+ * @param {string} absoluteObjPath
+ */
+async function runObjToGlbPipeline(absoluteObjPath) {
+  const ext = path.extname(absoluteObjPath).toLowerCase();
+  if (ext !== '.obj') return;
+  const dir = path.dirname(absoluteObjPath);
+  const baseNameNoExt = path.basename(absoluteObjPath, ext);
+  const outGlb = path.join(dir, `${baseNameNoExt}.glb`);
+  const asPosix = dir.split(path.sep).join('/');
+  const typeKey = asPosix.includes('/assets/soles') && !asPosix.includes('/assets/lasts') ? 'soles' : 'lasts';
+  const key = `${typeKey}:${normalizeAssetCodeKey(baseNameNoExt)}`;
+  // eslint-disable-next-line no-console
+  console.log('[3d-pipeline] start', { absoluteObjPath, outGlb, key });
+  try {
+    const glbBuf = await obj2gltf(absoluteObjPath, { binary: true });
+    await fse.writeFile(outGlb, glbBuf);
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.error('[3d-pipeline] obj2gltf failed', absoluteObjPath, e);
+    return;
+  }
+  let metrics = null;
+  try {
+    metrics = await computeMetricsFromGlbPath(outGlb);
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.error('[3d-pipeline] metrics failed', outGlb, e);
+  }
+  const meta = await readAssetsMeta();
+  meta.version = 1;
+  if (!meta.byKey) meta.byKey = {};
+  meta.byKey[key] = {
+    key,
+    type: typeKey,
+    code: stripExtAssetName(baseNameNoExt),
+    glbName: `${baseNameNoExt}.glb`,
+    sourceObjName: `${baseNameNoExt}.obj`,
+    metrics,
+    updatedAt: new Date().toISOString(),
+  };
+  await fse.writeJson(ASSETS_META_PATH, meta, { spaces: 2 });
+  await refreshAssetsCache();
+  // eslint-disable-next-line no-console
+  console.log('[3d-pipeline] done', { key, glb: path.basename(outGlb) });
 }
 
 const upload = multer({
@@ -3228,14 +3294,28 @@ app.post('/api/upload', upload.array('files', 200), async (req, res) => {
 
   await refreshAssetsCache();
 
+  const uploaded = files.map((f) => ({
+    originalName: f.originalname,
+    storedName: f.filename,
+    size: f.size,
+    destination: f.destination,
+    path: f.path,
+  }));
+
+  for (const f of files) {
+    const abs = f.path;
+    const name = String(f.originalname || f.filename || '').toLowerCase();
+    if (abs && name.endsWith('.obj')) {
+      void runObjToGlbPipeline(abs).catch((e) => {
+        // eslint-disable-next-line no-console
+        console.error('[3d-pipeline] async error', e);
+      });
+    }
+  }
+
   res.json({
     ok: true,
-    uploaded: files.map((f) => ({
-      originalName: f.originalname,
-      storedName: f.filename,
-      size: f.size,
-      destination: f.destination,
-    })),
+    uploaded,
   });
 });
 
@@ -3539,6 +3619,25 @@ app.get('/api/inventory-real', async (req, res) => {
     // eslint-disable-next-line no-console
     console.error('[dataEngine] inventory-real failed', e);
     return res.status(500).json({ ok: false, error: e instanceof Error ? e.message : 'inventory-real failed' });
+  }
+});
+
+// 3D 资产预处理元数据（秒开右侧报告；与 assets_meta.json 同步）
+app.get('/api/asset-meta', async (req, res) => {
+  try {
+    const typeRaw = String(req.query?.type || '').trim().toLowerCase();
+    const code = String(req.query?.code || '').trim();
+    if (!code) return res.status(400).json({ ok: false, error: 'missing code' });
+    const isSole = typeRaw === 'soles' || typeRaw === 'sole';
+    const t = isSole ? 'soles' : 'lasts';
+    const key = `${t}:${normalizeAssetCodeKey(code)}`;
+    const meta = await readAssetsMeta();
+    const entry = meta.byKey?.[key] || null;
+    return res.json({ ok: true, key, entry });
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.error('[api/asset-meta]', e);
+    return res.status(500).json({ ok: false, error: e instanceof Error ? e.message : 'asset-meta failed' });
   }
 });
 
