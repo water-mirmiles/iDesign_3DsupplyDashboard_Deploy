@@ -6,12 +6,10 @@ import { getStorageBaseUrl } from '@/lib/storageBaseUrl';
 import { extractLast3DMetrics, type Last3DMetrics } from '@/lib/last3dMetrics';
 
 type Props = {
-  /** 可传相对路径 /storage/... 或绝对 http(s) 完整 URL */
   fileUrl: string;
   className?: string;
   onLoaded?: () => void;
   onError?: (err: Error) => void;
-  /** 3D 解析成功后的物性参数 */
   onMetrics?: (m: Last3DMetrics) => void;
 };
 
@@ -23,42 +21,88 @@ function resolveAssetUrl(fileUrl: string) {
   return `${getStorageBaseUrl()}/${u.replace(/^\//, '')}`;
 }
 
+const TARGET_MAX = 5;
+const STD_MAT = 0xcccccc;
+
 /**
- * 将模型包围球完整纳入视野，按纵横比同时考虑水平/竖直 FOV
+ * 先居中（物理坐标可极大），物性在缩放前计算；再统一缩放到标准尺度便于入镜
  */
-function fitCameraToObject(camera: THREE.PerspectiveCamera, object: THREE.Object3D, controls?: OrbitControls) {
-  object.updateMatrixWorld(true);
-  const box = new THREE.Box3().setFromObject(object);
-  const center = box.getCenter(new THREE.Vector3());
-  const sphere = new THREE.Sphere();
-  box.getBoundingSphere(sphere);
-  const r = Math.max(1e-6, sphere.radius);
-  const vFov = (camera.fov * Math.PI) / 180;
-  const aspect = Math.max(0.2, Math.min(5, camera.aspect));
-  const hFov = 2 * Math.atan(Math.tan(vFov / 2) * aspect);
-  const distV = r / Math.sin(vFov / 2);
-  const distH = r / Math.sin(hFov / 2);
-  const d = Math.max(distV, distH) * 1.12;
+function centerObject(obj: THREE.Object3D) {
+  const box = new THREE.Box3().setFromObject(obj);
+  const c = box.getCenter(new THREE.Vector3());
+  obj.position.sub(c);
+  obj.updateMatrixWorld(true);
+}
 
-  camera.position.set(center.x, center.y + r * 0.12, center.z + d);
-  const near = Math.max(0.0001, d / 1e4);
-  const far = d * 400;
-  camera.near = near;
-  camera.far = far;
-  camera.updateProjectionMatrix();
+function displayNormalizeScale(obj: THREE.Object3D) {
+  obj.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(obj);
+  const size = box.getSize(new THREE.Vector3());
+  const maxDim = Math.max(size.x, size.y, size.z, 1e-9);
+  const s = TARGET_MAX / maxDim;
+  obj.scale.multiplyScalar(s);
+  obj.updateMatrixWorld(true);
+  const b2 = new THREE.Box3().setFromObject(obj);
+  const c2 = b2.getCenter(new THREE.Vector3());
+  obj.position.sub(c2);
+  obj.updateMatrixWorld(true);
+  return { scale: s, maxDim, size: b2.getSize(new THREE.Vector3()) };
+}
 
-  if (controls) {
-    controls.target.copy(center);
-    controls.minDistance = Math.max(0.0001, d * 0.0005);
-    controls.maxDistance = d * 200;
-    controls.update();
-  }
+function applyForcedMeshMaterial(obj: THREE.Object3D, mat: THREE.MeshStandardMaterial) {
+  obj.traverse((ch) => {
+    const o = ch as THREE.Mesh;
+    if ((o as any).isMesh) {
+      const old = o.material;
+      if (Array.isArray(old)) old.forEach((m) => (m as THREE.Material).dispose?.());
+      else (old as THREE.Material | undefined)?.dispose?.();
+      o.material = mat;
+      o.castShadow = false;
+      o.receiveShadow = false;
+    }
+  });
+}
+
+function loadTextWithXhr(
+  url: string,
+  onProgress: (pct: number | null) => void,
+  signal: { aborted: boolean }
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', url, true);
+    xhr.responseType = 'text';
+    xhr.onprogress = (e) => {
+      if (signal.aborted) return;
+      if (e.lengthComputable && e.total > 0) {
+        onProgress(Math.max(0, Math.min(100, Math.round((e.loaded / e.total) * 100))));
+      } else {
+        onProgress(null);
+      }
+    };
+    xhr.onload = () => {
+      if (signal.aborted) return;
+      onProgress(100);
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(xhr.responseText as string);
+        return;
+      }
+      // eslint-disable-next-line no-console
+      console.error('[ThreeDViewer] OBJ HTTP error', xhr.status, xhr.statusText, url);
+      reject(new Error(`HTTP ${xhr.status} ${String(xhr.statusText || '').trim()}`));
+    };
+    xhr.onerror = () => {
+      if (signal.aborted) return;
+      // eslint-disable-next-line no-console
+      console.error('[ThreeDViewer] XHR network error', url);
+      reject(new Error('网络错误或无法访问资源（CORS/代理）'));
+    };
+    xhr.send();
+  });
 }
 
 export default function ThreeDViewer({ fileUrl, className, onLoaded, onError, onMetrics }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
-  const rafRef = useRef<number | null>(null);
   const onMetricsRef = useRef(onMetrics);
   const onLoadedRef = useRef(onLoaded);
   const onErrorRef = useRef(onError);
@@ -77,45 +121,70 @@ export default function ThreeDViewer({ fileUrl, className, onLoaded, onError, on
     if (!container) return;
     if (!urlKey) return;
 
+    const signal = { aborted: false };
+
     setReady(false);
     setError(null);
-    setProgress(null);
-
-    const manager = new THREE.LoadingManager();
-    manager.onError = (u) => {
-      // eslint-disable-next-line no-console
-      console.error('[ThreeDViewer] LoadingManager.onError', u);
-    };
+    setProgress(0);
 
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x0b1220);
+    scene.background = new THREE.Color(0x333333);
 
-    const camera = new THREE.PerspectiveCamera(45, 1, 0.0001, 1_000_000);
-    camera.position.set(0, 0.5, 3);
+    const camera = new THREE.PerspectiveCamera(50, 1, 0.001, 1_000_000);
+    camera.position.set(8, 8, 8);
 
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: 'high-performance' });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.0;
+    renderer.toneMappingExposure = 1.4;
     renderer.shadowMap.enabled = false;
-
-    rendererRef.current = renderer;
     container.appendChild(renderer.domElement);
 
-    const ambient = new THREE.AmbientLight(0xffffff, 0.55);
+    // —— 强力光照：环境 + 半球 + 大平行光 + 点光（强度为原先量级约 3–4 倍）
+    const ambient = new THREE.AmbientLight(0xffffff, 2.0);
     scene.add(ambient);
-    const hemi = new THREE.HemisphereLight(0xffffff, 0x1f2937, 0.75);
-    hemi.position.set(0, 1, 0);
+    const hemi = new THREE.HemisphereLight(0xffffff, 0x6b7280, 1.2);
+    hemi.position.set(0, 200, 0);
     scene.add(hemi);
-    const dir = new THREE.DirectionalLight(0xffffff, 0.7);
-    dir.position.set(2, 3, 2);
+    const dir = new THREE.DirectionalLight(0xffffff, 2.4);
+    dir.position.set(200, 400, 250);
     scene.add(dir);
+    const dir2 = new THREE.DirectionalLight(0xffffff, 1.5);
+    dir2.position.set(-300, 100, -200);
+    scene.add(dir2);
+    const pt = new THREE.PointLight(0xffffff, 3.0, 0, 0.3);
+    pt.position.set(0, 80, 0);
+    scene.add(pt);
+    const pt2 = new THREE.PointLight(0xffeedd, 2.0, 0, 0.2);
+    pt2.position.set(200, 50, 200);
+    scene.add(pt2);
 
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
-    controls.dampingFactor = 0.08;
+    controls.dampingFactor = 0.06;
     controls.screenSpacePanning = true;
+    controls.target.set(0, 0, 0);
+    controls.minDistance = 0.05;
+    controls.maxDistance = 5e3;
+
+    const forcedMat = new THREE.MeshStandardMaterial({
+      color: STD_MAT,
+      side: THREE.DoubleSide,
+      metalness: 0.08,
+      roughness: 0.5,
+    });
+
+    const pointsMaterial = new THREE.PointsMaterial({
+      color: STD_MAT,
+      size: 2.5,
+      sizeAttenuation: true,
+    });
+
+    const grid = new THREE.GridHelper(100, 10, 0x666666, 0x4a4a4a);
+    scene.add(grid);
+    const axes = new THREE.AxesHelper(100);
+    scene.add(axes);
 
     const resize = () => {
       const w = container.clientWidth || 1;
@@ -129,188 +198,153 @@ export default function ThreeDViewer({ fileUrl, className, onLoaded, onError, on
     ro.observe(container);
     resize();
 
-    let disposed = false;
-    const loader = new OBJLoader(manager);
-
-    const material = new THREE.MeshStandardMaterial({
-      color: new THREE.Color('#e5e7eb'),
-      roughness: 0.55,
-      metalness: 0.05,
-    });
-
-    const pointsMaterial = new THREE.PointsMaterial({
-      color: new THREE.Color('#e5e7eb'),
-      size: 1.5,
-      sizeAttenuation: true,
-    });
-
-    const applyMaterialAndOptimize = (obj: THREE.Object3D) => {
-      let totalTriangles = 0;
-      const meshes: THREE.Mesh[] = [];
-      obj.traverse((child) => {
-        const mesh = child as THREE.Mesh;
-        if ((mesh as any).isMesh) meshes.push(mesh);
+    const loader = new OBJLoader();
+    const disposeGeometries = (o: THREE.Object3D) => {
+      o.traverse((n) => {
+        const m = n as any;
+        if (m.geometry && m.geometry.dispose) m.geometry.dispose();
+        // 材质为共享 forcedMat / pointsMaterial，不逐节点 dispose
       });
+    };
 
+    const processObj = (obj: THREE.Object3D) => {
+      let tri = 0;
+      const meshes: THREE.Mesh[] = [];
+      obj.traverse((ch) => {
+        const m = ch as THREE.Mesh;
+        if ((m as any).isMesh) meshes.push(m);
+      });
       for (const mesh of meshes) {
         const geom = (mesh as any).geometry as THREE.BufferGeometry | undefined;
-        if (geom && geom.isBufferGeometry) {
+        if (geom?.isBufferGeometry) {
           try {
             geom.computeVertexNormals();
           } catch {
-            // 非法面片时可能抛错
-          }
-          try {
-            geom.computeBoundingBox();
-          } catch {
             // ignore
           }
-          const pos = geom.getAttribute('position');
-          if (geom.index) totalTriangles += Math.floor((geom.index.count || 0) / 3);
-          else if (pos) totalTriangles += Math.floor((pos.count || 0) / 3);
-        }
-      }
-
-      // 仅对根对象整体居中，避免多 mesh 各自 geometry.center() 破坏装配关系
-      try {
-        const b = new THREE.Box3().setFromObject(obj);
-        const c = b.getCenter(new THREE.Vector3());
-        obj.position.sub(c);
-        obj.updateMatrixWorld(true);
-      } catch {
-        // ignore
-      }
-
-      const TRIANGLE_POINTS_FALLBACK = 1_500_000;
-      const shouldUsePoints = totalTriangles >= TRIANGLE_POINTS_FALLBACK;
-
-      obj.traverse((child) => {
-        const mesh = child as THREE.Mesh;
-        if (!(mesh as any).isMesh) return;
-        const geom = (mesh as any).geometry as THREE.BufferGeometry | undefined;
-        if (!geom || !geom.isBufferGeometry) return;
-
-        if (shouldUsePoints) {
-          const pts = new THREE.Points(geom, pointsMaterial);
-          pts.position.copy(mesh.position);
-          pts.rotation.copy(mesh.rotation);
-          pts.scale.copy(mesh.scale);
-          if (mesh.parent) {
-            mesh.parent.add(pts);
-            mesh.parent.remove(mesh);
+          if (geom.index) tri += Math.floor(geom.index.count / 3);
+          else {
+            const p = geom.getAttribute('position');
+            if (p) tri += Math.floor(p.count / 3);
           }
-          return;
         }
-        mesh.material = material;
-        mesh.castShadow = false;
-        mesh.receiveShadow = false;
-      });
+      }
 
-      return { usedPoints: shouldUsePoints };
+      centerObject(obj);
+      // 物性：在显示缩放前（真实坐标）
+      const metrics = extractLast3DMetrics(obj);
+      onMetricsRef.current?.(metrics);
+
+      // 高面片时仍可用点云，但用灰色点
+      const huge = tri >= 1_500_000;
+      if (huge) {
+        obj.traverse((ch) => {
+          const m = ch as THREE.Mesh;
+          if (!(m as any).isMesh) return;
+          const geom = m.geometry;
+          if (!geom) return;
+          const pts = new THREE.Points(geom, pointsMaterial);
+          if (m.parent) {
+            m.parent.add(pts);
+            m.parent.remove(m);
+          }
+        });
+      } else {
+        applyForcedMeshMaterial(obj, forcedMat);
+      }
+
+      const { size } = displayNormalizeScale(obj);
+      scene.add(obj);
+
+      const m = Math.max(size.x, size.y, size.z, 1e-6);
+      camera.position.set(m, m, m);
+      camera.near = Math.max(0.0001, m / 5e3);
+      camera.far = Math.max(500, m * 1e3);
+      camera.lookAt(0, 0, 0);
+      camera.updateProjectionMatrix();
+      controls.target.set(0, 0, 0);
+      controls.update();
     };
 
-    try {
-      loader.load(
-        urlKey,
-        (obj) => {
-          if (disposed) return;
-          try {
-            applyMaterialAndOptimize(obj);
-            scene.add(obj);
-            fitCameraToObject(camera, obj, controls);
+    void (async () => {
+      try {
+        const text = await loadTextWithXhr(
+          urlKey,
+          (p) => {
+            if (!signal.aborted) setProgress(p);
+          },
+          signal
+        );
+        if (signal.aborted) return;
+        const obj = loader.parse(text);
+        processObj(obj);
+        setReady(true);
+        onLoadedRef.current?.();
+      } catch (e) {
+        if (signal.aborted) return;
+        const err = e instanceof Error ? e : new Error('加载失败');
+        // eslint-disable-next-line no-console
+        console.error('[ThreeDViewer] load/parse', err);
+        setError(err.message);
+        onErrorRef.current?.(err);
+        setProgress(null);
+      }
+    })();
 
-            const metrics = extractLast3DMetrics(obj);
-            onMetricsRef.current?.(metrics);
-            setReady(true);
-            onLoadedRef.current?.();
-          } catch (e) {
-            // eslint-disable-next-line no-console
-            console.error('[ThreeDViewer] post-load / metrics failed', e);
-            const err = e instanceof Error ? e : new Error('模型后处理失败');
-            setError(err.message);
-            onErrorRef.current?.(err);
-          }
-        },
-        (evt) => {
-          if (disposed) return;
-          const loaded = Number((evt as any)?.loaded || 0);
-          const total = Number((evt as any)?.total || 0);
-          if (total > 0) {
-            const p = Math.max(0, Math.min(100, Math.round((loaded / total) * 100)));
-            setProgress(p);
-          } else {
-            setProgress(null);
-          }
-        },
-        (e) => {
-          if (disposed) return;
-          // eslint-disable-next-line no-console
-          console.error('[ThreeDViewer] OBJLoader error', e);
-          const err = e instanceof Error ? e : new Error((e as any)?.message || 'OBJ 加载失败');
-          setError(err.message);
-          onErrorRef.current?.(err);
-        }
-      );
-    } catch (e) {
-      // eslint-disable-next-line no-console
-      console.error('[ThreeDViewer] loader.load throw', e);
-      const err = e instanceof Error ? e : new Error('OBJ 加载异常');
-      setError(err.message);
-      onErrorRef.current?.(err);
-    }
-
+    let rafId = 0;
     const tick = () => {
+      rafId = window.requestAnimationFrame(tick);
+      if (signal.aborted) return;
       controls.update();
       renderer.render(scene, camera);
-      rafRef.current = window.requestAnimationFrame(tick);
     };
-    tick();
+    rafId = window.requestAnimationFrame(tick);
 
     return () => {
-      disposed = true;
+      signal.aborted = true;
+      window.cancelAnimationFrame(rafId);
       ro.disconnect();
-      if (rafRef.current != null) window.cancelAnimationFrame(rafRef.current);
-      controls.dispose();
-
-      scene.traverse((o) => {
-        if ((o as any).isMesh || (o as any).isPoints) {
-          const geom = (o as any).geometry as THREE.BufferGeometry | undefined;
-          if (geom && typeof geom.dispose === 'function') geom.dispose();
-        }
-      });
-      material.dispose();
+      disposeGeometries(scene);
+      scene.clear();
+      forcedMat.dispose();
       pointsMaterial.dispose();
-
+      controls.dispose();
       try {
         container.removeChild(renderer.domElement);
       } catch {
         // ignore
       }
       renderer.dispose();
-      rendererRef.current = null;
     };
   }, [urlKey]);
 
   return (
-    <div className={className} ref={containerRef}>
+    <div className={className} ref={containerRef} style={{ position: 'relative', minHeight: 120 }}>
       {!ready && !error ? (
-        <div className="absolute inset-0 pointer-events-none">
-          {progress != null ? (
-            <div className="absolute left-4 right-4 bottom-4 text-xs text-slate-200/80">
+        <div className="absolute inset-0 pointer-events-none z-[1]">
+          {progress != null && progress < 100 ? (
+            <div className="absolute left-4 right-4 bottom-4 text-xs text-slate-200/90">
               <div className="flex items-center justify-between mb-1">
-                <span>OBJ 下载中</span>
-                <span>{progress}%</span>
+                <span>OBJ 拉取中</span>
+                <span>{typeof progress === 'number' ? `${progress}%` : '—'}</span>
               </div>
-              <div className="h-1.5 bg-white/10 rounded">
-                <div className="h-1.5 bg-blue-500 rounded" style={{ width: `${progress}%` }} />
-              </div>
+              {typeof progress === 'number' ? (
+                <div className="h-1.5 bg-white/10 rounded">
+                  <div className="h-1.5 bg-blue-500 rounded" style={{ width: `${progress}%` }} />
+                </div>
+              ) : null}
             </div>
           ) : null}
         </div>
       ) : null}
       {error ? (
-        <div className="absolute inset-0 flex items-center justify-center text-sm text-red-300 bg-black/20">
-          {error}
+        <div
+          className="absolute inset-0 z-20 flex flex-col items-center justify-center px-4 text-center bg-black/75"
+          data-three-error-overlay="1"
+        >
+          <p className="text-sm font-mono text-red-400 break-all max-w-full">3D 加载失败</p>
+          <p className="text-lg font-mono text-red-300 font-bold mt-2 break-all max-w-full">{error}</p>
+          <p className="text-xs text-slate-400 mt-2">请检查 URL、HTTP 状态与跨域/代理 (Vite → :3001)</p>
         </div>
       ) : null}
     </div>
