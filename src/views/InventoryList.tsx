@@ -16,6 +16,8 @@ type InventoryRealResponse = {
 
 type AssetDetailsResponse = {
   ok: boolean;
+  status?: 'ready' | 'processing';
+  message?: string;
   type: 'lasts' | 'soles';
   code: string;
   file: {

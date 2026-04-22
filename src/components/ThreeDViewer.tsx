@@ -275,6 +275,17 @@ async function headValidateAssetUrl(resolvedUrl: string) {
   return { ok: resp.ok, status: resp.status, contentType: ct, isHtml };
 }
 
+function deriveObjUrlFromGlbUrl(glbResolvedUrl: string) {
+  try {
+    const u = new URL(glbResolvedUrl, window.location.origin);
+    u.pathname = u.pathname.replace(/\.glb$/i, '.obj');
+    // 清理 query：保留原 query，但 cache buster 会在外层加
+    return u.toString();
+  } catch {
+    return glbResolvedUrl.replace(/\.glb(\?.*)?$/i, '.obj');
+  }
+}
+
 function resourcePathForUrl(resolved: string) {
   try {
     const u = new URL(resolved, typeof window !== 'undefined' ? window.location.origin : 'http://local');
@@ -399,26 +410,10 @@ export default function ThreeDViewer({
           typeof glbCacheToken === 'number' || typeof glbCacheToken === 'string' ? String(glbCacheToken) : Date.now()
         }`
       : urlKey;
+    const objFallbackUrl = isGlb ? deriveObjUrlFromGlbUrl(urlKey) : urlKey;
 
     void (async () => {
       try {
-        // 防止 404 HTML 被 Three.js 当作二进制/文本解析导致黑屏或崩溃
-        const head = await headValidateAssetUrl(isGlb ? glbBustedUrl : urlKey);
-        if (!head.ok) {
-          const msg = `文件路径错误 (HTTP ${head.status})`;
-          setError(msg);
-          onErrorRef.current?.(new Error(msg));
-          setProgress(null);
-          return;
-        }
-        if (head.isHtml) {
-          const msg = '文件路径错误（返回了 HTML）';
-          setError(msg);
-          onErrorRef.current?.(new Error(msg));
-          setProgress(null);
-          return;
-        }
-
         const procBase: Omit<ProcessOpts, 'onMetrics' | 'debugState'> = {
           isGlb,
           precomputed: precomputedMetrics,
@@ -435,28 +430,69 @@ export default function ThreeDViewer({
         };
 
         if (isGlb) {
-          const ab = await loadArrayBufferWithXhr(
-            glbBustedUrl,
+          // 1) 优先 GLB（快）。若 GLB 404 / 加载失败，则自动降级 OBJ
+          const headGlb = await headValidateAssetUrl(glbBustedUrl);
+          if (headGlb.ok && !headGlb.isHtml) {
+            try {
+              const ab = await loadArrayBufferWithXhr(
+                glbBustedUrl,
+                (p) => {
+                  if (!signal.aborted) setProgress(p);
+                },
+                signal
+              );
+              if (signal.aborted) return;
+              const basePath = resourcePathForUrl(urlKey);
+              const gltf = await new Promise<{ scene: THREE.Object3D }>((resolve, reject) => {
+                loaderGltf.parse(
+                  ab,
+                  basePath,
+                  (g) => resolve(g as { scene: THREE.Object3D }),
+                  (err) => reject(err ?? new Error('GLB parse error'))
+                );
+              });
+              if (signal.aborted) return;
+              const ok = processLoadedObject(gltf.scene, {
+                ...procBase,
+                onMetrics: (m) => onMetricsRef.current?.(m),
+                debugState,
+              });
+              if (!ok) {
+                setProgress(null);
+                return;
+              }
+              setReady(true);
+              onLoadedRef.current?.();
+              setProgress(null);
+              return;
+            } catch (e) {
+              // eslint-disable-next-line no-console
+              console.warn('[ThreeDViewer] GLB 加载失败，降级 OBJ:', e);
+            }
+          }
+
+          // 2) OBJ 降级
+          const headObj = await headValidateAssetUrl(objFallbackUrl);
+          if (!headObj.ok || headObj.isHtml) {
+            const msg = `文件路径错误 (GLB:${headGlb.status} / OBJ:${headObj.status})`;
+            setError(msg);
+            onErrorRef.current?.(new Error(msg));
+            setProgress(null);
+            return;
+          }
+          const text = await loadTextWithXhr(
+            objFallbackUrl,
             (p) => {
               if (!signal.aborted) setProgress(p);
             },
             signal
           );
           if (signal.aborted) return;
-          const basePath = resourcePathForUrl(urlKey);
-          const gltf = await new Promise<{
-            scene: THREE.Object3D;
-          }>((resolve, reject) => {
-            loaderGltf.parse(
-              ab,
-              basePath,
-              (g) => resolve(g as { scene: THREE.Object3D }),
-              (err) => reject(err ?? new Error('GLB parse error'))
-            );
-          });
-          if (signal.aborted) return;
-          const ok = processLoadedObject(gltf.scene, {
+          const obj = loaderObj.parse(text);
+          const ok = processLoadedObject(obj, {
             ...procBase,
+            isGlb: false,
+            precomputed: null,
             onMetrics: (m) => onMetricsRef.current?.(m),
             debugState,
           });
@@ -465,6 +501,15 @@ export default function ThreeDViewer({
             return;
           }
         } else {
+          // OBJ 主路径
+          const headObj = await headValidateAssetUrl(urlKey);
+          if (!headObj.ok || headObj.isHtml) {
+            const msg = `文件路径错误 (HTTP ${headObj.status})`;
+            setError(msg);
+            onErrorRef.current?.(new Error(msg));
+            setProgress(null);
+            return;
+          }
           const text = await loadTextWithXhr(
             urlKey,
             (p) => {

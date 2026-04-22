@@ -164,6 +164,37 @@ function findPhysicalAssetFileAbs(dirAbs, codeRaw) {
   return path.join(dirAbs, candidates[0]);
 }
 
+/**
+ * 目录全扫描：只要「文件名(不含后缀)」与 code 相等(忽略大小写) 即命中。
+ * @returns {{ glb: string|null, obj: string|null, any: string|null, hits: string[] }}
+ */
+function scanDirForAssetByCode(dirAbs, codeRaw) {
+  const want = String(codeRaw ?? '').trim().toLowerCase();
+  if (!want) return { glb: null, obj: null, any: null, hits: [] };
+  let entries = [];
+  try {
+    entries = fs.readdirSync(dirAbs, { withFileTypes: true });
+  } catch {
+    return { glb: null, obj: null, any: null, hits: [] };
+  }
+  const hits = [];
+  let glb = null;
+  let obj = null;
+  let any = null;
+  for (const e of entries) {
+    if (!e.isFile()) continue;
+    const base = stripExtAssetName(e.name).trim().toLowerCase();
+    if (base !== want) continue;
+    const abs = path.join(dirAbs, e.name);
+    hits.push(e.name);
+    const ext = path.extname(e.name).toLowerCase();
+    if (!any) any = abs;
+    if (ext === '.glb') glb = abs;
+    if (ext === '.obj') obj = abs;
+  }
+  return { glb, obj, any, hits };
+}
+
 function formatBytesHuman(bytes) {
   const n = Number(bytes);
   if (!Number.isFinite(n) || n < 0) return '—';
@@ -3710,9 +3741,13 @@ app.get('/api/asset-details', async (req, res) => {
     const type = isSole ? 'soles' : 'lasts';
     const dir = isSole ? DIRS.soles : DIRS.lasts;
 
-    const abs = findPhysicalAssetFileAbs(dir, code);
     // eslint-disable-next-line no-console
-    console.log('[Server] 正在搜索资产:', abs || `(not found) dir=${dir} code=${JSON.stringify(code)}`);
+    console.log('[Server] STORAGE_ROOT =', STORAGE_ROOT);
+
+    const scan = scanDirForAssetByCode(dir, code);
+    const abs = scan.glb || scan.obj || scan.any;
+    // eslint-disable-next-line no-console
+    console.log('[Server] 正在搜索资产:', abs || `(not found) dir=${dir} code=${JSON.stringify(code)}`, 'hits=', scan.hits);
     let file = {
       exists: false,
       fileName: null,
@@ -3764,7 +3799,10 @@ app.get('/api/asset-details', async (req, res) => {
 
     const linkedSoleCodes = !isSole ? Array.from(soleSet).sort((a, b) => a.localeCompare(b)) : [];
 
-    if (!file.exists) {
+    // status: processing 当 OBJ 有但 GLB 还没生成（后台转换中）
+    const hasObj = Boolean(scan.obj && fs.existsSync(scan.obj));
+    const hasGlb = Boolean(scan.glb && fs.existsSync(scan.glb));
+    if (!hasObj && !hasGlb) {
       return res.status(404).json({
         ok: false,
         error: 'File not found',
@@ -3777,8 +3815,28 @@ app.get('/api/asset-details', async (req, res) => {
       });
     }
 
+    if (hasObj && !hasGlb) {
+      // eslint-disable-next-line no-console
+      console.log('[Success] 物理文件已锁定，路径为：', scan.obj);
+      return res.json({
+        ok: true,
+        status: 'processing',
+        message: '原始模型已就绪，预览转换中...',
+        type,
+        code,
+        file,
+        uploadedBy: '系统导入 (Storage)',
+        linkedStyles,
+        linkedSoleCodes,
+      });
+    }
+
+    // eslint-disable-next-line no-console
+    console.log('[Success] 物理文件已锁定，路径为：', scan.glb || abs);
+
     return res.json({
       ok: true,
+      status: 'ready',
       type,
       code,
       file,
