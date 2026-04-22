@@ -3561,6 +3561,7 @@ app.get('/api/dashboard-stats', async (req, res) => {
         brandBindingStats: payload.brandBindingStats || [],
         lastDigitizationStats: payload.lastDigitizationStats || [],
         soleDigitizationStats: payload.soleDigitizationStats || [],
+        trendHistory: payload.trendHistory || [],
         trends: payload.trends || {},
         rawStatusAudit: payload.rawStatusAudit || payload.meta?.rawStatusAudit || [],
       });
@@ -3581,6 +3582,7 @@ app.get('/api/dashboard-stats', async (req, res) => {
       brandBindingStats: snap.brandBindingStats || [],
       lastDigitizationStats: snap.lastDigitizationStats || [],
       soleDigitizationStats: snap.soleDigitizationStats || [],
+      trendHistory: snap.trendHistory || [],
       trends: snap.trends || {},
       rawStatusAudit: snap.rawStatusAudit || snap.meta?.rawStatusAudit || [],
     });

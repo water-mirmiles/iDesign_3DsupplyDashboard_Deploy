@@ -1098,6 +1098,12 @@ async function getDateDirsByNameSorted(dataTablesDir) {
     .sort((a, b) => a.localeCompare(b));
 }
 
+/** 对账/增量专用：按日期目录名倒序（Latest 在 [0]） */
+async function getDateDirsByNameDesc(dataTablesDir) {
+  const asc = await getDateDirsByNameSorted(dataTablesDir);
+  return asc.reverse();
+}
+
 /** 与磁盘文件名去后缀后一致：trim + 去扩展名 + 小写（与 lastCode 容错比对） */
 function physicalAssetKey(fileOrCodeName) {
   return String(stripExt(fileOrCodeName)).trim().toLowerCase();
@@ -2260,33 +2266,39 @@ export async function processAllData({ storageRoot }) {
 
   const latestEffKpis = statusBuckets?.effective?.kpis || {};
   const prevEffKpis = prev?.statusBuckets?.effective?.kpis || null;
-  const deltaTotalPoolStyles = totalPoolPrev != null ? totalPoolLatest - totalPoolPrev : null;
-  const delta3DLasts = prevEffKpis ? Number(latestEffKpis.last3DCount || latestEffKpis.matchedLasts || 0) - Number(prevEffKpis.last3DCount || prevEffKpis.matchedLasts || 0) : null;
-  const delta3DSoles = prevEffKpis ? Number(latestEffKpis.sole3DCount || latestEffKpis.matchedSoles || 0) - Number(prevEffKpis.sole3DCount || prevEffKpis.matchedSoles || 0) : null;
+  const deltaTotalPoolStyles = totalPoolPrev != null ? totalPoolLatest - totalPoolPrev : 0;
+  const delta3DLasts = prevEffKpis
+    ? Number(latestEffKpis.last3DCount || latestEffKpis.matchedLasts || 0) -
+      Number(prevEffKpis.last3DCount || prevEffKpis.matchedLasts || 0)
+    : 0;
+  const delta3DSoles = prevEffKpis
+    ? Number(latestEffKpis.sole3DCount || latestEffKpis.matchedSoles || 0) -
+      Number(prevEffKpis.sole3DCount || prevEffKpis.matchedSoles || 0)
+    : 0;
 
-  // 趋势：遍历所有日期目录，按月聚合累计匹配数（effective 口径）
+  // 趋势：遍历所有日期目录，生成按日时间序列（从远到近；effective 口径累计）
   const dataTablesDir = path.join(storageRoot, 'data_tables');
   const mappingConfigPath = path.join(storageRoot, 'mapping_config.json');
   const mappingConfig = safeJsonRead(mappingConfigPath);
   const mappingArr = pickMappingArray(mappingConfig);
   const standardMap = buildStandardMap(mappingArr || []);
-  const allDateDirs = await getDateDirsByNameSorted(dataTablesDir);
-  const monthMap = new Map(); // ym -> { date, last3D, sole3D }
+  const allDateDirs = await getDateDirsByNameSorted(dataTablesDir); // asc
+  const trendHistory = [];
   for (const d of allDateDirs) {
     try {
       const one = await aggregateForDateRoot({ storageRoot, dateDirName: d, standardMap });
       const eff = one?.statusBuckets?.effective?.kpis || {};
-      const ym = String(d).slice(0, 7);
-      monthMap.set(ym, {
-        date: ym,
-        last3D: Number(eff.last3DCount || eff.matchedLasts || 0),
-        sole3D: Number(eff.sole3DCount || eff.matchedSoles || 0),
+      const tot = one?.statusBuckets?.total?.kpis?.statusDist || null;
+      trendHistory.push({
+        date: String(d),
+        styles: tot ? sumStatusDist(tot) : Number(one?.kpis?.totalStyles || 0),
+        lasts3D: Number(eff.last3DCount || eff.matchedLasts || 0),
+        soles3D: Number(eff.sole3DCount || eff.matchedSoles || 0),
       });
     } catch {
       // ignore single date folder failure
     }
   }
-  const trendHistory = Array.from(monthMap.values()).sort((a, b) => String(a.date).localeCompare(String(b.date)));
 
   const payload = {
     generatedAt: new Date().toISOString(),
@@ -2706,16 +2718,18 @@ export async function aggregateProjectData({ storageRoot }) {
   const standardMap = buildStandardMap(mappingArr || []);
 
   const dataTablesDir = path.join(storageRoot, 'data_tables');
-  const dateDirs = await getDateDirsSorted(dataTablesDir);
-  const latest = dateDirs.length ? dateDirs[dateDirs.length - 1] : '';
-  const prev = dateDirs.length >= 2 ? dateDirs[dateDirs.length - 2] : '';
+  // 多版本识别：按日期目录名倒序
+  const dateDirs = await getDateDirsByNameDesc(dataTablesDir);
+  const latest = dateDirs.length ? dateDirs[0] : '';
+  const prev = dateDirs.length >= 2 ? dateDirs[1] : '';
 
   const latestAgg = await aggregateForDateRoot({ storageRoot, dateDirName: latest, standardMap });
   const prevAgg = prev ? await aggregateForDateRoot({ storageRoot, dateDirName: prev, standardMap }) : null;
 
-  const deltaActive = prevAgg ? computeDelta(latestAgg.kpis.activeStyles, prevAgg.kpis.activeStyles) : { delta: null, pct: null };
-  const deltaLastMatched = prevAgg ? computeDelta(latestAgg.kpis.matchedLasts, prevAgg.kpis.matchedLasts) : { delta: null, pct: null };
-  const deltaSoleMatched = prevAgg ? computeDelta(latestAgg.kpis.matchedSoles, prevAgg.kpis.matchedSoles) : { delta: null, pct: null };
+  // 容错：无 Previous 时 delta 归零（禁止出现误导性的巨大增量）
+  const deltaActive = prevAgg ? computeDelta(latestAgg.kpis.activeStyles, prevAgg.kpis.activeStyles) : { delta: 0, pct: null };
+  const deltaLastMatched = prevAgg ? computeDelta(latestAgg.kpis.matchedLasts, prevAgg.kpis.matchedLasts) : { delta: 0, pct: null };
+  const deltaSoleMatched = prevAgg ? computeDelta(latestAgg.kpis.matchedSoles, prevAgg.kpis.matchedSoles) : { delta: 0, pct: null };
 
   return {
     dates: { latest, prev },
@@ -2744,11 +2758,11 @@ export async function forceSyncLatestProduction({ storageRoot }) {
   const standardMap = buildStandardMap(mappingArr || []);
 
   const dataTablesDir = path.join(storageRoot, 'data_tables');
-  const dateDirs = await getDateDirsSorted(dataTablesDir);
-  const latest = dateDirs.length ? dateDirs[dateDirs.length - 1] : '';
+  const dateDirs = await getDateDirsByNameDesc(dataTablesDir);
+  const latest = dateDirs.length ? dateDirs[0] : '';
   const latestAgg = await aggregateForDateRoot({ storageRoot, dateDirName: latest, standardMap, forceSyncLog: true });
   return {
-    dates: { latest, prev: dateDirs.length >= 2 ? dateDirs[dateDirs.length - 2] : '' },
+    dates: { latest, prev: dateDirs.length >= 2 ? dateDirs[1] : '' },
     mapping: { hasConfig: Boolean(mappingArr && mappingArr.length), configPath: mappingConfigPath },
     latest: latestAgg,
   };

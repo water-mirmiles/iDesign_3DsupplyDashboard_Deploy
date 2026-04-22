@@ -7,7 +7,7 @@ import { Box, Layers, Hash, Factory, Loader2, Activity, TrendingUp, AlertCircle 
 import { cn } from '@/lib/utils';
 import { AssetTrendStats } from '@/types';
 
-type TrendHistoryPoint = { date: string; last3D: number; sole3D: number };
+type TrendHistoryPoint = { date: string; styles: number; lasts3D: number; soles3D: number };
 
 type DashboardStatsResponse = {
   ok: boolean;
@@ -436,18 +436,11 @@ export default function Dashboard() {
           较上月 +{value}{isPercent ? '%' : ''}
         </div>
       );
-    } else if (value < 0) {
-      return (
-        <div className="flex items-center text-xs font-medium text-red-600 bg-red-50 px-1.5 py-0.5 rounded mb-1">
-          <TrendingUp className="w-3 h-3 mr-1 rotate-180" />
-          较上月 {value}{isPercent ? '%' : ''}
-        </div>
-      );
     } else {
       return (
         <div className="flex items-center text-xs font-medium text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded mb-1">
           <Activity className="w-3 h-3 mr-1" />
-          较上月持平
+          较上月 {value}
         </div>
       );
     }
@@ -585,7 +578,7 @@ export default function Dashboard() {
           <div className="mt-4">
             <div className="flex items-end gap-2">
               <span className="text-3xl font-bold text-slate-900">{(tabStyleTotalCount || 0).toLocaleString()}</span>
-              {getTrendBadge(statusScope === 'total' ? stats?.kpis?.deltaTotalPoolStyles : stats?.kpis?.deltaActiveStyles)}
+              {getTrendBadge(stats?.kpis?.deltaTotalPoolStyles)}
             </div>
             <div className="mt-1 text-xs text-slate-500">
               当前口径：
@@ -705,7 +698,7 @@ export default function Dashboard() {
         <div className="flex items-center justify-between gap-4 mb-4">
           <div className="min-w-0">
             <h3 className="text-base font-semibold text-slate-900">3D 资产新增趋势</h3>
-            <div className="text-xs text-slate-500 mt-1">按月回溯 data_tables 目录生成（生效口径累计）</div>
+            <div className="text-xs text-slate-500 mt-1">按日回溯 data_tables 目录生成（生效口径累计）</div>
           </div>
           <div className="shrink-0 flex items-center gap-2">
             <span className="text-xs text-slate-500">周期</span>
@@ -732,8 +725,8 @@ export default function Dashboard() {
                 contentStyle={{ borderRadius: 12, borderColor: '#e2e8f0' }}
               />
               <Legend wrapperStyle={{ fontSize: '12px', ...LEGEND_TEXT_STYLE }} />
-              <Area type="monotone" dataKey="last3D" name="3D 楦头累计" stroke="#0284c7" fill="#bae6fd" strokeWidth={2} />
-              <Area type="monotone" dataKey="sole3D" name="3D 大底累计" stroke="#7c3aed" fill="#ddd6fe" strokeWidth={2} />
+              <Area type="monotone" dataKey="lasts3D" name="3D 楦头累计" stroke="#0284c7" fill="#bae6fd" strokeWidth={2} />
+              <Area type="monotone" dataKey="soles3D" name="3D 大底累计" stroke="#7c3aed" fill="#ddd6fe" strokeWidth={2} />
             </AreaChart>
           </ResponsiveContainer>
         </div>
