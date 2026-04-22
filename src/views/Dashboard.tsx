@@ -7,6 +7,8 @@ import { Box, Layers, Hash, Factory, Loader2, Activity, TrendingUp, AlertCircle 
 import { cn } from '@/lib/utils';
 import { AssetTrendStats } from '@/types';
 
+type TrendHistoryPoint = { date: string; last3D: number; sole3D: number };
+
 type DashboardStatsResponse = {
   ok: boolean;
   source?: 'final_dashboard_data' | 'live';
@@ -40,9 +42,12 @@ type DashboardStatsResponse = {
     stylesWithAny3D?: number;
     /** (生效款且 has3D) / 生效款总数 · 百分比 */
     any3DCoveragePercent?: number;
-    deltaActiveStyles: number;
-    deltaMatched3DLasts: number;
-    deltaMatched3DSoles: number;
+    deltaActiveStyles: number | null;
+    deltaMatched3DLasts: number | null;
+    deltaMatched3DSoles: number | null;
+    deltaTotalPoolStyles?: number | null;
+    delta3DLasts?: number | null;
+    delta3DSoles?: number | null;
   };
   statusBuckets?: {
     total?: { kpis?: any; lastDigitizationStats?: any[]; soleDigitizationStats?: any[] };
@@ -82,6 +87,7 @@ type DashboardStatsResponse = {
     completionRate: number;
   }>;
   trends?: { assetTrend?: AssetTrendStats[] };
+  trendHistory?: TrendHistoryPoint[];
   inventory?: Array<any>;
   /** 主表状态列原始值普查（全表物理行） */
   rawStatusAudit?: Array<{ value: string; rowCount: number }>;
@@ -133,7 +139,7 @@ export default function Dashboard() {
   const [statusScope, setStatusScope] = useState<'effective' | 'includeDraft' | 'total'>('effective');
 
   const [trendPeriod, setTrendPeriod] = useState<TimePeriod>('week');
-  const [chartData, setChartData] = useState<AssetTrendStats[]>([]);
+  const [chartData, setChartData] = useState<TrendHistoryPoint[]>([]);
 
   /** 入库款号按归一化状态计数（与 Tab 求和一致；无分桶快照时回落 scopeKPIs） */
   const invStatusCounts = useMemo(() => {
@@ -347,7 +353,7 @@ export default function Dashboard() {
         // eslint-disable-next-line no-console
         console.log('Dashboard Raw Data Received:', json);
         setStats(json);
-        setChartData(Array.isArray(json.trends?.assetTrend) ? json.trends.assetTrend : []);
+        setChartData(Array.isArray(json.trendHistory) ? json.trendHistory : []);
       } catch (e) {
         if (cancelled) return;
         setError(e instanceof Error ? e.message : '加载失败');
@@ -376,7 +382,7 @@ export default function Dashboard() {
       // eslint-disable-next-line no-console
       console.log('Dashboard Raw Data Received:', json2);
       setStats(json2);
-      setChartData(Array.isArray(json2.trends?.assetTrend) ? json2.trends.assetTrend : []);
+      setChartData(Array.isArray(json2.trendHistory) ? json2.trendHistory : []);
     } catch (e) {
       setError(e instanceof Error ? e.message : '重算失败');
     } finally {
@@ -414,7 +420,15 @@ export default function Dashboard() {
     window.location.reload();
   };
 
-  const getTrendBadge = (value: number, isPercent = false) => {
+  const getTrendBadge = (value: number | null | undefined, isPercent = false) => {
+    if (value == null) {
+      return (
+        <div className="flex items-center text-xs font-medium text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded mb-1">
+          <Activity className="w-3 h-3 mr-1" />
+          首个快照
+        </div>
+      );
+    }
     if (value > 0) {
       return (
         <div className="flex items-center text-xs font-medium text-emerald-600 bg-emerald-50 px-1.5 py-0.5 rounded mb-1">
@@ -571,7 +585,7 @@ export default function Dashboard() {
           <div className="mt-4">
             <div className="flex items-end gap-2">
               <span className="text-3xl font-bold text-slate-900">{(tabStyleTotalCount || 0).toLocaleString()}</span>
-              {getTrendBadge(stats?.kpis?.deltaActiveStyles || 0)}
+              {getTrendBadge(statusScope === 'total' ? stats?.kpis?.deltaTotalPoolStyles : stats?.kpis?.deltaActiveStyles)}
             </div>
             <div className="mt-1 text-xs text-slate-500">
               当前口径：
@@ -599,7 +613,7 @@ export default function Dashboard() {
               <span className="text-3xl font-bold text-slate-900">
                 {displayLast3DKpi.toLocaleString()}
               </span>
-              {getTrendBadge(stats?.kpis?.deltaMatched3DLasts || 0)}
+              {getTrendBadge(stats?.kpis?.delta3DLasts ?? stats?.kpis?.deltaMatched3DLasts)}
             </div>
             <div className="mt-1 text-xs text-slate-500">
               编号绑定率：{' '}
@@ -629,7 +643,7 @@ export default function Dashboard() {
               <span className="text-3xl font-bold text-slate-900">
                 {displaySole3DKpi.toLocaleString()}
               </span>
-              {getTrendBadge(stats?.kpis?.deltaMatched3DSoles || 0)}
+              {getTrendBadge(stats?.kpis?.delta3DSoles ?? stats?.kpis?.deltaMatched3DSoles)}
             </div>
             <div className="mt-1 text-xs text-slate-500">
               编号绑定率: <span className="font-medium text-slate-700">{scopeKPIs?.soleCodeLinkRate ?? 0}%</span>
@@ -684,6 +698,48 @@ export default function Dashboard() {
             </div>
           </div>
         </div>
+      </div>
+
+      {/* 3D 资产新增趋势 */}
+      <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm">
+        <div className="flex items-center justify-between gap-4 mb-4">
+          <div className="min-w-0">
+            <h3 className="text-base font-semibold text-slate-900">3D 资产新增趋势</h3>
+            <div className="text-xs text-slate-500 mt-1">按月回溯 data_tables 目录生成（生效口径累计）</div>
+          </div>
+          <div className="shrink-0 flex items-center gap-2">
+            <span className="text-xs text-slate-500">周期</span>
+            <select
+              value={trendPeriod}
+              onChange={(e) => handlePeriodChange(e.target.value as TimePeriod)}
+              className="text-xs rounded-md border border-slate-200 bg-white px-2 py-1 text-slate-700"
+            >
+              <option value="month">月</option>
+              <option value="week">周（占位）</option>
+              <option value="quarter">季（占位）</option>
+              <option value="year">年（占位）</option>
+            </select>
+          </div>
+        </div>
+        <div className="h-[260px] w-full">
+          <ResponsiveContainer width="100%" height="100%">
+            <AreaChart data={chartData || []} margin={{ top: 10, right: 16, left: 8, bottom: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
+              <XAxis dataKey="date" axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
+              <YAxis axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
+              <RechartsTooltip
+                cursor={{ stroke: '#94a3b8', strokeDasharray: '4 4' }}
+                contentStyle={{ borderRadius: 12, borderColor: '#e2e8f0' }}
+              />
+              <Legend wrapperStyle={{ fontSize: '12px', ...LEGEND_TEXT_STYLE }} />
+              <Area type="monotone" dataKey="last3D" name="3D 楦头累计" stroke="#0284c7" fill="#bae6fd" strokeWidth={2} />
+              <Area type="monotone" dataKey="sole3D" name="3D 大底累计" stroke="#7c3aed" fill="#ddd6fe" strokeWidth={2} />
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+        {(!chartData || chartData.length === 0) && (
+          <div className="text-xs text-slate-500 mt-3">暂无趋势点：请确认 `server/storage/data_tables/` 下存在多个日期目录。</div>
+        )}
       </div>
 
       {/* Digitization Leaderboards */}

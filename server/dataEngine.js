@@ -1089,6 +1089,15 @@ async function getDateDirsSorted(dataTablesDir) {
   return withStat.map((x) => x.name);
 }
 
+/** 趋势专用：仅取日期目录，并按目录名排序（时间线稳定） */
+async function getDateDirsByNameSorted(dataTablesDir) {
+  const entries = await fse.readdir(dataTablesDir, { withFileTypes: true });
+  return entries
+    .filter((e) => e.isDirectory() && isDateDirName(e.name))
+    .map((e) => e.name)
+    .sort((a, b) => a.localeCompare(b));
+}
+
 /** 与磁盘文件名去后缀后一致：trim + 去扩展名 + 小写（与 lastCode 容错比对） */
 function physicalAssetKey(fileOrCodeName) {
   return String(stripExt(fileOrCodeName)).trim().toLowerCase();
@@ -2242,6 +2251,42 @@ export async function processAllData({ storageRoot }) {
   const latest = agg.latest;
   const kpis = latest.kpis;
   const statusBuckets = latest.statusBuckets || null;
+  const prev = agg.prev || null;
+
+  const sumStatusDist = (sd) =>
+    Number(sd?.active || 0) + Number(sd?.draft || 0) + Number(sd?.obsolete || 0) + Number(sd?.other || 0);
+  const totalPoolLatest = sumStatusDist(statusBuckets?.total?.kpis?.statusDist);
+  const totalPoolPrev = prev?.statusBuckets?.total?.kpis?.statusDist ? sumStatusDist(prev.statusBuckets.total.kpis.statusDist) : null;
+
+  const latestEffKpis = statusBuckets?.effective?.kpis || {};
+  const prevEffKpis = prev?.statusBuckets?.effective?.kpis || null;
+  const deltaTotalPoolStyles = totalPoolPrev != null ? totalPoolLatest - totalPoolPrev : null;
+  const delta3DLasts = prevEffKpis ? Number(latestEffKpis.last3DCount || latestEffKpis.matchedLasts || 0) - Number(prevEffKpis.last3DCount || prevEffKpis.matchedLasts || 0) : null;
+  const delta3DSoles = prevEffKpis ? Number(latestEffKpis.sole3DCount || latestEffKpis.matchedSoles || 0) - Number(prevEffKpis.sole3DCount || prevEffKpis.matchedSoles || 0) : null;
+
+  // 趋势：遍历所有日期目录，按月聚合累计匹配数（effective 口径）
+  const dataTablesDir = path.join(storageRoot, 'data_tables');
+  const mappingConfigPath = path.join(storageRoot, 'mapping_config.json');
+  const mappingConfig = safeJsonRead(mappingConfigPath);
+  const mappingArr = pickMappingArray(mappingConfig);
+  const standardMap = buildStandardMap(mappingArr || []);
+  const allDateDirs = await getDateDirsByNameSorted(dataTablesDir);
+  const monthMap = new Map(); // ym -> { date, last3D, sole3D }
+  for (const d of allDateDirs) {
+    try {
+      const one = await aggregateForDateRoot({ storageRoot, dateDirName: d, standardMap });
+      const eff = one?.statusBuckets?.effective?.kpis || {};
+      const ym = String(d).slice(0, 7);
+      monthMap.set(ym, {
+        date: ym,
+        last3D: Number(eff.last3DCount || eff.matchedLasts || 0),
+        sole3D: Number(eff.sole3DCount || eff.matchedSoles || 0),
+      });
+    } catch {
+      // ignore single date folder failure
+    }
+  }
+  const trendHistory = Array.from(monthMap.values()).sort((a, b) => String(a.date).localeCompare(String(b.date)));
 
   const payload = {
     generatedAt: new Date().toISOString(),
@@ -2277,6 +2322,9 @@ export async function processAllData({ storageRoot }) {
       deltaActiveStyles: agg.deltas.activeStyles.delta,
       deltaMatched3DLasts: agg.deltas.matchedLasts.delta,
       deltaMatched3DSoles: agg.deltas.matchedSoles.delta,
+      deltaTotalPoolStyles,
+      delta3DLasts,
+      delta3DSoles,
     },
     // 新口径：按状态分桶的 KPI + 品牌进度榜（前端 Tabs 切换直接用）
     statusBuckets: statusBuckets || undefined,
@@ -2285,7 +2333,9 @@ export async function processAllData({ storageRoot }) {
     lastDigitizationStats: latest.lastDigitizationStats || [],
     soleDigitizationStats: latest.soleDigitizationStats || [],
     inventory: latest.inventory,
+    trendHistory,
     trends: {
+      // legacy: 保留字段，避免老 UI 依赖；但新 UI 请使用 trendHistory
       assetTrend: buildAssetTrendSeries({
         latestDate: agg.dates?.latest || '',
         last3DCount: kpis.last3DCount ?? kpis.matchedLasts,
@@ -2663,9 +2713,9 @@ export async function aggregateProjectData({ storageRoot }) {
   const latestAgg = await aggregateForDateRoot({ storageRoot, dateDirName: latest, standardMap });
   const prevAgg = prev ? await aggregateForDateRoot({ storageRoot, dateDirName: prev, standardMap }) : null;
 
-  const deltaActive = prevAgg ? computeDelta(latestAgg.kpis.activeStyles, prevAgg.kpis.activeStyles) : { delta: 0, pct: null };
-  const deltaLastMatched = prevAgg ? computeDelta(latestAgg.kpis.matchedLasts, prevAgg.kpis.matchedLasts) : { delta: 0, pct: null };
-  const deltaSoleMatched = prevAgg ? computeDelta(latestAgg.kpis.matchedSoles, prevAgg.kpis.matchedSoles) : { delta: 0, pct: null };
+  const deltaActive = prevAgg ? computeDelta(latestAgg.kpis.activeStyles, prevAgg.kpis.activeStyles) : { delta: null, pct: null };
+  const deltaLastMatched = prevAgg ? computeDelta(latestAgg.kpis.matchedLasts, prevAgg.kpis.matchedLasts) : { delta: null, pct: null };
+  const deltaSoleMatched = prevAgg ? computeDelta(latestAgg.kpis.matchedSoles, prevAgg.kpis.matchedSoles) : { delta: null, pct: null };
 
   return {
     dates: { latest, prev },
