@@ -57,6 +57,12 @@ const app = express();
 const STORAGE_ROOT = path.join(__dirname, 'storage');
 
 app.use(cors());
+
+// --- Production static hosting (Vite dist/) ---
+// 托管前端构建出的 dist 文件夹（与仓库根 `dist/` 对齐）
+const DIST_DIR = path.join(__dirname, '..', 'dist');
+app.use(express.static(DIST_DIR));
+
 app.use(
   '/storage',
   express.static(STORAGE_ROOT, {
@@ -3921,6 +3927,16 @@ app.get('/api/asset-file', (req, res) => {
     // eslint-disable-next-line no-console
     console.error('[api/asset-file]', e);
     return res.status(500).json({ ok: false, error: e instanceof Error ? e.message : 'asset-file failed' });
+  }
+});
+
+// SPA 路由兜底：确保刷新页面时前端路由不失效（仅对非 /api 与非 /storage 生效）
+app.get('*', (req, res, next) => {
+  try {
+    if (req.url.startsWith('/api') || req.url.startsWith('/storage')) return next();
+    return res.sendFile(path.join(DIST_DIR, 'index.html'));
+  } catch {
+    return next();
   }
 });
 
