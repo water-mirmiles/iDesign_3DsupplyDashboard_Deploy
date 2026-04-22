@@ -100,12 +100,16 @@ export function isTruthyActiveStatus(v) {
  * Draft 分类保留，当前数据可为 0。
  */
 function normalizeInventoryStatus(v) {
+  // 强制去空格 + 小写（物理纠偏：避免 "Draft " 这类值漏分桶）
   const raw = normalize(v);
-  const s = raw.toLowerCase();
+  const s = String(raw ?? '').trim().toLowerCase();
 
   const isNum01 = (x) => /^0(\.0+)?$/.test(x);
   const isNum1 = (x) => /^1(\.0+)?$/.test(x);
   const isNum9 = (x) => /^9(\.0+)?$/.test(x);
+
+  // —— 0) Draft 精确匹配（必须显式识别 draft / Draft）
+  if (s === 'draft') return 'draft';
 
   // —— 1) 作废/无效：invalid 与扩展词库（先于 effective，避免歧义）
   if (s === 'invalid' || /\binvalid\b/.test(s)) return 'obsolete';
@@ -136,6 +140,23 @@ function normalizeInventoryStatus(v) {
 
   // —— 兜底：其他（仍计入全量池条形图）
   return 'other';
+}
+
+/** 列出所有未落入 active/draft/obsolete 的原始词汇（只计 other） */
+function auditMainTableOtherStatusDistribution(main, statusCol) {
+  const counts = new Map();
+  const rows = main?.rows || [];
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i] || {};
+    const raw = statusCol ? row[statusCol] : undefined;
+    const bucket = normalizeInventoryStatus(raw);
+    if (bucket !== 'other') continue;
+    const label = formatRawStatusLabel(raw);
+    counts.set(label, (counts.get(label) || 0) + 1);
+  }
+  return Array.from(counts.entries())
+    .map(([value, rowCount]) => ({ value, rowCount }))
+    .sort((a, b) => b.rowCount - a.rowCount);
 }
 
 /** 主表状态列原始值普查（不限于有款号的行） */
@@ -1872,6 +1893,17 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
   const rawStatusAudit = auditMainTableRawStatusDistribution(main, statusCol);
   printRawStatusAuditTable(rawStatusAudit, main, statusCol);
   printStatusScopeCensus(main, statusCol, rawStatusAudit);
+  const otherRaw = auditMainTableOtherStatusDistribution(main, statusCol);
+  if (otherRaw.length) {
+    // eslint-disable-next-line no-console
+    console.log('[Status Audit] 以下原始状态未落入 (effective/draft/invalid) 三标准桶，已计入 other：');
+    for (const it of otherRaw) {
+      // eslint-disable-next-line no-console
+      console.log(`- "${it.value}": ${it.rowCount} 行`);
+    }
+    // eslint-disable-next-line no-console
+    console.log('---------------------------');
+  }
 
   const inventory = [];
   // 归一化四态：全物理行计数（用于 Dashboard 三档 Tab 的加法原则校验）
