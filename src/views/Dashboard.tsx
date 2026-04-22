@@ -693,47 +693,49 @@ export default function Dashboard() {
         </div>
       </div>
 
-      {/* 3D 资产新增趋势 */}
-      <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm">
-        <div className="flex items-center justify-between gap-4 mb-4">
-          <div className="min-w-0">
-            <h3 className="text-base font-semibold text-slate-900">3D 资产新增趋势</h3>
-            <div className="text-xs text-slate-500 mt-1">按日回溯 data_tables 目录生成（生效口径累计）</div>
+      {/* 3D 资产新增趋势（暂时隐藏；需要时把 false 改成 true） */}
+      {false && (
+        <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm">
+          <div className="flex items-center justify-between gap-4 mb-4">
+            <div className="min-w-0">
+              <h3 className="text-base font-semibold text-slate-900">3D 资产新增趋势</h3>
+              <div className="text-xs text-slate-500 mt-1">按日回溯 data_tables 目录生成（生效口径累计）</div>
+            </div>
+            <div className="shrink-0 flex items-center gap-2">
+              <span className="text-xs text-slate-500">周期</span>
+              <select
+                value={trendPeriod}
+                onChange={(e) => handlePeriodChange(e.target.value as TimePeriod)}
+                className="text-xs rounded-md border border-slate-200 bg-white px-2 py-1 text-slate-700"
+              >
+                <option value="month">月</option>
+                <option value="week">周（占位）</option>
+                <option value="quarter">季（占位）</option>
+                <option value="year">年（占位）</option>
+              </select>
+            </div>
           </div>
-          <div className="shrink-0 flex items-center gap-2">
-            <span className="text-xs text-slate-500">周期</span>
-            <select
-              value={trendPeriod}
-              onChange={(e) => handlePeriodChange(e.target.value as TimePeriod)}
-              className="text-xs rounded-md border border-slate-200 bg-white px-2 py-1 text-slate-700"
-            >
-              <option value="month">月</option>
-              <option value="week">周（占位）</option>
-              <option value="quarter">季（占位）</option>
-              <option value="year">年（占位）</option>
-            </select>
+          <div className="h-[260px] w-full">
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={chartData || []} margin={{ top: 10, right: 16, left: 8, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
+                <XAxis dataKey="date" axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
+                <YAxis axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
+                <RechartsTooltip
+                  cursor={{ stroke: '#94a3b8', strokeDasharray: '4 4' }}
+                  contentStyle={{ borderRadius: 12, borderColor: '#e2e8f0' }}
+                />
+                <Legend wrapperStyle={{ fontSize: '12px', ...LEGEND_TEXT_STYLE }} />
+                <Area type="monotone" dataKey="lasts3D" name="3D 楦头累计" stroke="#0284c7" fill="#bae6fd" strokeWidth={2} />
+                <Area type="monotone" dataKey="soles3D" name="3D 大底累计" stroke="#7c3aed" fill="#ddd6fe" strokeWidth={2} />
+              </AreaChart>
+            </ResponsiveContainer>
           </div>
+          {(!chartData || chartData.length === 0) && (
+            <div className="text-xs text-slate-500 mt-3">暂无趋势点：请确认 `server/storage/data_tables/` 下存在多个日期目录。</div>
+          )}
         </div>
-        <div className="h-[260px] w-full">
-          <ResponsiveContainer width="100%" height="100%">
-            <AreaChart data={chartData || []} margin={{ top: 10, right: 16, left: 8, bottom: 0 }}>
-              <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
-              <XAxis dataKey="date" axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
-              <YAxis axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
-              <RechartsTooltip
-                cursor={{ stroke: '#94a3b8', strokeDasharray: '4 4' }}
-                contentStyle={{ borderRadius: 12, borderColor: '#e2e8f0' }}
-              />
-              <Legend wrapperStyle={{ fontSize: '12px', ...LEGEND_TEXT_STYLE }} />
-              <Area type="monotone" dataKey="lasts3D" name="3D 楦头累计" stroke="#0284c7" fill="#bae6fd" strokeWidth={2} />
-              <Area type="monotone" dataKey="soles3D" name="3D 大底累计" stroke="#7c3aed" fill="#ddd6fe" strokeWidth={2} />
-            </AreaChart>
-          </ResponsiveContainer>
-        </div>
-        {(!chartData || chartData.length === 0) && (
-          <div className="text-xs text-slate-500 mt-3">暂无趋势点：请确认 `server/storage/data_tables/` 下存在多个日期目录。</div>
-        )}
-      </div>
+      )}
 
       {/* Digitization Leaderboards */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
