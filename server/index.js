@@ -845,13 +845,19 @@ function isDateDirName(name) {
 async function getLatestDataTablesDir() {
   await ensureStorageDirs();
   const entries = await fse.readdir(DIRS.dataTables, { withFileTypes: true });
-  const dateDirs = entries
-    .filter((e) => e.isDirectory() && isDateDirName(e.name))
-    .map((e) => e.name)
-    .sort();
-
-  if (dateDirs.length === 0) return DIRS.dataTables;
-  return path.join(DIRS.dataTables, dateDirs[dateDirs.length - 1]);
+  const dirs = entries.filter((e) => e.isDirectory()).map((e) => e.name);
+  if (!dirs.length) return DIRS.dataTables;
+  let best = { name: dirs[0], mtimeMs: 0 };
+  for (const name of dirs) {
+    try {
+      const st = await fse.stat(path.join(DIRS.dataTables, name));
+      const m = st.mtimeMs || 0;
+      if (m >= best.mtimeMs) best = { name, mtimeMs: m };
+    } catch {
+      // ignore
+    }
+  }
+  return path.join(DIRS.dataTables, best.name);
 }
 
 function isExcelFileName(name) {
@@ -3493,6 +3499,8 @@ app.get('/api/dashboard-stats', async (req, res) => {
           snap ? 'yes' : 'no'
         } stale=${snapIsStale ? 'yes' : 'no'} snap.latest=${snapLatestDate || '(none)'} prod.latest=${latestProdDate || '(none)'}`
       );
+      // 强制删除旧缓存（包含 final_results.json），避免读到旧残留
+      await purgeOldSnapshots();
       const payload = await processAllData({ storageRoot: STORAGE_ROOT });
       await persistFinalDashboardData(STORAGE_ROOT, payload);
       return res.json({

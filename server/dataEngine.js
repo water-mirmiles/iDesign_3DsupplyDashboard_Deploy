@@ -901,9 +901,10 @@ function columnNameForMainRow(entry) {
 function readSheetRows(fullPath) {
   const wb = XLSX.readFile(fullPath, { cellText: false, cellDates: true });
   const sheetName = wb.SheetNames?.[0];
-  if (!sheetName) return { headers: [], rows: [] };
+  if (!sheetName) return { headers: [], rows: [], sheetRef: null };
   const sheet = wb.Sheets[sheetName];
-  if (!sheet) return { headers: [], rows: [] };
+  if (!sheet) return { headers: [], rows: [], sheetRef: null };
+  const sheetRef = sheet['!ref'] ? String(sheet['!ref']) : null;
   const grid = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, defval: '' });
 
   const normHeader = (v) => String(v ?? '').trim().toLowerCase();
@@ -976,8 +977,7 @@ function readSheetRows(fullPath) {
   // 若 sandbox 且第一行不像表头：强制 DDL 列顺序
   if (isSandboxFile && ddlColumnsForThisTable.length && !firstLooksLikeHeader) {
     const headers = ddlColumnsForThisTable;
-    let rows = XLSX.utils.sheet_to_json(sheet, { header: headers, raw: false, defval: '', range: 0 });
-    const styleKey = headers.includes('style_wms') ? 'style_wms' : '';
+    let rows = XLSX.utils.sheet_to_json(sheet, { header: headers, raw: false, defval: '', range: 0, blankrows: true });
     const normalizeCellForRow = (v) => {
       const s = String(v ?? '');
       const t = s.trim();
@@ -994,23 +994,12 @@ function readSheetRows(fullPath) {
       }
       return t;
     };
-    rows = (Array.isArray(rows) ? rows : [])
-      .map((r) => {
-        const out = {};
-        for (const [k, v] of Object.entries(r || {})) out[String(k)] = normalizeCellForRow(v);
-        return out;
-      })
-      .filter((r) => {
-        const vals = Object.values(r || {});
-        const allEmpty = vals.every((v) => {
-          if (Array.isArray(v)) return v.length === 0;
-          return String(v ?? '').trim() === '';
-        });
-        if (allEmpty) return false;
-        if (styleKey && String(r?.[styleKey] ?? '').trim() === '') return false;
-        return true;
-      });
-    return { headers, rows };
+    rows = (Array.isArray(rows) ? rows : []).map((r) => {
+      const out = {};
+      for (const [k, v] of Object.entries(r || {})) out[String(k)] = normalizeCellForRow(v);
+      return out;
+    });
+    return { headers, rows, sheetRef };
   }
 
   // 若第一行已被判定为表头：必须锁定为 header（禁止再用“字符总量最高”把数据行误判为 header）
@@ -1044,9 +1033,7 @@ function readSheetRows(fullPath) {
   });
 
   // 数据行从表头下一行开始
-  let rows = XLSX.utils.sheet_to_json(sheet, { header: headers, raw: false, defval: '', range: headerRowIndex + 1 });
-
-  const styleKey = headers.includes('style_wms') ? 'style_wms' : '';
+  let rows = XLSX.utils.sheet_to_json(sheet, { header: headers, raw: false, defval: '', range: headerRowIndex + 1, blankrows: true });
   const normalizeCellForRow = (v) => {
     const s = String(v ?? '');
     const t = s.trim();
@@ -1065,25 +1052,13 @@ function readSheetRows(fullPath) {
     return t;
   };
 
-  rows = (Array.isArray(rows) ? rows : [])
-    .map((r) => {
-      const out = {};
-      for (const [k, v] of Object.entries(r || {})) out[String(k)] = normalizeCellForRow(v);
-      return out;
-    })
-    // 过滤脏数据：全空行跳过；若存在款号列 style_wms 且为空则跳过
-    .filter((r) => {
-      const vals = Object.values(r || {});
-      const allEmpty = vals.every((v) => {
-        if (Array.isArray(v)) return v.length === 0;
-        return String(v ?? '').trim() === '';
-      });
-      if (allEmpty) return false;
-      if (styleKey && String(r?.[styleKey] ?? '').trim() === '') return false;
-      return true;
-    });
+  rows = (Array.isArray(rows) ? rows : []).map((r) => {
+    const out = {};
+    for (const [k, v] of Object.entries(r || {})) out[String(k)] = normalizeCellForRow(v);
+    return out;
+  });
 
-  return { headers, rows };
+  return { headers, rows, sheetRef };
 }
 
 async function listFiles(dir) {
@@ -1093,10 +1068,19 @@ async function listFiles(dir) {
 
 async function getDateDirsSorted(dataTablesDir) {
   const entries = await fse.readdir(dataTablesDir, { withFileTypes: true });
-  return entries
-    .filter((e) => e.isDirectory() && isDateDirName(e.name))
-    .map((e) => e.name)
-    .sort();
+  const dirs = entries.filter((e) => e.isDirectory()).map((e) => e.name);
+  const withStat = [];
+  for (const name of dirs) {
+    try {
+      const st = await fse.stat(path.join(dataTablesDir, name));
+      withStat.push({ name, mtimeMs: st.mtimeMs || 0 });
+    } catch {
+      withStat.push({ name, mtimeMs: 0 });
+    }
+  }
+  // 修改时间最晚在最后
+  withStat.sort((a, b) => a.mtimeMs - b.mtimeMs || a.name.localeCompare(b.name));
+  return withStat.map((x) => x.name);
 }
 
 /** 与磁盘文件名去后缀后一致：trim + 去扩展名 + 小写（与 lastCode 容错比对） */
@@ -1504,14 +1488,14 @@ export async function loadExcelFolderAsTablesMap(folderPath) {
   }
   const xlsxTables = excelFiles.map((fileName) => {
     const fullPath = path.join(folderPath, fileName);
-    const { headers, rows } = readSheetRows(fullPath);
+    const { headers, rows, sheetRef } = readSheetRows(fullPath);
     // eslint-disable-next-line no-console
     console.log(`[Excel] 加载表: ${fileName}`);
     // eslint-disable-next-line no-console
     console.log(`[Excel] 识别到表头: ${(headers || []).slice(0, 5).join(', ')}...`);
     // eslint-disable-next-line no-console
     console.log(`[Excel] 数据行数: ${(rows || []).length} 行`);
-    return { fileName, fullPath, headers, rows };
+    return { fileName, fullPath, headers, rows, sheetRef };
   });
   return { xlsxTables, tablesMap: buildTablesMap(xlsxTables) };
 }
@@ -1734,8 +1718,8 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
   const excelFiles = (await listFiles(dateDir)).filter((n) => ['.xlsx', '.xls'].includes(path.extname(n).toLowerCase()));
   const xlsxTables = excelFiles.map((fileName) => {
     const fullPath = path.join(dateDir, fileName);
-    const { headers, rows } = readSheetRows(fullPath);
-    return { fileName, fullPath, headers, rows };
+    const { headers, rows, sheetRef } = readSheetRows(fullPath);
+    return { fileName, fullPath, headers, rows, sheetRef };
   });
   const tablesMap = buildTablesMap(xlsxTables);
 
@@ -1918,14 +1902,16 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
   for (let i = 0; i < main.rows.length; i++) {
     const row = main.rows[i] || {};
     const styleVal = styleCol ? normalize(row?.[styleCol]) : '';
-    if (!styleVal) continue;
-
+    // 先对全物理行计数（即使 style_wms 为空也要入 statusDist）
     const styleUpper = String(styleVal || '').trim().toUpperCase();
     const wantTrace = styleUpper === 'SBOX26008M';
 
     const rawStatusVal = statusCol ? row?.[statusCol] : '';
     const invStatus = normalizeInventoryStatus(rawStatusVal);
     statusDist[invStatus] += 1;
+
+    // inventory（入库款号行）仍只统计有 style_wms 的行
+    if (!styleVal) continue;
 
     const lastResolved = (() => {
       // 强制路径：优先直接取 associated_last_type；若列名在生产快照中变体，则自动探测 FK 列
@@ -2376,6 +2362,12 @@ export async function resolveFirstActiveRowFromFolder({
   if (!main) {
     return { ok: false, error: '无法识别主表（必须存在 ods_pdm_pdm_product_info_df.xlsx）', row: null, mainTable: null };
   }
+
+  // 物理对账自查：打印绝对路径与 !ref（含表头）
+  // eslint-disable-next-line no-console
+  console.log('📂 [Critical] 当前正在读取的主文件路径:', main.fullPath);
+  // eslint-disable-next-line no-console
+  console.log('📊 [Critical] 该文件实际物理行数 (含表头):', main.sheetRef || '(unknown !ref)');
 
   const mainTableName = buildTableNameIndex(main.fileName);
   // 强制对账：逻辑表名 -> 物理文件路径
