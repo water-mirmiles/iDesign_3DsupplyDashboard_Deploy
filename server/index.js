@@ -96,6 +96,50 @@ const FINAL_DASHBOARD_PATH = path.join(STORAGE_ROOT, 'final_dashboard_data.json'
 const FINAL_RESULTS_PATH = path.join(STORAGE_ROOT, 'final_results.json');
 const ASSETS_META_PATH = path.join(STORAGE_ROOT, 'assets_meta.json');
 
+/**
+ * 暴力清除本地 JSON 快照缓存：
+ * 删除 server/storage 下除 data_tables 与 assets 目录之外的所有 .json 文件。
+ * （临时排障：避免 final_results.json / final_dashboard_data.json 等残留导致“数字死锁”）
+ */
+async function purgeStorageJsonExceptDataAndAssets() {
+  const keepSub = new Set([path.resolve(DIRS.dataTables), path.resolve(path.join(STORAGE_ROOT, 'assets'))]);
+  const shouldSkipDir = (absDir) => {
+    const d = path.resolve(absDir);
+    for (const k of keepSub) {
+      const prefix = k.endsWith(path.sep) ? k : k + path.sep;
+      if (d === k || d.startsWith(prefix)) return true;
+    }
+    return false;
+  };
+  const removed = [];
+  const walk = async (dirAbs) => {
+    if (shouldSkipDir(dirAbs)) return;
+    let entries = [];
+    try {
+      entries = await fse.readdir(dirAbs, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const full = path.join(dirAbs, e.name);
+      if (e.isDirectory()) {
+        await walk(full);
+      } else if (e.isFile() && e.name.toLowerCase().endsWith('.json')) {
+        try {
+          await fse.remove(full);
+          removed.push(path.relative(STORAGE_ROOT, full).split(path.sep).join('/'));
+        } catch {
+          // ignore
+        }
+      }
+    }
+  };
+  await walk(STORAGE_ROOT);
+  // eslint-disable-next-line no-console
+  console.log('[Startup] purge storage json removed:', removed.length ? removed.join(', ') : '(none)');
+  return removed;
+}
+
 /** 与 multer 目的地规则一致：3D 文件名应落到 lasts 或 soles 哪个目录 */
 function resolve3dAssetDirByFileName(originalName) {
   const base = path.basename(String(originalName || ''));
@@ -3886,6 +3930,7 @@ app.use((err, _req, res, _next) => {
 
 async function start() {
   await ensureStorageDirs();
+  await purgeStorageJsonExceptDataAndAssets();
   // 自动化环境清理：启动时强制确保 sandbox 目录存在
   try {
     fse.ensureDirSync(path.join(__dirname, 'storage', 'sandbox'));

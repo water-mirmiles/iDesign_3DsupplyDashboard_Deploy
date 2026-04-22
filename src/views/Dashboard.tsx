@@ -340,7 +340,7 @@ export default function Dashboard() {
       setIsLoading(true);
       setError(null);
       try {
-        const resp = await fetch('/api/dashboard-stats');
+        const resp = await fetch(`/api/dashboard-stats?t=${Date.now()}`);
         const json = (await resp.json()) as DashboardStatsResponse;
         if (!resp.ok || !json.ok) throw new Error(json.error || `加载失败（HTTP ${resp.status}）`);
         if (cancelled) return;
@@ -370,7 +370,7 @@ export default function Dashboard() {
       const json = await resp.json().catch(() => null);
       if (!resp.ok || !json?.ok) throw new Error(json?.error || `重算失败（HTTP ${resp.status}）`);
       // 重算后强制拉取最新 stats（避免仍读旧快照）
-      const resp2 = await fetch('/api/dashboard-stats?refresh=1');
+      const resp2 = await fetch(`/api/dashboard-stats?refresh=1&t=${Date.now()}`);
       const json2 = (await resp2.json()) as DashboardStatsResponse;
       if (!resp2.ok || !json2.ok) throw new Error(json2.error || `刷新失败（HTTP ${resp2.status}）`);
       // eslint-disable-next-line no-console

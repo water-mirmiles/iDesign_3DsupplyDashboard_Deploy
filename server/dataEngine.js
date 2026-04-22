@@ -905,7 +905,13 @@ function readSheetRows(fullPath) {
   const sheet = wb.Sheets[sheetName];
   if (!sheet) return { headers: [], rows: [], sheetRef: null };
   const sheetRef = sheet['!ref'] ? String(sheet['!ref']) : null;
-  const grid = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, defval: '' });
+  // Row count audit：header:1 会返回二维数组；blankrows true 保留空行
+  const grid = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, defval: '', blankrows: true });
+  const gridRowCount = Array.isArray(grid) ? grid.length : 0;
+  // 另一种“暴力长度”：不指定 header，得到对象数组（用于粗验行数是否≈5824）
+  const sheetJsonLen = Array.isArray(XLSX.utils.sheet_to_json(sheet, { raw: false, defval: '', blankrows: true }))
+    ? XLSX.utils.sheet_to_json(sheet, { raw: false, defval: '', blankrows: true }).length
+    : 0;
 
   const normHeader = (v) => String(v ?? '').trim().toLowerCase();
   const looksNumericLike = (s) => {
@@ -999,7 +1005,7 @@ function readSheetRows(fullPath) {
       for (const [k, v] of Object.entries(r || {})) out[String(k)] = normalizeCellForRow(v);
       return out;
     });
-    return { headers, rows, sheetRef };
+    return { headers, rows, sheetRef, gridRowCount, sheetJsonLen };
   }
 
   // 若第一行已被判定为表头：必须锁定为 header（禁止再用“字符总量最高”把数据行误判为 header）
@@ -1058,7 +1064,7 @@ function readSheetRows(fullPath) {
     return out;
   });
 
-  return { headers, rows, sheetRef };
+  return { headers, rows, sheetRef, gridRowCount, sheetJsonLen };
 }
 
 async function listFiles(dir) {
@@ -1718,8 +1724,8 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
   const excelFiles = (await listFiles(dateDir)).filter((n) => ['.xlsx', '.xls'].includes(path.extname(n).toLowerCase()));
   const xlsxTables = excelFiles.map((fileName) => {
     const fullPath = path.join(dateDir, fileName);
-    const { headers, rows, sheetRef } = readSheetRows(fullPath);
-    return { fileName, fullPath, headers, rows, sheetRef };
+    const { headers, rows, sheetRef, gridRowCount, sheetJsonLen } = readSheetRows(fullPath);
+    return { fileName, fullPath, headers, rows, sheetRef, gridRowCount, sheetJsonLen };
   });
   const tablesMap = buildTablesMap(xlsxTables);
 
@@ -1899,6 +1905,7 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
   let sole3DMatchedCount = 0;
   let activeSeen = 0;
   let matchSamplePrinted = 0;
+  const unrecognizedStatusSamples = [];
   for (let i = 0; i < main.rows.length; i++) {
     const row = main.rows[i] || {};
     const styleVal = styleCol ? normalize(row?.[styleCol]) : '';
@@ -1907,6 +1914,16 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
     const wantTrace = styleUpper === 'SBOX26008M';
 
     const rawStatusVal = statusCol ? row?.[statusCol] : '';
+    const rawStatusTrim = String(rawStatusVal ?? '').trim();
+    const rawStatusLower = rawStatusTrim.toLowerCase();
+    if (
+      rawStatusTrim &&
+      rawStatusLower !== 'effective' &&
+      rawStatusLower !== 'invalid' &&
+      unrecognizedStatusSamples.length < 20
+    ) {
+      unrecognizedStatusSamples.push(rawStatusTrim);
+    }
     const invStatus = normalizeInventoryStatus(rawStatusVal);
     statusDist[invStatus] += 1;
 
@@ -2071,6 +2088,10 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
   }
 
   const totalStyles = inventory.length;
+  if (unrecognizedStatusSamples.length) {
+    // eslint-disable-next-line no-console
+    console.log('[Critical] 前 20 个“非 effective 且非 invalid”的原始 data_status 值：', unrecognizedStatusSamples);
+  }
   const statusSum = Number(statusDist.active || 0) + Number(statusDist.draft || 0) + Number(statusDist.obsolete || 0) + Number(statusDist.other || 0);
   if (statusSum !== totalStyles) {
     // eslint-disable-next-line no-console
@@ -2354,7 +2375,10 @@ export async function resolveFirstActiveRowFromFolder({
 
   // 唯一合法主表：ods_pdm_pdm_product_info_df（禁止按表头/全表猜）
   const MAIN_LOGICAL = 'ods_pdm_pdm_product_info_df';
-  const main =
+  // eslint-disable-next-line no-console
+  console.log('📁 [Critical] latestDir =', dateDir);
+
+  let main =
     xlsxTables.find((t) => normalize(getLogicalTableName(t?.fileName || '')) === MAIN_LOGICAL) ||
     (masterTableLogicalName
       ? xlsxTables.find((t) => normalize(getLogicalTableName(t?.fileName || '')) === normalize(masterTableLogicalName)) || null
@@ -2368,6 +2392,35 @@ export async function resolveFirstActiveRowFromFolder({
   console.log('📂 [Critical] 当前正在读取的主文件路径:', main.fullPath);
   // eslint-disable-next-line no-console
   console.log('📊 [Critical] 该文件实际物理行数 (含表头):', main.sheetRef || '(unknown !ref)');
+  // eslint-disable-next-line no-console
+  console.log('📊 [Critical] sheet_to_json(sheet).length =', Number(main.sheetJsonLen || 0));
+
+  // 若行数明显不对：扫描同目录下所有表，找出“行数最多”的候选（用于纠偏）
+  const maxByLen = (xlsxTables || [])
+    .map((t) => ({ t, n: Number(t?.sheetJsonLen || 0) }))
+    .sort((a, b) => b.n - a.n)[0];
+  if (maxByLen?.t && maxByLen.n > 0 && Number(main.sheetJsonLen || 0) < maxByLen.n) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[Critical] 主表行数(${Number(main.sheetJsonLen || 0)}) < 同目录最大行数(${maxByLen.n})，将输出候选列表并尝试锁定最大表`
+    );
+    // eslint-disable-next-line no-console
+    for (const t of xlsxTables) {
+      console.log(`- [RowCount] ${t.fileName}: sheet_to_json.len=${Number(t.sheetJsonLen || 0)} !ref=${t.sheetRef || '(n/a)'}`);
+    }
+    // 若最大表接近 5824（阈值 5600+），强制锁定为 main（防止读错快照/文件）
+    if (maxByLen.n >= 5600) {
+      main = maxByLen.t;
+      // eslint-disable-next-line no-console
+      console.log('✅ [Critical] 已切换主表为行数最多文件:', main.fileName);
+      // eslint-disable-next-line no-console
+      console.log('📂 [Critical] 当前正在读取的主文件路径:', main.fullPath);
+      // eslint-disable-next-line no-console
+      console.log('📊 [Critical] 该文件实际物理行数 (含表头):', main.sheetRef || '(unknown !ref)');
+      // eslint-disable-next-line no-console
+      console.log('📊 [Critical] sheet_to_json(sheet).length =', Number(main.sheetJsonLen || 0));
+    }
+  }
 
   const mainTableName = buildTableNameIndex(main.fileName);
   // 强制对账：逻辑表名 -> 物理文件路径
