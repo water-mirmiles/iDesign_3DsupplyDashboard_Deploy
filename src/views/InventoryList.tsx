@@ -3,6 +3,8 @@ import { Search, Filter, Download, MoreHorizontal, CheckCircle2, XCircle, Databa
 import { cn } from '@/lib/utils';
 import { InventoryItem } from '@/types';
 import ThreeDViewer from '@/components/ThreeDViewer';
+import { getStorageBaseUrl } from '@/lib/storageBaseUrl';
+import { formatMetricsForUi, type Last3DMetrics } from '@/lib/last3dMetrics';
 
 type InventoryRealResponse = {
   ok: boolean;
@@ -75,6 +77,8 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType }: PreviewModalPro
   const [details, setDetails] = useState<AssetDetailsResponse | null>(null);
   const [viewerReady, setViewerReady] = useState(false);
   const [viewerError, setViewerError] = useState<string | null>(null);
+  const [lastMetrics, setLastMetrics] = useState<Last3DMetrics | null>(null);
+  const [scan3d, setScan3d] = useState(false);
 
   const apiType = assetType === 'last' ? 'lasts' : 'soles';
 
@@ -102,8 +106,27 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType }: PreviewModalPro
     setShowAllSoles(false);
     setViewerReady(false);
     setViewerError(null);
+    setLastMetrics(null);
+    setScan3d(false);
     void loadDetails();
   }, [isOpen, assetCode, loadDetails]);
+
+  const file = details?.file;
+  const fileUrl = useMemo(() => {
+    if (!isOpen) return null;
+    if (!file?.exists || !file.fileName) return null;
+    return `${getStorageBaseUrl()}/storage/assets/${apiType}/${encodeURIComponent(String(file.fileName))}`;
+  }, [isOpen, file?.exists, file?.fileName, apiType]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    if (!fileUrl) {
+      setScan3d(false);
+      return;
+    }
+    setLastMetrics(null);
+    setScan3d(true);
+  }, [isOpen, fileUrl]);
 
   if (!isOpen) return null;
 
@@ -111,12 +134,8 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType }: PreviewModalPro
   const soles = details?.linkedSoleCodes ?? [];
   const displayedStyles = showAllStyles ? styles : styles.slice(0, 5);
   const displayedSoles = showAllSoles ? soles : soles.slice(0, 3);
-  const file = details?.file;
   const downloadHref = `/api/asset-file?type=${encodeURIComponent(apiType)}&code=${encodeURIComponent(assetCode.trim())}`;
-  const fileUrl =
-    file?.exists && file.fileName
-      ? `/storage/assets/${apiType}/${encodeURIComponent(String(file.fileName))}`
-      : null;
+  const reportDisp = lastMetrics ? formatMetricsForUi(lastMetrics) : null;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm animate-in fade-in duration-200">
@@ -131,14 +150,20 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType }: PreviewModalPro
           
           {/* Three.js Viewer */}
           {fileUrl ? (
-            <div className="absolute inset-0">
+            <div className="absolute inset-0" key={fileUrl}>
               <ThreeDViewer
                 fileUrl={fileUrl}
-                className="absolute inset-0"
+                className="absolute inset-0 relative"
+                onMetrics={(m) => {
+                  setLastMetrics(m);
+                  setScan3d(false);
+                }}
                 onLoaded={() => setViewerReady(true)}
                 onError={(e) => {
                   setViewerError(e.message);
                   setViewerReady(false);
+                  setScan3d(false);
+                  setLastMetrics(null);
                 }}
               />
             </div>
@@ -172,7 +197,10 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType }: PreviewModalPro
               <>
                 <div className="w-16 h-16 border-4 border-slate-700 border-t-blue-500 rounded-full animate-spin mx-auto mb-4" />
                 <p className="text-slate-400 font-medium tracking-widest">3D 模型解析中...</p>
-                <p className="text-slate-600 text-sm mt-2">OBJLoader 正在加载：{file.fileName}</p>
+                <p className="text-slate-600 text-sm mt-2">
+                  {scan3d ? '正在进行三维特征扫描…' : '正在下载/解析 OBJ…'}
+                </p>
+                <p className="text-slate-500 text-xs mt-1 font-mono break-all px-2">{file.fileName}</p>
               </>
             ) : (
               <>
@@ -227,6 +255,51 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType }: PreviewModalPro
                 </div>
               </div>
             </div>
+
+            {assetType === 'last' && (fileUrl || !loading) ? (
+              <div className="pt-2 border-t border-slate-100">
+                <h3 className="text-sm font-semibold text-slate-800">3D 数字化扫描报告 (AI Analysis)</h3>
+                {scan3d && !lastMetrics && !viewerError && file?.exists ? (
+                  <p className="text-sm text-indigo-600 mt-2 flex items-center gap-2">
+                    <span className="inline-block w-2 h-2 bg-indigo-500 rounded-full animate-pulse" />
+                    正在进行三维特征扫描…
+                  </p>
+                ) : null}
+                {lastMetrics && reportDisp ? (
+                  <div className="mt-3 space-y-2 text-sm text-slate-700">
+                    <div className="grid grid-cols-3 gap-2">
+                      <div>
+                        <div className="text-[10px] text-slate-500 uppercase">长度 L (X)</div>
+                        <div className="font-mono">{reportDisp.L}</div>
+                      </div>
+                      <div>
+                        <div className="text-[10px] text-slate-500 uppercase">宽度 W (Z)</div>
+                        <div className="font-mono">{reportDisp.W}</div>
+                      </div>
+                      <div>
+                        <div className="text-[10px] text-slate-500 uppercase">高度 H (Y)</div>
+                        <div className="font-mono">{reportDisp.H}</div>
+                      </div>
+                    </div>
+                    <div>
+                      <span className="text-slate-500">跟高(估算)：</span>
+                      <span className="font-mono ml-1">{reportDisp.heel}</span>
+                    </div>
+                    <div>
+                      <span className="text-slate-500">体积(估算)：</span>
+                      <span className="font-mono ml-1">{reportDisp.vol}</span>
+                    </div>
+                    <div className="text-xs text-slate-500">
+                      <div>中国码(建议)：{lastMetrics.shoeSizeChinaHint}</div>
+                      <div>欧码(建议)：{lastMetrics.shoeSizeEurHint}</div>
+                    </div>
+                    <p className="text-[11px] text-slate-400 leading-snug">{lastMetrics.volumeNote}</p>
+                  </div>
+                ) : !scan3d && !lastMetrics && file?.exists && !viewerError ? (
+                  <p className="text-sm text-slate-500 mt-2">等待 3D 模型解码…</p>
+                ) : null}
+              </div>
+            ) : null}
 
             <div className="pt-6 border-t border-slate-100">
               <div className="flex justify-between items-center mb-3">

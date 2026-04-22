@@ -2,45 +2,75 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
+import { getStorageBaseUrl } from '@/lib/storageBaseUrl';
+import { extractLast3DMetrics, type Last3DMetrics } from '@/lib/last3dMetrics';
 
 type Props = {
+  /** 可传相对路径 /storage/... 或绝对 http(s) 完整 URL */
   fileUrl: string;
   className?: string;
   onLoaded?: () => void;
   onError?: (err: Error) => void;
+  /** 3D 解析成功后的物性参数 */
+  onMetrics?: (m: Last3DMetrics) => void;
 };
 
+function resolveAssetUrl(fileUrl: string) {
+  const u = String(fileUrl || '').trim();
+  if (!u) return '';
+  if (u.startsWith('http://') || u.startsWith('https://')) return u;
+  if (u.startsWith('/')) return `${getStorageBaseUrl()}${u}`;
+  return `${getStorageBaseUrl()}/${u.replace(/^\//, '')}`;
+}
+
+/**
+ * 将模型包围球完整纳入视野，按纵横比同时考虑水平/竖直 FOV
+ */
 function fitCameraToObject(camera: THREE.PerspectiveCamera, object: THREE.Object3D, controls?: OrbitControls) {
+  object.updateMatrixWorld(true);
   const box = new THREE.Box3().setFromObject(object);
-  const size = box.getSize(new THREE.Vector3());
   const center = box.getCenter(new THREE.Vector3());
+  const sphere = new THREE.Sphere();
+  box.getBoundingSphere(sphere);
+  const r = Math.max(1e-6, sphere.radius);
+  const vFov = (camera.fov * Math.PI) / 180;
+  const aspect = Math.max(0.2, Math.min(5, camera.aspect));
+  const hFov = 2 * Math.atan(Math.tan(vFov / 2) * aspect);
+  const distV = r / Math.sin(vFov / 2);
+  const distH = r / Math.sin(hFov / 2);
+  const d = Math.max(distV, distH) * 1.12;
 
-  const maxDim = Math.max(size.x, size.y, size.z);
-  const fov = (camera.fov * Math.PI) / 180;
-  let cameraZ = Math.abs((maxDim / 2) / Math.tan(fov / 2));
-  cameraZ *= 1.6;
-
-  camera.position.set(center.x, center.y + maxDim * 0.15, center.z + cameraZ);
-  camera.near = Math.max(0.01, cameraZ / 200);
-  camera.far = cameraZ * 500;
+  camera.position.set(center.x, center.y + r * 0.12, center.z + d);
+  const near = Math.max(0.0001, d / 1e4);
+  const far = d * 400;
+  camera.near = near;
+  camera.far = far;
   camera.updateProjectionMatrix();
 
   if (controls) {
     controls.target.copy(center);
+    controls.minDistance = Math.max(0.0001, d * 0.0005);
+    controls.maxDistance = d * 200;
     controls.update();
   }
 }
 
-export default function ThreeDViewer({ fileUrl, className, onLoaded, onError }: Props) {
+export default function ThreeDViewer({ fileUrl, className, onLoaded, onError, onMetrics }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const rafRef = useRef<number | null>(null);
+  const onMetricsRef = useRef(onMetrics);
+  const onLoadedRef = useRef(onLoaded);
+  const onErrorRef = useRef(onError);
+  onMetricsRef.current = onMetrics;
+  onLoadedRef.current = onLoaded;
+  onErrorRef.current = onError;
 
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [progress, setProgress] = useState<number | null>(null);
 
-  const urlKey = useMemo(() => String(fileUrl || '').trim(), [fileUrl]);
+  const urlKey = useMemo(() => resolveAssetUrl(String(fileUrl || '').trim()), [fileUrl]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -51,13 +81,19 @@ export default function ThreeDViewer({ fileUrl, className, onLoaded, onError }: 
     setError(null);
     setProgress(null);
 
+    const manager = new THREE.LoadingManager();
+    manager.onError = (u) => {
+      // eslint-disable-next-line no-console
+      console.error('[ThreeDViewer] LoadingManager.onError', u);
+    };
+
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x0b1220);
 
-    const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 1000);
+    const camera = new THREE.PerspectiveCamera(45, 1, 0.0001, 1_000_000);
     camera.position.set(0, 0.5, 3);
 
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: 'high-performance' });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -69,11 +105,9 @@ export default function ThreeDViewer({ fileUrl, className, onLoaded, onError }: 
 
     const ambient = new THREE.AmbientLight(0xffffff, 0.55);
     scene.add(ambient);
-
     const hemi = new THREE.HemisphereLight(0xffffff, 0x1f2937, 0.75);
     hemi.position.set(0, 1, 0);
     scene.add(hemi);
-
     const dir = new THREE.DirectionalLight(0xffffff, 0.7);
     dir.position.set(2, 3, 2);
     scene.add(dir);
@@ -82,8 +116,6 @@ export default function ThreeDViewer({ fileUrl, className, onLoaded, onError }: 
     controls.enableDamping = true;
     controls.dampingFactor = 0.08;
     controls.screenSpacePanning = true;
-    controls.minDistance = 0.1;
-    controls.maxDistance = 50;
 
     const resize = () => {
       const w = container.clientWidth || 1;
@@ -98,7 +130,7 @@ export default function ThreeDViewer({ fileUrl, className, onLoaded, onError }: 
     resize();
 
     let disposed = false;
-    const loader = new OBJLoader();
+    const loader = new OBJLoader(manager);
 
     const material = new THREE.MeshStandardMaterial({
       color: new THREE.Color('#e5e7eb'),
@@ -114,7 +146,6 @@ export default function ThreeDViewer({ fileUrl, className, onLoaded, onError }: 
 
     const applyMaterialAndOptimize = (obj: THREE.Object3D) => {
       let totalTriangles = 0;
-      let totalVertices = 0;
       const meshes: THREE.Mesh[] = [];
       obj.traverse((child) => {
         const mesh = child as THREE.Mesh;
@@ -124,11 +155,10 @@ export default function ThreeDViewer({ fileUrl, className, onLoaded, onError }: 
       for (const mesh of meshes) {
         const geom = (mesh as any).geometry as THREE.BufferGeometry | undefined;
         if (geom && geom.isBufferGeometry) {
-          // 缓冲区优化：法线 + 包围盒（为 fitCamera/缩放提供依据）
           try {
             geom.computeVertexNormals();
           } catch {
-            // ignore
+            // 非法面片时可能抛错
           }
           try {
             geom.computeBoundingBox();
@@ -136,97 +166,98 @@ export default function ThreeDViewer({ fileUrl, className, onLoaded, onError }: 
             // ignore
           }
           const pos = geom.getAttribute('position');
-          if (pos) totalVertices += pos.count || 0;
           if (geom.index) totalTriangles += Math.floor((geom.index.count || 0) / 3);
           else if (pos) totalTriangles += Math.floor((pos.count || 0) / 3);
         }
       }
 
-      // 工业模型坐标往往很大：对整个对象做一次“中心对齐”
+      // 仅对根对象整体居中，避免多 mesh 各自 geometry.center() 破坏装配关系
       try {
-        const box = new THREE.Box3().setFromObject(obj);
-        const center = box.getCenter(new THREE.Vector3());
-        obj.position.sub(center);
+        const b = new THREE.Box3().setFromObject(obj);
+        const c = b.getCenter(new THREE.Vector3());
+        obj.position.sub(c);
+        obj.updateMatrixWorld(true);
       } catch {
         // ignore
       }
 
-      // 面片过多时自动切点云渲染，避免拖拽卡顿
       const TRIANGLE_POINTS_FALLBACK = 1_500_000;
       const shouldUsePoints = totalTriangles >= TRIANGLE_POINTS_FALLBACK;
 
       obj.traverse((child) => {
         const mesh = child as THREE.Mesh;
         if (!(mesh as any).isMesh) return;
-
         const geom = (mesh as any).geometry as THREE.BufferGeometry | undefined;
-        if (geom && geom.isBufferGeometry) {
-          // 按要求强制调用 geometry.center()（点云/网格都受益）
-          try {
-            geom.center();
-          } catch {
-            // ignore
-          }
-        }
+        if (!geom || !geom.isBufferGeometry) return;
 
-        if (shouldUsePoints && geom && geom.isBufferGeometry) {
+        if (shouldUsePoints) {
           const pts = new THREE.Points(geom, pointsMaterial);
           pts.position.copy(mesh.position);
           pts.rotation.copy(mesh.rotation);
           pts.scale.copy(mesh.scale);
-          if (mesh.parent) mesh.parent.add(pts);
-          if (mesh.parent) mesh.parent.remove(mesh);
+          if (mesh.parent) {
+            mesh.parent.add(pts);
+            mesh.parent.remove(mesh);
+          }
           return;
         }
-
-        // 默认网格材质（关闭 wireframe）
         mesh.material = material;
         mesh.castShadow = false;
         mesh.receiveShadow = false;
       });
 
-      return { totalTriangles, totalVertices, usedPoints: shouldUsePoints };
+      return { usedPoints: shouldUsePoints };
     };
 
-    const applyMaterial = (obj: THREE.Object3D) => {
-      obj.traverse((child) => {
-        const mesh = child as THREE.Mesh;
-        if ((mesh as any).isMesh) {
-          mesh.material = material;
-          mesh.castShadow = false;
-          mesh.receiveShadow = false;
-        }
-      });
-    };
+    try {
+      loader.load(
+        urlKey,
+        (obj) => {
+          if (disposed) return;
+          try {
+            applyMaterialAndOptimize(obj);
+            scene.add(obj);
+            fitCameraToObject(camera, obj, controls);
 
-    loader.load(
-      urlKey,
-      (obj) => {
-        if (disposed) return;
-        applyMaterialAndOptimize(obj);
-        scene.add(obj);
-        fitCameraToObject(camera, obj, controls);
-        setReady(true);
-        onLoaded?.();
-      },
-      (evt) => {
-        if (disposed) return;
-        const loaded = Number((evt as any)?.loaded || 0);
-        const total = Number((evt as any)?.total || 0);
-        if (total > 0 && loaded >= 0) {
-          const p = Math.max(0, Math.min(100, Math.round((loaded / total) * 100)));
-          setProgress(p);
-        } else {
-          setProgress(null);
+            const metrics = extractLast3DMetrics(obj);
+            onMetricsRef.current?.(metrics);
+            setReady(true);
+            onLoadedRef.current?.();
+          } catch (e) {
+            // eslint-disable-next-line no-console
+            console.error('[ThreeDViewer] post-load / metrics failed', e);
+            const err = e instanceof Error ? e : new Error('模型后处理失败');
+            setError(err.message);
+            onErrorRef.current?.(err);
+          }
+        },
+        (evt) => {
+          if (disposed) return;
+          const loaded = Number((evt as any)?.loaded || 0);
+          const total = Number((evt as any)?.total || 0);
+          if (total > 0) {
+            const p = Math.max(0, Math.min(100, Math.round((loaded / total) * 100)));
+            setProgress(p);
+          } else {
+            setProgress(null);
+          }
+        },
+        (e) => {
+          if (disposed) return;
+          // eslint-disable-next-line no-console
+          console.error('[ThreeDViewer] OBJLoader error', e);
+          const err = e instanceof Error ? e : new Error((e as any)?.message || 'OBJ 加载失败');
+          setError(err.message);
+          onErrorRef.current?.(err);
         }
-      },
-      (e) => {
-        if (disposed) return;
-        const err = new Error(e?.message || 'OBJ 加载失败');
-        setError(err.message);
-        onError?.(err);
-      }
-    );
+      );
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error('[ThreeDViewer] loader.load throw', e);
+      const err = e instanceof Error ? e : new Error('OBJ 加载异常');
+      setError(err.message);
+      onErrorRef.current?.(err);
+    }
 
     const tick = () => {
       controls.update();
@@ -242,8 +273,7 @@ export default function ThreeDViewer({ fileUrl, className, onLoaded, onError }: 
       controls.dispose();
 
       scene.traverse((o) => {
-        const m = o as THREE.Mesh;
-        if ((m as any).isMesh || (o as any).isPoints) {
+        if ((o as any).isMesh || (o as any).isPoints) {
           const geom = (o as any).geometry as THREE.BufferGeometry | undefined;
           if (geom && typeof geom.dispose === 'function') geom.dispose();
         }
@@ -259,7 +289,7 @@ export default function ThreeDViewer({ fileUrl, className, onLoaded, onError }: 
       renderer.dispose();
       rendererRef.current = null;
     };
-  }, [urlKey, onLoaded, onError]);
+  }, [urlKey]);
 
   return (
     <div className={className} ref={containerRef}>
@@ -286,4 +316,3 @@ export default function ThreeDViewer({ fileUrl, className, onLoaded, onError }: 
     </div>
   );
 }
-

@@ -48,8 +48,21 @@ const envStat = (() => {
 const dotenvResult = dotenv.config({ path: ENV_PATH, debug: true });
 
 const app = express();
+/** 必须在其它路由与 body parser 之前：供 /storage 直出与 Three.js Range 拉取 */
+const STORAGE_ROOT = path.join(__dirname, 'storage');
 
 app.use(cors());
+app.use(
+  '/storage',
+  express.static(STORAGE_ROOT, {
+    etag: true,
+    maxAge: '1h',
+    setHeaders(res) {
+      res.setHeader('Accept-Ranges', 'bytes');
+      res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    },
+  })
+);
 // 17 表 DDL + 草稿 JSON 体积较大，放宽上限避免 413
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
@@ -67,7 +80,6 @@ function resolveProjectServerStorageDir() {
 const DRAFT_STORAGE_DIR = resolveProjectServerStorageDir();
 const SCHEMA_DRAFT_PATH = path.join(DRAFT_STORAGE_DIR, 'schema_draft.json');
 
-const STORAGE_ROOT = path.join(__dirname, 'storage');
 const DIRS = {
   dataTables: path.join(STORAGE_ROOT, 'data_tables'),
   lasts: path.join(STORAGE_ROOT, 'assets', 'lasts'),
@@ -77,20 +89,6 @@ const DIRS = {
 const MAPPING_CONFIG_PATH = path.join(STORAGE_ROOT, 'mapping_config.json');
 const FINAL_DASHBOARD_PATH = path.join(STORAGE_ROOT, 'final_dashboard_data.json');
 const FINAL_RESULTS_PATH = path.join(STORAGE_ROOT, 'final_results.json');
-
-// 静态资源：供前端 Three.js 等直接拉取 .obj / .stl（路径与 STORAGE_ROOT 对齐）
-app.use(
-  '/storage',
-  express.static(STORAGE_ROOT, {
-    etag: true,
-    maxAge: '1h',
-    setHeaders(res) {
-      // 大文件加载：显式声明支持 Range（send 默认支持，但这里确保前端/代理更稳定）
-      res.setHeader('Accept-Ranges', 'bytes');
-      res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-    },
-  })
-);
 
 /** 与 dataEngine 物理对账一致：去后缀 + trim + 小写 */
 const ASSET_3D_EXTS = ['.obj', '.stl', '.3dm'];
