@@ -258,6 +258,72 @@ function pickMappingArray(mappingConfig) {
   return null;
 }
 
+/**
+ * 无 mapping_config.json 时的内置映射（与生产 PDM 主表/维表一致），保证零配置部署可算全量 KPI。
+ * 主表：ods_pdm_pdm_product_info_df；款号 style_wms；状态 data_status；
+ * 楦：associated_last_type -> base_last.id -> code；底：associated_sole_info -> base_heel.id -> code。
+ */
+const DEFAULT_PRODUCT_MAIN = 'ods_pdm_pdm_product_info_df';
+
+const DEFAULT_MAPPING = [
+  {
+    standardKey: 'styleCode',
+    physicalColumn: 'style_wms',
+    sourceField: 'style_wms',
+    sourceTable: `${DEFAULT_PRODUCT_MAIN}.xlsx`,
+  },
+  {
+    standardKey: 'brand',
+    physicalColumn: 'brand_name',
+    sourceField: 'brand_name',
+    sourceTable: `${DEFAULT_PRODUCT_MAIN}.xlsx`,
+  },
+  {
+    standardKey: 'status',
+    physicalColumn: 'data_status',
+    sourceField: 'data_status',
+    sourceTable: `${DEFAULT_PRODUCT_MAIN}.xlsx`,
+  },
+  {
+    standardKey: 'lastCode',
+    joinPath: [
+      'ods_pdm_pdm_product_info_df.associated_last_type',
+      'ods_pdm_pdm_base_last_df.id',
+      'ods_pdm_pdm_base_last_df.code',
+    ],
+  },
+  {
+    standardKey: 'soleCode',
+    joinPath: [
+      'ods_pdm_pdm_product_info_df.associated_sole_info',
+      'ods_pdm_pdm_base_heel_df.id',
+      'ods_pdm_pdm_base_heel_df.code',
+    ],
+  },
+];
+
+function resolveMappingFromStorage(storageRoot) {
+  const mappingConfigPath = path.join(storageRoot, 'mapping_config.json');
+  const mappingConfig = safeJsonRead(mappingConfigPath);
+  const fromFile = pickMappingArray(mappingConfig);
+  const hasMappingFile = Boolean(fromFile?.length);
+  const mappingArr = hasMappingFile ? fromFile : DEFAULT_MAPPING;
+  return { mappingArr, hasMappingFile, usedDefaultMapping: !hasMappingFile, mappingConfigPath };
+}
+
+/** 与 index.js getLatestDataTablesDir 对齐：优先 module 侧 storage，其次 cwd 下 server/storage/data_tables */
+function resolveDataTablesRootForStorage(storageRoot) {
+  const fromStorage = path.join(storageRoot, 'data_tables');
+  const fromCwd = path.resolve(process.cwd(), 'server', 'storage', 'data_tables');
+  try {
+    if (fse.existsSync(fromStorage)) return fromStorage;
+    if (fse.existsSync(fromCwd)) return fromCwd;
+  } catch {
+    // ignore
+  }
+  return fromStorage;
+}
+
 function parseConcatPipeToken(physicalColumn) {
   const raw = String(physicalColumn || '');
   if (!raw.startsWith('CONCAT|')) return null;
@@ -898,6 +964,97 @@ function columnNameForMainRow(entry) {
   return normalize(entry.sourceField) || normalize(entry.physicalColumn);
 }
 
+const PRODUCT_MAIN_LOGICAL = 'ods_pdm_pdm_product_info_df';
+
+function addLogicalTableNameFromToken(raw, intoSet) {
+  const s = normalize(raw);
+  if (!s) return;
+  const logical = normalize(getLogicalTableName(s));
+  if (logical) intoSet.add(logical);
+}
+
+function collectReferencedLogicalTablesFromStandardMap(standardMap) {
+  const set = new Set();
+  addLogicalTableNameFromToken(PRODUCT_MAIN_LOGICAL, set);
+
+  const visitPart = (part) => {
+    if (!part || typeof part !== 'object') return;
+    addLogicalTableNameFromToken(part.sourceTable, set);
+    const jp = part.joinPath;
+    if (!Array.isArray(jp)) return;
+    for (const seg of jp) {
+      if (!seg || typeof seg !== 'object') continue;
+      addLogicalTableNameFromToken(seg.sourceTable, set);
+      addLogicalTableNameFromToken(seg.targetTable, set);
+    }
+  };
+
+  const visitEntry = (entry) => {
+    if (!entry) return;
+    if (entry.mode === 'concat' && Array.isArray(entry.parts)) {
+      for (const p of entry.parts) visitPart(p);
+      return;
+    }
+    addLogicalTableNameFromToken(entry.sourceTable, set);
+    visitPart({ joinPath: entry.joinPath });
+  };
+
+  for (const entry of standardMap?.values?.() || []) visitEntry(entry);
+  return set;
+}
+
+function applyMainColumnFallbacks(mainTable, cols) {
+  if (!mainTable?.headers?.length) return cols;
+  const h = new Set(mainTable.headers.map((x) => normalizeLower(String(x))));
+  const out = { ...cols };
+  if (!out.styleCol && h.has('style_wms')) out.styleCol = 'style_wms';
+  if (!out.brandCol && h.has('brand_name')) out.brandCol = 'brand_name';
+  if (!out.statusCol && h.has('data_status')) out.statusCol = 'data_status';
+  return out;
+}
+
+/**
+ * 仅加载 mapping 引用到的逻辑表对应 XLSX（+ 强制主表），避免扫 50k 行无关大表。
+ * 每个文件只打一行汇总日志。
+ */
+async function loadReferencedXlsxTablesForFolder(folderPath, standardMap, logPrefix = '[Excel]') {
+  const logicalSet =
+    standardMap && standardMap.size
+      ? collectReferencedLogicalTablesFromStandardMap(standardMap)
+      : new Set([PRODUCT_MAIN_LOGICAL]);
+
+  const mainL = normalizeLower(PRODUCT_MAIN_LOGICAL);
+  const orderedLogical = Array.from(logicalSet).sort((a, b) => {
+    const A = normalizeLower(a);
+    const B = normalizeLower(b);
+    if (A === mainL) return -1;
+    if (B === mainL) return 1;
+    return String(a).localeCompare(String(b));
+  });
+
+  const allNames = await listFiles(folderPath);
+  const xlsxNames = allNames.filter((n) => ['.xlsx', '.xls'].includes(path.extname(n).toLowerCase()));
+
+  const seenFile = new Set();
+  const xlsxTables = [];
+  for (const logical of orderedLogical) {
+    const want = normalizeLower(logical);
+    const hit =
+      xlsxNames.find((fn) => normalizeLower(getLogicalTableName(fn)) === want) ||
+      xlsxNames.find((fn) => normalizeLower(fn).includes(want)) ||
+      null;
+    if (!hit || seenFile.has(hit)) continue;
+    seenFile.add(hit);
+    const fullPath = path.join(folderPath, hit);
+    const { headers, rows, sheetRef, gridRowCount, sheetJsonLen } = readSheetRows(fullPath);
+    // eslint-disable-next-line no-console
+    console.log(`${logPrefix} loaded ${logical} <- ${hit} rows=${Array.isArray(rows) ? rows.length : 0}`);
+    xlsxTables.push({ fileName: hit, fullPath, headers, rows, sheetRef, gridRowCount, sheetJsonLen });
+  }
+
+  return { xlsxTables, tablesMap: buildTablesMap(xlsxTables) };
+}
+
 function readSheetRows(fullPath) {
   const wb = XLSX.readFile(fullPath, { cellText: false, cellDates: true });
   const sheetName = wb.SheetNames?.[0];
@@ -1509,14 +1666,10 @@ export async function loadExcelFolderAsTablesMap(folderPath) {
   }
   const xlsxTables = excelFiles.map((fileName) => {
     const fullPath = path.join(folderPath, fileName);
-    const { headers, rows, sheetRef } = readSheetRows(fullPath);
+    const { headers, rows, sheetRef, sheetJsonLen } = readSheetRows(fullPath);
     // eslint-disable-next-line no-console
-    console.log(`[Excel] 加载表: ${fileName}`);
-    // eslint-disable-next-line no-console
-    console.log(`[Excel] 识别到表头: ${(headers || []).slice(0, 5).join(', ')}...`);
-    // eslint-disable-next-line no-console
-    console.log(`[Excel] 数据行数: ${(rows || []).length} 行`);
-    return { fileName, fullPath, headers, rows, sheetRef };
+    console.log(`[Excel] loaded ${getLogicalTableName(fileName)} <- ${fileName} rows=${Array.isArray(rows) ? rows.length : 0}`);
+    return { fileName, fullPath, headers, rows, sheetRef, sheetJsonLen };
   });
   return { xlsxTables, tablesMap: buildTablesMap(xlsxTables) };
 }
@@ -1733,33 +1886,32 @@ export async function validateJoinPathSuggestionsWithGoldenXlsx({
 }
 
 async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, forceSyncLog = false }) {
-  const dataTablesDir = path.join(storageRoot, 'data_tables');
+  const dataTablesDir = resolveDataTablesRootForStorage(storageRoot);
   const dateDir = dateDirName ? path.join(dataTablesDir, dateDirName) : dataTablesDir;
 
   // eslint-disable-next-line no-console
   console.log('📁 [Critical] latestDir =', dateDir);
 
-  const excelFiles = (await listFiles(dateDir)).filter((n) => ['.xlsx', '.xls'].includes(path.extname(n).toLowerCase()));
-  const xlsxTables = excelFiles.map((fileName) => {
-    const fullPath = path.join(dateDir, fileName);
-    const { headers, rows, sheetRef, gridRowCount, sheetJsonLen } = readSheetRows(fullPath);
-    return { fileName, fullPath, headers, rows, sheetRef, gridRowCount, sheetJsonLen };
-  });
-  const tablesMap = buildTablesMap(xlsxTables);
+  const { xlsxTables, tablesMap } = await loadReferencedXlsxTablesForFolder(dateDir, standardMap, '[Engine][Excel]');
 
-  const styleCol = columnNameForMainRow(standardMap.get('styleCode'));
-  const brandCol = columnNameForMainRow(standardMap.get('brand'));
-  const statusCol =
+  let styleCol = columnNameForMainRow(standardMap.get('styleCode'));
+  let brandCol = columnNameForMainRow(standardMap.get('brand'));
+  let statusCol =
     columnNameForMainRow(standardMap.get('status')) || columnNameForMainRow(standardMap.get('data_status'));
   const lastCol = columnNameForMainRow(standardMap.get('lastCode'));
   const soleCol = columnNameForMainRow(standardMap.get('soleCode'));
   const colorCol = columnNameForMainRow(standardMap.get('colorCode'));
   const materialCol = columnNameForMainRow(standardMap.get('materialCode'));
 
-  const required = [styleCol, brandCol, statusCol].filter(Boolean);
   // 生产看板强制主表：ods_pdm_pdm_product_info_df（逻辑名）
   const forcedMain =
-    xlsxTables.find((t) => normalizeLower(getLogicalTableName(t.fileName)) === 'ods_pdm_pdm_product_info_df') || null;
+    xlsxTables.find((t) => normalizeLower(getLogicalTableName(t.fileName)) === normalizeLower(PRODUCT_MAIN_LOGICAL)) || null;
+  const fb = applyMainColumnFallbacks(forcedMain, { styleCol, brandCol, statusCol });
+  styleCol = fb.styleCol;
+  brandCol = fb.brandCol;
+  statusCol = fb.statusCol;
+
+  const required = [styleCol, brandCol, statusCol].filter(Boolean);
   let main = forcedMain || (required.length ? guessStyleMainTable(xlsxTables, required) : null);
 
   if (main) {
@@ -1769,31 +1921,6 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
     console.log('📊 [Critical] 该文件实际物理行数 (含表头):', main.sheetRef || '(unknown !ref)');
     // eslint-disable-next-line no-console
     console.log('📊 [Critical] sheet_to_json(sheet).length =', Number(main.sheetJsonLen || 0));
-
-    const maxByLen = (xlsxTables || [])
-      .map((t) => ({ t, n: Number(t?.sheetJsonLen || 0) }))
-      .sort((a, b) => b.n - a.n)[0];
-    if (maxByLen?.t && maxByLen.n > 0 && Number(main.sheetJsonLen || 0) !== maxByLen.n) {
-      // eslint-disable-next-line no-console
-      console.warn(
-        `[Critical] 主表行数(${Number(main.sheetJsonLen || 0)}) != 同目录最大行数(${maxByLen.n})，将扫描并在必要时切换到最大表`
-      );
-      // eslint-disable-next-line no-console
-      for (const t of xlsxTables) {
-        console.log(`- [RowCount] ${t.fileName}: sheet_to_json.len=${Number(t.sheetJsonLen || 0)} !ref=${t.sheetRef || '(n/a)'}`);
-      }
-      if (maxByLen.n >= 5600 && Number(main.sheetJsonLen || 0) < 5600) {
-        main = maxByLen.t;
-        // eslint-disable-next-line no-console
-        console.log('✅ [Critical] 已切换主表为行数最多文件:', main.fileName);
-        // eslint-disable-next-line no-console
-        console.log('📂 [Critical] 当前正在读取的主文件路径:', main.fullPath);
-        // eslint-disable-next-line no-console
-        console.log('📊 [Critical] 该文件实际物理行数 (含表头):', main.sheetRef || '(unknown !ref)');
-        // eslint-disable-next-line no-console
-        console.log('📊 [Critical] sheet_to_json(sheet).length =', Number(main.sheetJsonLen || 0));
-      }
-    }
   }
 
   if (!main) {
@@ -2277,16 +2404,21 @@ export async function processAllData({ storageRoot }) {
     : 0;
 
   // 趋势：遍历所有日期目录，生成按日时间序列（从远到近；effective 口径累计）
-  const dataTablesDir = path.join(storageRoot, 'data_tables');
-  const mappingConfigPath = path.join(storageRoot, 'mapping_config.json');
-  const mappingConfig = safeJsonRead(mappingConfigPath);
-  const mappingArr = pickMappingArray(mappingConfig);
+  const dataTablesDir = resolveDataTablesRootForStorage(storageRoot);
+  const { mappingArr } = resolveMappingFromStorage(storageRoot);
   const standardMap = buildStandardMap(mappingArr || []);
   const allDateDirs = await getDateDirsByNameSorted(dataTablesDir); // asc
+  const aggByDate = new Map();
+  if (agg?.dates?.latest) aggByDate.set(String(agg.dates.latest), latest);
+  if (agg?.dates?.prev && prev) aggByDate.set(String(agg.dates.prev), prev);
   const trendHistory = [];
   for (const d of allDateDirs) {
     try {
-      const one = await aggregateForDateRoot({ storageRoot, dateDirName: d, standardMap });
+      let one = aggByDate.get(String(d));
+      if (!one) {
+        one = await aggregateForDateRoot({ storageRoot, dateDirName: d, standardMap });
+        aggByDate.set(String(d), one);
+      }
       const eff = one?.statusBuckets?.effective?.kpis || {};
       const tot = one?.statusBuckets?.total?.kpis?.statusDist || null;
       trendHistory.push({
@@ -2447,7 +2579,7 @@ export async function resolveFirstActiveRowFromFolder({
   targetStyle = '',
   masterTableLogicalName = '',
 }) {
-  const { xlsxTables, tablesMap } = preload ?? (await readAllFilesFromFolder(folderPath));
+  const { xlsxTables, tablesMap } = preload ?? (await loadReferencedXlsxTablesForFolder(folderPath, standardMap, '[Sandbox][Excel]'));
   if (!xlsxTables?.length) {
     return { ok: false, error: 'sandbox 目录下没有 XLSX 文件', row: null, mainTable: null };
   }
@@ -2462,29 +2594,33 @@ export async function resolveFirstActiveRowFromFolder({
     return false;
   };
 
-  // 唯一合法锚定列：style_wms（禁止推断/暴力全列搜）
-  const styleCol = 'style_wms';
-  const brandCol = columnNameForMainRow(standardMap.get('brand'));
-  const statusCol =
-    columnNameForMainRow(standardMap.get('status')) || columnNameForMainRow(standardMap.get('data_status'));
-  const lastCol = columnNameForMainRow(standardMap.get('lastCode'));
-  const soleCol = columnNameForMainRow(standardMap.get('soleCode'));
-  const colorCol = columnNameForMainRow(standardMap.get('colorCode'));
-  const materialCol = columnNameForMainRow(standardMap.get('materialCode'));
-
-  // 唯一合法主表：ods_pdm_pdm_product_info_df（禁止按表头/全表猜）
-  const MAIN_LOGICAL = 'ods_pdm_pdm_product_info_df';
   // eslint-disable-next-line no-console
-  console.log('📁 [Critical] latestDir =', dateDir);
+  console.log('📁 [Critical] folder =', folderPath);
 
   let main =
-    xlsxTables.find((t) => normalize(getLogicalTableName(t?.fileName || '')) === MAIN_LOGICAL) ||
+    xlsxTables.find((t) => normalizeLower(getLogicalTableName(t?.fileName || '')) === normalizeLower(PRODUCT_MAIN_LOGICAL)) ||
     (masterTableLogicalName
-      ? xlsxTables.find((t) => normalize(getLogicalTableName(t?.fileName || '')) === normalize(masterTableLogicalName)) || null
+      ? xlsxTables.find(
+          (t) => normalizeLower(getLogicalTableName(t?.fileName || '')) === normalizeLower(masterTableLogicalName)
+        ) || null
       : null);
   if (!main) {
     return { ok: false, error: '无法识别主表（必须存在 ods_pdm_pdm_product_info_df.xlsx）', row: null, mainTable: null };
   }
+
+  let styleCol = columnNameForMainRow(standardMap.get('styleCode'));
+  let brandCol = columnNameForMainRow(standardMap.get('brand'));
+  let statusCol =
+    columnNameForMainRow(standardMap.get('status')) || columnNameForMainRow(standardMap.get('data_status'));
+  const fbCols = applyMainColumnFallbacks(main, { styleCol, brandCol, statusCol });
+  styleCol = fbCols.styleCol;
+  brandCol = fbCols.brandCol;
+  statusCol = fbCols.statusCol;
+
+  const lastCol = columnNameForMainRow(standardMap.get('lastCode'));
+  const soleCol = columnNameForMainRow(standardMap.get('soleCode'));
+  const colorCol = columnNameForMainRow(standardMap.get('colorCode'));
+  const materialCol = columnNameForMainRow(standardMap.get('materialCode'));
 
   // 物理对账自查：打印绝对路径与 !ref（含表头）
   // eslint-disable-next-line no-console
@@ -2494,39 +2630,12 @@ export async function resolveFirstActiveRowFromFolder({
   // eslint-disable-next-line no-console
   console.log('📊 [Critical] sheet_to_json(sheet).length =', Number(main.sheetJsonLen || 0));
 
-  // 若行数明显不对：扫描同目录下所有表，找出“行数最多”的候选（用于纠偏）
-  const maxByLen = (xlsxTables || [])
-    .map((t) => ({ t, n: Number(t?.sheetJsonLen || 0) }))
-    .sort((a, b) => b.n - a.n)[0];
-  if (maxByLen?.t && maxByLen.n > 0 && Number(main.sheetJsonLen || 0) < maxByLen.n) {
-    // eslint-disable-next-line no-console
-    console.warn(
-      `[Critical] 主表行数(${Number(main.sheetJsonLen || 0)}) < 同目录最大行数(${maxByLen.n})，将输出候选列表并尝试锁定最大表`
-    );
-    // eslint-disable-next-line no-console
-    for (const t of xlsxTables) {
-      console.log(`- [RowCount] ${t.fileName}: sheet_to_json.len=${Number(t.sheetJsonLen || 0)} !ref=${t.sheetRef || '(n/a)'}`);
-    }
-    // 若最大表接近 5824（阈值 5600+），强制锁定为 main（防止读错快照/文件）
-    if (maxByLen.n >= 5600) {
-      main = maxByLen.t;
-      // eslint-disable-next-line no-console
-      console.log('✅ [Critical] 已切换主表为行数最多文件:', main.fileName);
-      // eslint-disable-next-line no-console
-      console.log('📂 [Critical] 当前正在读取的主文件路径:', main.fullPath);
-      // eslint-disable-next-line no-console
-      console.log('📊 [Critical] 该文件实际物理行数 (含表头):', main.sheetRef || '(unknown !ref)');
-      // eslint-disable-next-line no-console
-      console.log('📊 [Critical] sheet_to_json(sheet).length =', Number(main.sheetJsonLen || 0));
-    }
-  }
-
   const mainTableName = buildTableNameIndex(main.fileName);
   // 强制对账：逻辑表名 -> 物理文件路径
   // eslint-disable-next-line no-console
   console.log('[Debug] 正在查找逻辑表:', mainTableName, '对应的物理文件是:', main.fullPath || main.fileName);
   const diagnosticsMap = previewStrict ? new Map() : null;
-  let effectiveStyleCol = styleCol;
+  const effectiveStyleCol = styleCol;
   const findColumnContainingTarget = (row, target) => {
     if (!row || !target) return '';
     for (const [k, v] of Object.entries(row)) {
@@ -2712,12 +2821,10 @@ export async function resolveFirstActiveRowFromFolder({
 }
 
 export async function aggregateProjectData({ storageRoot }) {
-  const mappingConfigPath = path.join(storageRoot, 'mapping_config.json');
-  const mappingConfig = safeJsonRead(mappingConfigPath);
-  const mappingArr = pickMappingArray(mappingConfig);
+  const { mappingArr, hasMappingFile, usedDefaultMapping, mappingConfigPath } = resolveMappingFromStorage(storageRoot);
   const standardMap = buildStandardMap(mappingArr || []);
 
-  const dataTablesDir = path.join(storageRoot, 'data_tables');
+  const dataTablesDir = resolveDataTablesRootForStorage(storageRoot);
   // 多版本识别：按日期目录名倒序
   const dateDirs = await getDateDirsByNameDesc(dataTablesDir);
   const latest = dateDirs.length ? dateDirs[0] : '';
@@ -2734,7 +2841,8 @@ export async function aggregateProjectData({ storageRoot }) {
   return {
     dates: { latest, prev },
     mapping: {
-      hasConfig: Boolean(mappingArr && mappingArr.length),
+      hasConfig: Boolean(hasMappingFile && mappingArr?.length),
+      usedDefaultMapping: Boolean(usedDefaultMapping),
       configPath: mappingConfigPath,
     },
     latest: latestAgg,
@@ -2752,18 +2860,16 @@ export async function aggregateProjectData({ storageRoot }) {
  * 会在遍历生效款时打印 ForceSync 进度日志。
  */
 export async function forceSyncLatestProduction({ storageRoot }) {
-  const mappingConfigPath = path.join(storageRoot, 'mapping_config.json');
-  const mappingConfig = safeJsonRead(mappingConfigPath);
-  const mappingArr = pickMappingArray(mappingConfig);
+  const { mappingArr, hasMappingFile, usedDefaultMapping, mappingConfigPath } = resolveMappingFromStorage(storageRoot);
   const standardMap = buildStandardMap(mappingArr || []);
 
-  const dataTablesDir = path.join(storageRoot, 'data_tables');
+  const dataTablesDir = resolveDataTablesRootForStorage(storageRoot);
   const dateDirs = await getDateDirsByNameDesc(dataTablesDir);
   const latest = dateDirs.length ? dateDirs[0] : '';
   const latestAgg = await aggregateForDateRoot({ storageRoot, dateDirName: latest, standardMap, forceSyncLog: true });
   return {
     dates: { latest, prev: dateDirs.length >= 2 ? dateDirs[1] : '' },
-    mapping: { hasConfig: Boolean(mappingArr && mappingArr.length), configPath: mappingConfigPath },
+    mapping: { hasConfig: Boolean(hasMappingFile && mappingArr?.length), usedDefaultMapping: Boolean(usedDefaultMapping), configPath: mappingConfigPath },
     latest: latestAgg,
   };
 }

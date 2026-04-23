@@ -534,7 +534,12 @@ export default function Dashboard() {
         </div>
       </div>
 
-      {!isLoading && stats && (!stats.mapping?.hasConfig || !stats.meta?.mainTable) && (
+      {!isLoading &&
+        stats &&
+        (!stats.meta?.mainTable ||
+          (!stats.mapping?.hasConfig &&
+            !stats.mapping?.usedDefaultMapping &&
+            Number(stats.kpis?.lastCodeLinkRate ?? 0) <= 0)) && (
         <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 text-sm text-amber-800 flex items-start gap-3">
           <AlertCircle className="w-5 h-5 mt-0.5" />
           <div className="min-w-0">

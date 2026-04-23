@@ -93,10 +93,18 @@ const SCHEMA_DRAFT_PATH = path.join(DRAFT_STORAGE_DIR, 'schema_draft.json');
 
 const DIRS = {
   dataTables: path.join(STORAGE_ROOT, 'data_tables'),
+  /** 与仓库根起算的 server/storage/data_tables，部署 cwd 在仓根时与 dataTables 对齐 */
+  dataTablesFromCwd: path.resolve(process.cwd(), 'server', 'storage', 'data_tables'),
   lasts: path.join(STORAGE_ROOT, 'assets', 'lasts'),
   soles: path.join(STORAGE_ROOT, 'assets', 'soles'),
   sandbox: path.join(STORAGE_ROOT, 'sandbox'),
 };
+
+function getResolvedDataTablesRoot() {
+  if (fse.existsSync(DIRS.dataTablesFromCwd)) return DIRS.dataTablesFromCwd;
+  if (fse.existsSync(DIRS.dataTables)) return DIRS.dataTables;
+  return DIRS.dataTablesFromCwd;
+}
 const MAPPING_CONFIG_PATH = path.join(STORAGE_ROOT, 'mapping_config.json');
 const FINAL_DASHBOARD_PATH = path.join(STORAGE_ROOT, 'final_dashboard_data.json');
 const FINAL_RESULTS_PATH = path.join(STORAGE_ROOT, 'final_results.json');
@@ -894,20 +902,22 @@ function isDateDirName(name) {
 
 async function getLatestDataTablesDir() {
   await ensureStorageDirs();
-  const entries = await fse.readdir(DIRS.dataTables, { withFileTypes: true });
+  const root = getResolvedDataTablesRoot();
+  if (!(await fse.pathExists(root))) return root;
+  const entries = await fse.readdir(root, { withFileTypes: true });
   const dirs = entries.filter((e) => e.isDirectory()).map((e) => e.name);
-  if (!dirs.length) return DIRS.dataTables;
+  if (!dirs.length) return root;
   let best = { name: dirs[0], mtimeMs: 0 };
   for (const name of dirs) {
     try {
-      const st = await fse.stat(path.join(DIRS.dataTables, name));
+      const st = await fse.stat(path.join(root, name));
       const m = st.mtimeMs || 0;
       if (m >= best.mtimeMs) best = { name, mtimeMs: m };
     } catch {
       // ignore
     }
   }
-  return path.join(DIRS.dataTables, best.name);
+  return path.join(root, best.name);
 }
 
 function isExcelFileName(name) {
@@ -3956,6 +3966,20 @@ async function start() {
     // ignore
   }
   await refreshAssetsCache();
+
+  // 零配置：启动即全量重算并落盘，首次打开看板即可命中 KPI（无需先点映射/重算）
+  try {
+    const payload = await processAllData({ storageRoot: STORAGE_ROOT });
+    await persistFinalDashboardData(STORAGE_ROOT, payload);
+    // eslint-disable-next-line no-console
+    console.log(
+      '[Startup] dashboard snapshot warmed:',
+      path.relative(process.cwd(), FINAL_DASHBOARD_PATH) || FINAL_DASHBOARD_PATH
+    );
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.warn('[Startup] dashboard warm failed:', e instanceof Error ? e.message : e);
+  }
 
   const port = 3001;
   // 强制释放端口并自检（best-effort；仅本地开发使用）
