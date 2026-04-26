@@ -1,4 +1,4 @@
-export type MandatoryDataFileRole = 'core-main' | 'last-relation' | 'sole-relation';
+export type MandatoryDataFileRole = 'core-main' | 'last-relation' | 'sole-relation' | 'brand-master';
 
 export type MandatoryDataFile = {
   role: MandatoryDataFileRole;
@@ -35,5 +35,13 @@ export const MANDATORY_DATA_FILES: MandatoryDataFile[] = [
     expectedFileName: 'ods_pdm_pdm_base_heel_df.xlsx',
     title: '大底关系表',
     description: '将主表的 Sole ID 换算为可匹配 3D 文件的 Sole Code。',
+  },
+  {
+    role: 'brand-master',
+    requiredLabel: '必填 D',
+    tableName: 'ods_wms_base_brand_df',
+    expectedFileName: 'ods_wms_base_brand_df.xlsx',
+    title: '品牌库',
+    description: '将主表的品牌 ID 换算为真实品牌名称（如 Bruno Marc、DREAM PAIRS）。',
   },
 ];

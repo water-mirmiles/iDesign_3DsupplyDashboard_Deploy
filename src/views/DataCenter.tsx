@@ -390,7 +390,7 @@ export default function DataCenter() {
               </button>
             </div>
 
-            <div className="mt-4 grid grid-cols-1 gap-3 lg:grid-cols-3">
+            <div className="mt-4 grid grid-cols-1 gap-3 lg:grid-cols-4">
               {MANDATORY_DATA_FILES.map((file) => {
                 const status = mandatoryReadyByTable.get(file.tableName);
                 const isReady = Boolean(status?.ready);

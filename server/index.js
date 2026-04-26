@@ -930,6 +930,7 @@ const MANDATORY_DATA_TABLES = [
   'ods_pdm_pdm_product_info_df',
   'ods_pdm_pdm_base_last_df',
   'ods_pdm_pdm_base_heel_df',
+  'ods_wms_base_brand_df',
 ];
 
 async function getLatestDateDataTablesDir() {
@@ -3628,6 +3629,7 @@ app.get('/api/dashboard-stats', async (req, res) => {
         mapping: payload.mapping,
         meta: payload.meta,
         kpis: payload.kpis,
+        inventoryRows: Array.isArray(payload.inventory) ? payload.inventory.length : 0,
         statusBuckets: payload.statusBuckets || {},
         inventory: payload.inventory || [],
         brandCoverage: payload.brandCoverage || [],
@@ -3649,6 +3651,7 @@ app.get('/api/dashboard-stats', async (req, res) => {
       mapping: snap.mapping,
       meta: snap.meta,
       kpis: snap.kpis,
+      inventoryRows: Array.isArray(snap.inventory) ? snap.inventory.length : 0,
       statusBuckets: snap.statusBuckets || {},
       inventory: snap.inventory || [],
       brandCoverage: snap.brandCoverage || [],

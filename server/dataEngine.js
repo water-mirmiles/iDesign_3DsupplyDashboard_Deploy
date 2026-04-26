@@ -25,7 +25,10 @@ const MANDATORY_DATA_TABLE_MATCHERS = [
   { tableName: 'ods_pdm_pdm_product_info_df', keywords: ['product_info'] },
   { tableName: 'ods_pdm_pdm_base_last_df', keywords: ['base_last'] },
   { tableName: 'ods_pdm_pdm_base_heel_df', keywords: ['base_heel'] },
+  { tableName: 'ods_wms_base_brand_df', keywords: ['base_brand'] },
 ];
+
+const MANDATORY_DATA_TABLE_NAMES = MANDATORY_DATA_TABLE_MATCHERS.map((it) => it.tableName);
 
 export function matchesMandatoryDataTableFileName(fileName, tableName) {
   const ext = path.extname(String(fileName || '')).toLowerCase();
@@ -61,6 +64,16 @@ function buildScalarIndexForTableField(tbl, fieldName) {
   return m;
 }
 
+function appendModelingDebugLog(storageRoot, line) {
+  try {
+    const p = path.join(storageRoot, 'modeling_debug.log');
+    const ts = new Date().toISOString();
+    fs.appendFileSync(p, `[${ts}] ${line}\n`, 'utf8');
+  } catch {
+    // debug log must never block aggregation
+  }
+}
+
 function findTableByNameKeywords(tablesMap, keywords) {
   const wants = (Array.isArray(keywords) ? keywords : [keywords]).map((k) => normalizeLower(k)).filter(Boolean);
   if (!wants.length || !(tablesMap instanceof Map)) return null;
@@ -86,6 +99,46 @@ function buildIdToCodeIndex(tbl) {
     if (!idx.has(k)) idx.set(k, code);
   }
   return idx;
+}
+
+function buildIdToBrandNameIndex(tbl) {
+  if (!tbl?.rows?.length) return null;
+  const idx = new Map();
+  for (const r of tbl.rows) {
+    const idv = getRowFieldLoose(r, 'id', tbl.headers);
+    const namev = getRowFieldLoose(r, 'brand_name', tbl.headers);
+    const k = normalizeJoinIdKey(idv);
+    const name = namev == null ? '' : normalize(namev);
+    if (!k || !name) continue;
+    if (!idx.has(k)) idx.set(k, name);
+  }
+  return idx;
+}
+
+function loadLatestMandatoryTableFromDataTablesRoot(dataTablesDir, tableName) {
+  try {
+    if (!fse.pathExistsSync(dataTablesDir)) return null;
+    const dirs = fs
+      .readdirSync(dataTablesDir, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && isDateDirName(e.name))
+      .map((e) => e.name)
+      .sort((a, b) => b.localeCompare(a));
+    for (const dirName of dirs) {
+      const dirAbs = path.join(dataTablesDir, dirName);
+      const files = fs
+        .readdirSync(dirAbs, { withFileTypes: true })
+        .filter((e) => e.isFile())
+        .map((e) => e.name);
+      const hit = files.find((name) => matchesMandatoryDataTableFileName(name, tableName));
+      if (!hit) continue;
+      const fullPath = path.join(dirAbs, hit);
+      const { headers, rows, sheetRef, gridRowCount, sheetJsonLen } = readSheetRows(fullPath);
+      return { fileName: hit, fullPath, headers, rows, sheetRef, gridRowCount, sheetJsonLen, snapshotDate: dirName };
+    }
+  } catch {
+    // ignore optional dimension lookup failure
+  }
+  return null;
 }
 
 function normalizeJoinIdKey(v) {
@@ -1059,6 +1112,9 @@ async function loadReferencedXlsxTablesForFolder(folderPath, standardMap, logPre
     standardMap && standardMap.size
       ? collectReferencedLogicalTablesFromStandardMap(standardMap)
       : new Set([PRODUCT_MAIN_LOGICAL]);
+  for (const tableName of MANDATORY_DATA_TABLE_NAMES) {
+    logicalSet.add(tableName);
+  }
 
   const mainL = normalizeLower(PRODUCT_MAIN_LOGICAL);
   const orderedLogical = Array.from(logicalSet).sort((a, b) => {
@@ -1197,7 +1253,7 @@ function readSheetRows(fullPath) {
     };
     rows = (Array.isArray(rows) ? rows : []).map((r) => {
       const out = {};
-      for (const [k, v] of Object.entries(r || {})) out[String(k)] = normalizeCellForRow(v);
+      for (const [k, v] of Object.entries(r || {})) out[normHeader(k)] = normalizeCellForRow(v);
       return out;
     });
     return { headers, rows, sheetRef, gridRowCount, sheetJsonLen };
@@ -1255,7 +1311,7 @@ function readSheetRows(fullPath) {
 
   rows = (Array.isArray(rows) ? rows : []).map((r) => {
     const out = {};
-    for (const [k, v] of Object.entries(r || {})) out[String(k)] = normalizeCellForRow(v);
+    for (const [k, v] of Object.entries(r || {})) out[normHeader(k)] = normalizeCellForRow(v);
     return out;
   });
 
@@ -2047,6 +2103,19 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
   if (!forcedSoleTbl || !forcedSoleIndex) {
     traceDim(`大底维表未加载/无法建索引：期望 base_heel_df；实际 soleTbl=${forcedSoleTbl?.fileName || '(null)'}`);
   }
+
+  const forcedBrandTbl =
+    getTableFromMap('ods_wms_base_brand_df', tablesMap) ||
+    findTableByNameKeywords(tablesMap, ['base_brand_df', 'wms_base_brand_df']) ||
+    loadLatestMandatoryTableFromDataTablesRoot(dataTablesDir, 'ods_wms_base_brand_df');
+  const forcedBrandIndex = buildIdToBrandNameIndex(forcedBrandTbl);
+  if (!forcedBrandTbl || !forcedBrandIndex) {
+    appendModelingDebugLog(
+      storageRoot,
+      `品牌维表未加载/无法建索引：期望 ods_wms_base_brand_df；实际 brandTbl=${forcedBrandTbl?.fileName || '(null)'}`
+    );
+  }
+
   // Join 性能优化：为常见维表构建 (table,targetField) -> Map<key,row> 的 O(1) 索引
   const joinIndexes = new Map();
   for (const entry of [standardMap.get('brand'), standardMap.get('lastCode'), standardMap.get('soleCode')].filter(Boolean)) {
@@ -2124,6 +2193,8 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
   let sole3DMatchedCount = 0;
   let activeSeen = 0;
   let matchSamplePrinted = 0;
+  let soleTracePrinted = 0;
+  let brandFallbackPrinted = 0;
   const unrecognizedStatusSamples = [];
   for (let i = 0; i < main.rows.length; i++) {
     const row = main.rows[i] || {};
@@ -2145,9 +2216,6 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
     }
     const invStatus = normalizeInventoryStatus(rawStatusVal);
     statusDist[invStatus] += 1;
-
-    // inventory（入库款号行）仍只统计有 style_wms 的行
-    if (!styleVal) continue;
 
     const lastResolved = (() => {
       // 强制路径：优先直接取 associated_last_type；若列名在生产快照中变体，则自动探测 FK 列
@@ -2193,6 +2261,13 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
       }
       const fkRaw = String(fk ?? '').trim();
       const fkKey = normalizeJoinIdKey(fk);
+      if (soleTracePrinted < 3) {
+        const probe = fkKey || fkRaw || '(空)';
+        const code = fkKey && forcedSoleIndex ? forcedSoleIndex.get(fkKey) : '';
+        soleTracePrinted += 1;
+        // eslint-disable-next-line no-console
+        console.log(`[Sole-Trace] 正在尝试 Join: 主表ID(${probe}) -> 维表ID(${probe}) => ${code || '(未命中)'}`);
+      }
       if (!fkKey && (fkRaw === '' || fkRaw === '0')) {
         traceDim(`大底空值容错：style=${styleUpper} associated_sole_info=${fkRaw === '' ? '(空)' : '0'}`);
       }
@@ -2257,8 +2332,18 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
     const has3DAny = has3DLast || has3DSole;
 
     const brandVal = (() => {
+      const rawBrand = getRowFieldLoose(row, 'brand', main.headers);
+      const rawBrandId = normalizeJoinIdKey(rawBrand);
+      if (rawBrandId && forcedBrandIndex) {
+        const name = forcedBrandIndex.get(rawBrandId);
+        if (name) return name;
+        if (brandFallbackPrinted < 50) {
+          brandFallbackPrinted += 1;
+          appendModelingDebugLog(storageRoot, `品牌 Join 未命中：main.brand=${rawBrandId}，保留原始 ID。`);
+        }
+      }
       const mapped = resolveFast(standardMap.get('brand'), row, brandCol);
-      if (mapped) return mapped;
+      if (mapped && !/^\d+$/.test(String(mapped).trim())) return mapped;
       for (const cand of [brandCol, 'brand_name', 'brand', 'brand_code', 'brand_id']) {
         const v = getRowFieldLoose(row, cand, main.headers);
         const s = normalize(v);
@@ -2581,7 +2666,9 @@ export async function processAllData({ storageRoot }) {
 
 export async function persistFinalDashboardData(storageRoot, payload) {
   const outPath = path.join(storageRoot, 'final_dashboard_data.json');
+  const finalResultsPath = path.join(storageRoot, 'final_results.json');
   await fse.writeJson(outPath, payload, { spaces: 2 });
+  await fse.writeJson(finalResultsPath, payload, { spaces: 2 });
   return outPath;
 }
 
