@@ -242,6 +242,14 @@ export default function Dashboard() {
     [selectedLevelSummary, selectedStatusSummary]
   );
 
+  const handleToggleAllStatuses = useCallback(() => {
+    setSelectedStatuses(allStatusesSelected ? [] : statusOptions);
+  }, [allStatusesSelected, statusOptions]);
+
+  const handleToggleAllLevels = useCallback(() => {
+    setSelectedLevels(allLevelsSelected ? [] : levelOptions);
+  }, [allLevelsSelected, levelOptions]);
+
   useEffect(() => {
     if (!stats || filtersInitialized) return;
     setSelectedStatuses(statusOptions.includes('active') ? ['active'] : statusOptions);
@@ -608,7 +616,7 @@ export default function Dashboard() {
               <div className="flex flex-wrap items-center gap-2">
                 <button
                   type="button"
-                  onClick={() => setSelectedStatuses(statusOptions)}
+                  onClick={handleToggleAllStatuses}
                   className={cn(
                     'inline-flex items-center rounded-lg border px-3 py-2 text-sm font-medium transition-colors',
                     allStatusesSelected ? 'border-blue-600 bg-blue-600 text-white shadow-sm' : 'border-slate-200 bg-slate-50 text-slate-700 hover:bg-white'
@@ -644,7 +652,7 @@ export default function Dashboard() {
               <div className="flex min-w-0 flex-wrap items-center gap-2">
                 <button
                   type="button"
-                  onClick={() => setSelectedLevels(levelOptions)}
+                  onClick={handleToggleAllLevels}
                   className={cn(
                     'rounded-lg border px-3 py-2 text-sm font-semibold transition-colors',
                     allLevelsSelected ? 'border-blue-600 bg-blue-600 text-white shadow-sm' : 'border-slate-200 bg-slate-50 text-slate-700 hover:bg-white'
@@ -774,8 +782,11 @@ export default function Dashboard() {
               <span className="text-3xl font-bold text-slate-900">{(tabStyleTotalCount || 0).toLocaleString()}</span>
               {getTrendBadge(stats?.kpis?.deltaTotalPoolStyles)}
             </div>
-            <div className="mt-1 max-w-full truncate text-xs text-slate-500" title={criteriaText}>
-              <span className="shrink-0">当前统计口径：</span>
+            <div
+              className="mt-1 block max-w-[220px] overflow-hidden text-ellipsis whitespace-nowrap text-xs text-slate-500"
+              title={criteriaText}
+            >
+              <span>当前统计口径：</span>
               <span className="font-medium text-slate-700">{criteriaText.replace(/^当前统计口径：/, '')}</span>
             </div>
           </div>
