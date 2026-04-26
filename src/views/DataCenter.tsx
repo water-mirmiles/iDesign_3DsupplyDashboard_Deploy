@@ -35,6 +35,16 @@ type MandatoryFilesResponse = {
   }>;
 };
 
+function getCurrentUsername() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem('currentUser') || 'null');
+    if (parsed?.username) return String(parsed.username).trim();
+  } catch {
+    // ignore
+  }
+  return localStorage.getItem('username') || 'System';
+}
+
 function formatBytes(bytes: number) {
   const units = ['B', 'KB', 'MB', 'GB'];
   let v = bytes;
@@ -93,6 +103,7 @@ export default function DataCenter() {
           size: number;
           uploadTime: string;
           snapshotDate?: string;
+          operator?: string;
           category: 'xlsx' | '3d_lasts' | '3d_soles' | 'unknown';
         }>;
       };
@@ -105,7 +116,7 @@ export default function DataCenter() {
         status: 'success',
         uploadTime: it.uploadTime,
         snapshotDate: it.snapshotDate,
-        operator: 'Storage',
+        operator: it.operator || 'System',
         targetTable: it.category === 'xlsx' ? '数据表文件' : it.category === '3d_soles' ? '3D 大底库' : '3D 楦头库',
       }));
       setHistory(mapped);
@@ -226,6 +237,7 @@ export default function DataCenter() {
     return new Promise<void>((resolve, reject) => {
       const form = new FormData();
       form.append('files', file);
+      form.append('username', getCurrentUsername());
 
       const xhr = new XMLHttpRequest();
       xhr.open('POST', '/api/upload', true);
@@ -250,7 +262,11 @@ export default function DataCenter() {
   /** 上传后强制重算看板并落盘，避免仍读未含新 3D 文件的旧快照 */
   const triggerDashboardPhysicalSync = async () => {
     try {
-      const resp = await fetch('/api/force-sync-dashboard', { method: 'POST' });
+      const resp = await fetch('/api/force-sync-dashboard', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: getCurrentUsername() }),
+      });
       const json = (await resp.json().catch(() => null)) as { ok?: boolean; error?: string } | null;
       if (!resp.ok || !json?.ok) {
         // eslint-disable-next-line no-console

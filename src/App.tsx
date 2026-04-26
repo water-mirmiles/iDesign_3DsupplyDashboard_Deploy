@@ -12,16 +12,32 @@ import InventoryList from '@/views/InventoryList';
 import LastSoleRelationView from '@/views/LastSoleRelation';
 import Login from '@/views/Login';
 
+type CurrentUser = { username: string };
+
+function readCurrentUser(): CurrentUser | null {
+  try {
+    const parsed = JSON.parse(localStorage.getItem('currentUser') || 'null');
+    if (parsed && typeof parsed.username === 'string' && parsed.username.trim()) return { username: parsed.username.trim() };
+  } catch {
+    // ignore
+  }
+  const legacy = localStorage.getItem('username');
+  return legacy ? { username: legacy } : null;
+}
+
 export default function App() {
-  const [isAuthenticated, setIsAuthenticated] = useState(() => localStorage.getItem('isLoggedIn') === 'true');
+  const [currentUser, setCurrentUser] = useState<CurrentUser | null>(() => readCurrentUser());
+  const [isAuthenticated, setIsAuthenticated] = useState(() => Boolean(readCurrentUser()));
   const [currentView, setCurrentView] = useState(() => localStorage.getItem('currentView') || 'dashboard');
 
   if (!isAuthenticated) {
     return <Login onLogin={({ username, rememberMe }) => {
+      const user = { username };
+      setCurrentUser(user);
       setIsAuthenticated(true);
+      localStorage.setItem('currentUser', JSON.stringify(user));
       localStorage.setItem('username', username);
-      if (rememberMe) localStorage.setItem('isLoggedIn', 'true');
-      else localStorage.removeItem('isLoggedIn');
+      localStorage.setItem('isLoggedIn', rememberMe ? 'true' : 'session');
     }} />;
   }
 
@@ -58,8 +74,12 @@ export default function App() {
       }}
       onLogout={() => {
         setIsAuthenticated(false);
+        setCurrentUser(null);
         localStorage.removeItem('isLoggedIn');
+        localStorage.removeItem('currentUser');
+        localStorage.removeItem('username');
       }}
+      currentUser={currentUser}
     >
       {renderView()}
     </Layout>

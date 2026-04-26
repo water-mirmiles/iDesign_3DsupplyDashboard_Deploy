@@ -5,24 +5,7 @@ interface LoginProps {
   onLogin: (info: { username: string; rememberMe: boolean }) => void;
 }
 
-type StoredUser = { username: string; password: string };
-
-function loadUsers(): StoredUser[] {
-  try {
-    const raw = localStorage.getItem('users');
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed)
-      ? parsed.filter((u) => typeof u?.username === 'string' && typeof u?.password === 'string')
-      : [];
-  } catch {
-    return [];
-  }
-}
-
-function saveUsers(users: StoredUser[]) {
-  localStorage.setItem('users', JSON.stringify(users));
-}
+type AuthResponse = { ok?: boolean; user?: { username: string }; error?: string };
 
 export default function Login({ onLogin }: LoginProps) {
   const [isLogin, setIsLogin] = useState(true);
@@ -31,7 +14,7 @@ export default function Login({ onLogin }: LoginProps) {
   const [rememberMe, setRememberMe] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
 
@@ -39,25 +22,21 @@ export default function Login({ onLogin }: LoginProps) {
     const p = password;
     if (!u || !p) return;
 
-    const users = loadUsers();
-
-    if (isLogin) {
-      const found = users.find((x) => x.username === u && x.password === p);
-      if (!found) {
-        setError('用户名或密码错误，或该账号尚未注册。');
+    try {
+      const resp = await fetch(isLogin ? '/api/auth/login' : '/api/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: u, password: p }),
+      });
+      const json = (await resp.json().catch(() => ({}))) as AuthResponse;
+      if (!resp.ok || !json.ok || !json.user?.username) {
+        setError(json.error || (isLogin ? '用户名或密码错误，或该账号尚未注册。' : '注册失败。'));
         return;
       }
-      onLogin({ username: u, rememberMe });
-      return;
+      onLogin({ username: json.user.username, rememberMe });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '认证服务暂不可用。');
     }
-
-    if (users.some((x) => x.username === u)) {
-      setError('该用户名已存在，请直接登录。');
-      return;
-    }
-
-    saveUsers([...users, { username: u, password: p }]);
-    onLogin({ username: u, rememberMe });
   };
 
   return (
@@ -129,7 +108,7 @@ export default function Login({ onLogin }: LoginProps) {
               记住我
             </label>
             <div className="text-xs text-slate-500">
-              {isLogin ? '登录校验本地用户列表' : '注册将写入本地存储'}
+              {isLogin ? '登录校验后端用户库' : '注册将写入后端 users.json'}
             </div>
           </div>
 

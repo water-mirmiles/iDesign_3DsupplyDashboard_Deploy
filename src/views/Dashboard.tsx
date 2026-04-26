@@ -161,6 +161,16 @@ function isLinkedCode(v: any) {
   return s !== '' && s !== '-' && s !== '0';
 }
 
+function getCurrentUsername() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem('currentUser') || 'null');
+    if (parsed?.username) return String(parsed.username).trim();
+  } catch {
+    // ignore
+  }
+  return localStorage.getItem('username') || 'System';
+}
+
 export default function Dashboard() {
   const [stats, setStats] = useState<DashboardStatsResponse | null>(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -419,11 +429,15 @@ export default function Dashboard() {
     setIsForceSyncing(true);
     setError(null);
     try {
-      const resp = await fetch('/api/force-sync-dashboard', { method: 'POST' });
+      const resp = await fetch('/api/force-sync-dashboard', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: getCurrentUsername() }),
+      });
       const json = await resp.json().catch(() => null);
       if (!resp.ok || !json?.ok) throw new Error(json?.error || `重算失败（HTTP ${resp.status}）`);
       // 重算后强制拉取最新 stats（避免仍读旧快照）
-      const resp2 = await fetch(`/api/dashboard-stats?refresh=1&t=${Date.now()}`);
+      const resp2 = await fetch(`/api/dashboard-stats?t=${Date.now()}`);
       const json2 = (await resp2.json()) as DashboardStatsResponse;
       if (!resp2.ok || !json2.ok) throw new Error(json2.error || `刷新失败（HTTP ${resp2.status}）`);
       // eslint-disable-next-line no-console

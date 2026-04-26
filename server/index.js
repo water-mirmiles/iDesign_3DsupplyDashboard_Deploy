@@ -4,6 +4,7 @@ import express from 'express';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import { execSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fse from 'fs-extra';
 import { computeMetricsFromGlbPath } from './last3dMetricsNode.mjs';
 
@@ -106,10 +107,58 @@ function getResolvedDataTablesRoot() {
   if (fse.existsSync(DIRS.dataTables)) return DIRS.dataTables;
   return DIRS.dataTablesFromCwd;
 }
+
+function passwordHash(password) {
+  return crypto.createHash('sha256').update(String(password || ''), 'utf8').digest('hex');
+}
+
+function normalizeUsername(v) {
+  return String(v || '').trim();
+}
+
+async function readUsersFile() {
+  try {
+    if (!(await fse.pathExists(USERS_PATH))) return { version: 1, users: [] };
+    const data = await fse.readJson(USERS_PATH);
+    return {
+      version: 1,
+      users: Array.isArray(data?.users) ? data.users : [],
+    };
+  } catch {
+    return { version: 1, users: [] };
+  }
+}
+
+async function writeUsersFile(payload) {
+  await fse.ensureDir(STORAGE_ROOT);
+  await fse.writeJson(USERS_PATH, payload, { spaces: 2 });
+}
+
+async function readUploadAudit() {
+  try {
+    if (!(await fse.pathExists(UPLOAD_AUDIT_PATH))) return { version: 1, byPath: {} };
+    const data = await fse.readJson(UPLOAD_AUDIT_PATH);
+    return { version: 1, byPath: data?.byPath && typeof data.byPath === 'object' ? data.byPath : {} };
+  } catch {
+    return { version: 1, byPath: {} };
+  }
+}
+
+async function writeUploadAudit(payload) {
+  await fse.ensureDir(STORAGE_ROOT);
+  await fse.writeJson(UPLOAD_AUDIT_PATH, payload, { spaces: 2 });
+}
+
+function getRequestOperator(req) {
+  const body = req?.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+  return normalizeUsername(body.username || body.operator || body.currentUser?.username) || 'System';
+}
 const MAPPING_CONFIG_PATH = path.join(STORAGE_ROOT, 'mapping_config.json');
 const FINAL_DASHBOARD_PATH = path.join(STORAGE_ROOT, 'final_dashboard_data.json');
 const FINAL_RESULTS_PATH = path.join(STORAGE_ROOT, 'final_results.json');
 const ASSETS_META_PATH = path.join(STORAGE_ROOT, 'assets_meta.json');
+const USERS_PATH = path.join(STORAGE_ROOT, 'users.json');
+const UPLOAD_AUDIT_PATH = path.join(STORAGE_ROOT, 'upload_audit.json');
 
 /**
  * 暴力清除本地 JSON 快照缓存：
@@ -118,6 +167,7 @@ const ASSETS_META_PATH = path.join(STORAGE_ROOT, 'assets_meta.json');
  */
 async function purgeStorageJsonExceptDataAndAssets() {
   const keepSub = new Set([path.resolve(DIRS.dataTables), path.resolve(path.join(STORAGE_ROOT, 'assets'))]);
+  const keepFiles = new Set([path.resolve(USERS_PATH), path.resolve(UPLOAD_AUDIT_PATH), path.resolve(ASSETS_META_PATH)]);
   const shouldSkipDir = (absDir) => {
     const d = path.resolve(absDir);
     for (const k of keepSub) {
@@ -140,6 +190,7 @@ async function purgeStorageJsonExceptDataAndAssets() {
       if (e.isDirectory()) {
         await walk(full);
       } else if (e.isFile() && e.name.toLowerCase().endsWith('.json')) {
+        if (keepFiles.has(path.resolve(full))) continue;
         try {
           await fse.remove(full);
           removed.push(path.relative(STORAGE_ROOT, full).split(path.sep).join('/'));
@@ -1145,6 +1196,43 @@ const sandboxUpload = multer({
 
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true });
+});
+
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const username = normalizeUsername(req.body?.username);
+    const password = String(req.body?.password || '');
+    if (!username || !password) return res.status(400).json({ ok: false, error: '用户名和密码不能为空' });
+
+    const db = await readUsersFile();
+    if (db.users.some((u) => normalizeUsername(u.username).toLowerCase() === username.toLowerCase())) {
+      return res.status(409).json({ ok: false, error: '该用户名已存在，请直接登录。' });
+    }
+
+    const now = new Date().toISOString();
+    db.users.push({ username, passwordHash: passwordHash(password), createdAt: now, updatedAt: now });
+    await writeUsersFile(db);
+    return res.json({ ok: true, user: { username } });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e instanceof Error ? e.message : 'register failed' });
+  }
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const username = normalizeUsername(req.body?.username);
+    const password = String(req.body?.password || '');
+    if (!username || !password) return res.status(400).json({ ok: false, error: '用户名和密码不能为空' });
+
+    const db = await readUsersFile();
+    const found = db.users.find(
+      (u) => normalizeUsername(u.username).toLowerCase() === username.toLowerCase() && u.passwordHash === passwordHash(password)
+    );
+    if (!found) return res.status(401).json({ ok: false, error: '用户名或密码错误，或该账号尚未注册。' });
+    return res.json({ ok: true, user: { username: found.username } });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e instanceof Error ? e.message : 'login failed' });
+  }
 });
 
 /** 上传队列：检查目标 3D 文件是否已存在（与 multer 归档规则一致） */
@@ -3482,6 +3570,8 @@ app.post('/api/upload', upload.array('files', 200), async (req, res) => {
   if (!files || !Array.isArray(files) || files.length === 0) {
     return res.status(400).json({ ok: false, error: 'No files uploaded' });
   }
+  const operator = getRequestOperator(req);
+  const uploadedAt = new Date().toISOString();
 
   for (const f of files) {
     if (f.path) removeSiblingGlbOn3dAssetOverwrite(f.path);
@@ -3489,12 +3579,27 @@ app.post('/api/upload', upload.array('files', 200), async (req, res) => {
 
   await refreshAssetsCache();
 
+  const audit = await readUploadAudit();
+  for (const f of files) {
+    if (!f.path) continue;
+    const rel = path.relative(STORAGE_ROOT, f.path).split(path.sep).join('/');
+    audit.byPath[rel] = {
+      relPath: rel,
+      fileName: f.filename || f.originalname,
+      uploadedBy: operator,
+      uploadedAt,
+    };
+  }
+  await writeUploadAudit(audit);
+
   const uploaded = files.map((f) => ({
     originalName: f.originalname,
     storedName: f.filename,
     size: f.size,
     destination: f.destination,
     path: f.path,
+    uploadedBy: operator,
+    uploadedAt,
   }));
 
   for (const f of files) {
@@ -3540,6 +3645,7 @@ function formatDateTime(d) {
 
 app.get('/api/history', async (_req, res) => {
   await ensureStorageDirs();
+  const uploadAudit = await readUploadAudit();
 
   const [dataTableFiles, lastFiles, soleFiles] = await Promise.all([
     walkFiles(DIRS.dataTables),
@@ -3555,6 +3661,7 @@ app.get('/api/history', async (_req, res) => {
     const rel = path.relative(STORAGE_ROOT, fullPath).split(path.sep).join('/');
     const category = detectCategoryFromPath(fullPath);
     const fileName = path.basename(fullPath);
+    const audit = uploadAudit.byPath?.[rel] || null;
 
     let snapshotDate;
     if (category === 'xlsx') {
@@ -3576,6 +3683,7 @@ app.get('/api/history', async (_req, res) => {
       uploadTime: formatDateTime(stat.mtime),
       snapshotDate,
       category,
+      operator: audit?.uploadedBy || 'System',
     });
   }
 
@@ -3674,18 +3782,20 @@ app.get('/api/dashboard-stats', async (req, res) => {
 });
 
 // 强制全量生产重算：先清缓存，再从 data_tables 最新日期目录全量聚合并落盘
-app.post('/api/force-sync-dashboard', async (_req, res) => {
+app.post('/api/force-sync-dashboard', async (req, res) => {
   try {
+    const operator = getRequestOperator(req);
+    const operationTime = new Date();
     const removed = await purgeOldSnapshots();
     // eslint-disable-next-line no-console
     console.log('[ForceSync] purge removed:', removed.length ? removed.join(', ') : '(none)');
 
     // 先跑一次带进度日志的生产聚合（只最新日期目录），用于终端可视化
-    const agg = await forceSyncLatestProduction({ storageRoot: STORAGE_ROOT });
+    const agg = await forceSyncLatestProduction({ storageRoot: STORAGE_ROOT, operator, operationTime });
     const latest = agg.latest;
 
     // 再生成与 Dashboard 一致的最终快照（包含 KPI / trends / inventory）
-    const payload = await processAllData({ storageRoot: STORAGE_ROOT });
+    const payload = await processAllData({ storageRoot: STORAGE_ROOT, operator, operationTime });
     const outPath = await persistFinalDashboardData(STORAGE_ROOT, payload);
 
     return res.json({
@@ -3710,6 +3820,8 @@ app.post('/api/force-sync-dashboard', async (_req, res) => {
 app.post('/api/certify-and-sync', async (req, res) => {
   try {
     await ensureStorageDirs();
+    const operator = getRequestOperator(req);
+    const operationTime = new Date();
     const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
     const mcRaw = body.mappingConfig;
     const mc =
@@ -3733,7 +3845,7 @@ app.post('/api/certify-and-sync', async (req, res) => {
       };
       await fse.writeJson(MAPPING_CONFIG_PATH, filePayload, { spaces: 2 });
     }
-    const payload = await processAllData({ storageRoot: STORAGE_ROOT });
+    const payload = await processAllData({ storageRoot: STORAGE_ROOT, operator, operationTime });
     const outPath = await persistFinalDashboardData(STORAGE_ROOT, payload);
     // eslint-disable-next-line no-console
     console.log('[Engine] certify-and-sync 已写入', outPath);
@@ -3900,6 +4012,9 @@ app.get('/api/asset-details', async (req, res) => {
         modifiedLabel: formatDisplayMtime(st.mtime),
       };
     }
+    const uploadAudit = await readUploadAudit();
+    const relAssetPath = abs ? path.relative(STORAGE_ROOT, abs).split(path.sep).join('/') : '';
+    const uploadedBy = uploadAudit.byPath?.[relAssetPath]?.uploadedBy || 'System';
 
     const snap = await readFinalDashboardSnapshot();
     let inventory = Array.isArray(snap?.inventory) ? snap.inventory : [];
@@ -3942,7 +4057,7 @@ app.get('/api/asset-details', async (req, res) => {
         type,
         code,
         file,
-        uploadedBy: '系统导入 (Storage)',
+        uploadedBy,
         linkedStyles,
         linkedSoleCodes,
       });
@@ -3958,7 +4073,7 @@ app.get('/api/asset-details', async (req, res) => {
         type,
         code,
         file,
-        uploadedBy: '系统导入 (Storage)',
+        uploadedBy,
         linkedStyles,
         linkedSoleCodes,
       });
@@ -3973,7 +4088,7 @@ app.get('/api/asset-details', async (req, res) => {
       type,
       code,
       file,
-      uploadedBy: '系统导入 (Storage)',
+      uploadedBy,
       linkedStyles,
       linkedSoleCodes,
     });

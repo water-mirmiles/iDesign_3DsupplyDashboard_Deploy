@@ -257,6 +257,13 @@ function normalizeProductLevel(v) {
   return s.endsWith('级') ? s.slice(0, -1) || '未定级' : s;
 }
 
+function formatAuditDateTime(input = new Date()) {
+  const d = input instanceof Date ? input : new Date(input);
+  const safe = Number.isNaN(d.getTime()) ? new Date() : d;
+  const pad2 = (n) => String(n).padStart(2, '0');
+  return `${safe.getFullYear()}-${pad2(safe.getMonth() + 1)}-${pad2(safe.getDate())} ${pad2(safe.getHours())}:${pad2(safe.getMinutes())}`;
+}
+
 /** 列出所有未落入 active/draft/obsolete 的原始词汇（只计 other） */
 function auditMainTableOtherStatusDistribution(main, statusCol) {
   const counts = new Map();
@@ -2001,7 +2008,7 @@ export async function validateJoinPathSuggestionsWithGoldenXlsx({
   return validated;
 }
 
-async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, forceSyncLog = false }) {
+async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, forceSyncLog = false, operator = 'System', operationTime = new Date() }) {
   const dataTablesDir = resolveDataTablesRootForStorage(storageRoot);
   const dateDir = dateDirName ? path.join(dataTablesDir, dateDirName) : dataTablesDir;
 
@@ -2061,6 +2068,8 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
 
   const lastsSet = scan3DAssetDirSync(path.join(storageRoot, 'assets', 'lasts'));
   const solesSet = scan3DAssetDirSync(path.join(storageRoot, 'assets', 'soles'));
+  const auditOperator = normalize(operator) || 'System';
+  const auditTimestamp = formatAuditDateTime(operationTime);
 
   const mainTableName = buildTableNameIndex(main.fileName);
   const traceDim = (msg) => aiTraceLineSync(`[Trace] ${msg}`);
@@ -2384,8 +2393,8 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
       data_status: invStatus,
       product_actual_position: productLevel,
       productLevel,
-      lastUpdated: dateDirName || '',
-      updatedBy: 'Storage',
+      lastUpdated: auditTimestamp,
+      updatedBy: auditOperator,
       sourceTable: main.fileName,
       target_audience,
       __has3DAny: has3DAny,
@@ -2521,11 +2530,11 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
 /**
  * 全量聚合：读取 mapping_config、最新快照目录下全部 XLSX（多表 Join / CONCAT）、对齐 3D 资产文件名。
  */
-export async function processAllData({ storageRoot }) {
+export async function processAllData({ storageRoot, operator = 'System', operationTime = new Date() }) {
   // eslint-disable-next-line no-console
   console.log('[Engine] 正在合成款号数据...');
   const t0 = Date.now();
-  const agg = await aggregateProjectData({ storageRoot });
+  const agg = await aggregateProjectData({ storageRoot, operator, operationTime });
   const latest = agg.latest;
   const kpis = latest.kpis;
   const statusBuckets = latest.statusBuckets || null;
@@ -2969,7 +2978,7 @@ export async function resolveFirstActiveRowFromFolder({
   return { ok: false, error: '未找到生效行', row: null, mainTable: main?.fileName || null };
 }
 
-export async function aggregateProjectData({ storageRoot }) {
+export async function aggregateProjectData({ storageRoot, operator = 'System', operationTime = new Date() }) {
   const { mappingArr, hasMappingFile, usedDefaultMapping, mappingConfigPath } = resolveMappingFromStorage(storageRoot);
   const standardMap = buildStandardMap(mappingArr || []);
 
@@ -2979,7 +2988,7 @@ export async function aggregateProjectData({ storageRoot }) {
   const latest = dateDirs.length ? dateDirs[0] : '';
   const prev = dateDirs.length >= 2 ? dateDirs[1] : '';
 
-  const latestAgg = await aggregateForDateRoot({ storageRoot, dateDirName: latest, standardMap });
+  const latestAgg = await aggregateForDateRoot({ storageRoot, dateDirName: latest, standardMap, operator, operationTime });
   const prevAgg = prev ? await aggregateForDateRoot({ storageRoot, dateDirName: prev, standardMap }) : null;
 
   // 容错：无 Previous 时 delta 归零（禁止出现误导性的巨大增量）
@@ -3008,14 +3017,14 @@ export async function aggregateProjectData({ storageRoot }) {
  * 强制生产重算（仅最新日期目录），用于 /api/force-sync-dashboard。
  * 会在遍历生效款时打印 ForceSync 进度日志。
  */
-export async function forceSyncLatestProduction({ storageRoot }) {
+export async function forceSyncLatestProduction({ storageRoot, operator = 'System', operationTime = new Date() }) {
   const { mappingArr, hasMappingFile, usedDefaultMapping, mappingConfigPath } = resolveMappingFromStorage(storageRoot);
   const standardMap = buildStandardMap(mappingArr || []);
 
   const dataTablesDir = resolveDataTablesRootForStorage(storageRoot);
   const dateDirs = await getDateDirsByNameDesc(dataTablesDir);
   const latest = dateDirs.length ? dateDirs[0] : '';
-  const latestAgg = await aggregateForDateRoot({ storageRoot, dateDirName: latest, standardMap, forceSyncLog: true });
+  const latestAgg = await aggregateForDateRoot({ storageRoot, dateDirName: latest, standardMap, forceSyncLog: true, operator, operationTime });
   return {
     dates: { latest, prev: dateDirs.length >= 2 ? dateDirs[1] : '' },
     mapping: { hasConfig: Boolean(hasMappingFile && mappingArr?.length), usedDefaultMapping: Boolean(usedDefaultMapping), configPath: mappingConfigPath },

@@ -364,7 +364,7 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType, targetAudience }:
                 </div>
                 <div>
                   <label className="text-xs font-medium text-slate-500 uppercase tracking-wider">上传用户</label>
-                  <p className="text-sm text-slate-900 mt-1">{details?.uploadedBy ?? '系统导入 (Storage)'}</p>
+                  <p className="text-sm text-slate-900 mt-1">{details?.uploadedBy ?? 'System'}</p>
                 </div>
                 <div>
                   <label className="text-xs font-medium text-slate-500 uppercase tracking-wider">文件大小</label>

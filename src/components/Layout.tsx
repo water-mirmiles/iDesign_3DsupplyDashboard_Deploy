@@ -6,9 +6,10 @@ interface SidebarProps {
   currentView: string;
   onNavigate: (view: string) => void;
   onLogout: () => void;
+  currentUser?: { username: string } | null;
 }
 
-export function Sidebar({ currentView, onNavigate, onLogout }: SidebarProps) {
+export function Sidebar({ currentView, onNavigate, onLogout, currentUser }: SidebarProps) {
   const navItems = [
     { id: 'dashboard', label: '概览看板', icon: LayoutDashboard },
     { id: 'inventory', label: '款号详细清单', icon: List },
@@ -57,10 +58,15 @@ export function Sidebar({ currentView, onNavigate, onLogout }: SidebarProps) {
 
       {/* Bottom Actions */}
       <div className="p-4 border-t border-slate-800 space-y-1">
-        <button className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium hover:bg-slate-800 hover:text-white transition-colors">
-          <Settings className="w-5 h-5 text-slate-400" />
-          系统设置
-        </button>
+        <div className="rounded-lg border border-slate-800 bg-slate-950/40 px-3 py-2.5">
+          <div className="flex items-center gap-3 text-sm font-medium text-slate-300">
+            <Settings className="w-5 h-5 text-slate-400" />
+            系统设置
+          </div>
+          <div className="mt-2 truncate pl-8 text-xs text-slate-500" title={currentUser?.username || '未登录'}>
+            当前登录：<span className="font-medium text-slate-300">{currentUser?.username || '未登录'}</span>
+          </div>
+        </div>
         <button 
           onClick={onLogout}
           className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium text-red-400 hover:bg-slate-800 hover:text-red-300 transition-colors"
@@ -73,10 +79,22 @@ export function Sidebar({ currentView, onNavigate, onLogout }: SidebarProps) {
   );
 }
 
-export function Layout({ children, currentView, onNavigate, onLogout }: { children: React.ReactNode, currentView: string, onNavigate: (view: string) => void, onLogout: () => void }) {
+export function Layout({
+  children,
+  currentView,
+  onNavigate,
+  onLogout,
+  currentUser,
+}: {
+  children: React.ReactNode;
+  currentView: string;
+  onNavigate: (view: string) => void;
+  onLogout: () => void;
+  currentUser?: { username: string } | null;
+}) {
   return (
     <div className="flex h-screen min-h-0 bg-slate-50 overflow-hidden font-sans">
-      <Sidebar currentView={currentView} onNavigate={onNavigate} onLogout={onLogout} />
+      <Sidebar currentView={currentView} onNavigate={onNavigate} onLogout={onLogout} currentUser={currentUser} />
       <main className="flex-1 h-screen min-h-0 overflow-y-auto">
         <div className="w-full px-4 py-4">
           {children}
