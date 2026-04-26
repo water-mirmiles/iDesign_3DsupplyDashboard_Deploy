@@ -48,6 +48,11 @@ type AssetMetaResponse = {
 type AssetFilter = 'all' | 'matched' | 'missing';
 
 const SEARCH_HISTORY_KEY = 'supply3d_search_history_v2';
+const ASSET_FILTER_OPTIONS: Array<{ value: AssetFilter; label: string }> = [
+  { value: 'all', label: '全部' },
+  { value: 'matched', label: '已匹配' },
+  { value: 'missing', label: '缺失' },
+];
 
 function styleStatusLabel(status: string) {
   switch (status) {
@@ -125,6 +130,39 @@ function toggleValue(list: string[], value: string) {
 function getDateValue(v?: string) {
   const s = String(v || '').trim();
   return /^\d{4}-\d{2}-\d{2}/.test(s) ? s.slice(0, 10) : '';
+}
+
+function AssetFilterToggleGroup({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: AssetFilter;
+  onChange: (value: AssetFilter) => void;
+}) {
+  return (
+    <div className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-2 py-1.5 shadow-sm">
+      <span className="whitespace-nowrap text-xs font-semibold text-slate-500">{label}</span>
+      <div className="flex items-center gap-1">
+        {ASSET_FILTER_OPTIONS.map((option) => (
+          <button
+            key={option.value}
+            type="button"
+            onClick={() => onChange(option.value)}
+            className={cn(
+              'rounded-md border px-2.5 py-1 text-xs font-semibold transition-colors',
+              value === option.value
+                ? 'border-blue-600 bg-blue-600 text-white shadow-sm'
+                : 'border-slate-200 bg-slate-50 text-slate-600 hover:border-blue-200 hover:bg-blue-50 hover:text-blue-700'
+            )}
+          >
+            {option.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 interface PreviewModalProps {
@@ -773,17 +811,6 @@ export default function InventoryList() {
           <p className="text-sm text-slate-500 mt-1">管理所有款号及其 3D 资产的匹配状态</p>
         </div>
         <div className="flex items-center gap-3">
-          <button
-            type="button"
-            onClick={() => setIsAdvancedOpen(true)}
-            className="flex items-center gap-2 px-4 py-2 bg-white border border-slate-200 text-slate-700 text-sm font-medium rounded-lg hover:bg-slate-50 transition-colors shadow-sm"
-          >
-            <Filter className="w-4 h-4" />
-            高级筛选
-            {activeAdvancedFilterCount > 0 && (
-              <span className="rounded-full bg-blue-600 px-1.5 py-0.5 text-[10px] font-bold text-white">{activeAdvancedFilterCount}</span>
-            )}
-          </button>
           <span className="text-sm text-slate-500">
             当前命中：<span className="font-semibold text-slate-900">{filteredItems.length}</span> 条 / 共 {items.length} 条
           </span>
@@ -794,11 +821,11 @@ export default function InventoryList() {
         </div>
       </div>
 
-      <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+      <div className="overflow-visible rounded-xl border border-slate-200 bg-white shadow-sm">
         {/* Toolbar */}
-        <div className="p-4 border-b border-slate-200 flex flex-wrap gap-4 justify-between items-center bg-slate-50/50">
+        <div className="relative z-50 flex flex-wrap items-center justify-between gap-4 border-b border-slate-200 bg-slate-50/50 p-4">
           <div className="flex flex-1 flex-wrap items-center gap-3">
-            <div className="relative min-w-[18rem] max-w-md flex-1 overflow-visible">
+            <div className="relative z-[100] min-w-[18rem] max-w-md flex-1 overflow-visible">
               <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
               <input 
                 type="text" 
@@ -816,7 +843,7 @@ export default function InventoryList() {
               />
               {isSearchFocused === true && searchHistory.length > 0 && (
                 <div
-                  className="absolute left-0 top-full z-[9999] mt-1 w-full rounded-lg border border-slate-200 bg-white p-3 shadow-xl dark:border-slate-700 dark:bg-slate-900"
+                  className="absolute left-0 top-full z-[9999] mt-1 max-h-80 w-full overflow-y-auto rounded-lg border border-slate-200 bg-white p-3 shadow-2xl dark:border-slate-700 dark:bg-slate-900"
                   onMouseDown={(e) => e.preventDefault()}
                 >
                   <div className="mb-2 flex items-center justify-between">
@@ -876,6 +903,19 @@ export default function InventoryList() {
               <Search className="h-4 w-4" />
               搜索
             </button>
+            <AssetFilterToggleGroup label="楦头 3D" value={lastAssetFilter} onChange={setLastAssetFilter} />
+            <AssetFilterToggleGroup label="大底 3D" value={soleAssetFilter} onChange={setSoleAssetFilter} />
+            <button
+              type="button"
+              onClick={() => setIsAdvancedOpen(true)}
+              className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-700 shadow-sm transition-colors hover:bg-slate-50"
+            >
+              <Filter className="h-4 w-4" />
+              高级筛选
+              {activeAdvancedFilterCount > 0 && (
+                <span className="rounded-full bg-blue-600 px-1.5 py-0.5 text-[10px] font-bold text-white">{activeAdvancedFilterCount}</span>
+              )}
+            </button>
           </div>
           <div className="text-sm text-slate-500">
             共 <span className="font-medium text-slate-900">{filteredItems.length}</span> 条记录
@@ -883,7 +923,7 @@ export default function InventoryList() {
         </div>
 
         {/* Table */}
-        <div className="overflow-x-auto">
+        <div className="relative z-0 overflow-x-auto">
           {error && (
             <div className="p-4 text-sm text-red-700 bg-red-50 border-b border-red-200">
               {error}
@@ -1108,15 +1148,11 @@ export default function InventoryList() {
                 <div>
                   <div className="mb-3 text-sm font-semibold text-slate-900">楦头状态</div>
                   <div className="grid grid-cols-3 gap-2">
-                    {[
-                      ['all', '全部'],
-                      ['matched', '已匹配'],
-                      ['missing', '缺失'],
-                    ].map(([value, label]) => (
+                    {ASSET_FILTER_OPTIONS.map(({ value, label }) => (
                       <button
                         key={value}
                         type="button"
-                        onClick={() => setLastAssetFilter(value as AssetFilter)}
+                        onClick={() => setLastAssetFilter(value)}
                         className={cn(
                           'rounded-lg border px-3 py-2 text-sm font-medium',
                           lastAssetFilter === value ? 'border-blue-600 bg-blue-600 text-white' : 'border-slate-200 bg-slate-50 text-slate-700 hover:bg-white'
@@ -1130,15 +1166,11 @@ export default function InventoryList() {
                 <div>
                   <div className="mb-3 text-sm font-semibold text-slate-900">大底状态</div>
                   <div className="grid grid-cols-3 gap-2">
-                    {[
-                      ['all', '全部'],
-                      ['matched', '已匹配'],
-                      ['missing', '缺失'],
-                    ].map(([value, label]) => (
+                    {ASSET_FILTER_OPTIONS.map(({ value, label }) => (
                       <button
                         key={value}
                         type="button"
-                        onClick={() => setSoleAssetFilter(value as AssetFilter)}
+                        onClick={() => setSoleAssetFilter(value)}
                         className={cn(
                           'rounded-lg border px-3 py-2 text-sm font-medium',
                           soleAssetFilter === value ? 'border-blue-600 bg-blue-600 text-white' : 'border-slate-200 bg-slate-50 text-slate-700 hover:bg-white'
