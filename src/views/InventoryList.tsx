@@ -77,21 +77,42 @@ const DataStatusBadge = ({ status }: { status: InventoryItem['data_status'] }) =
 
 const LevelBadge = ({ level }: { level?: string }) => {
   const raw = String(level || '').trim();
-  if (!raw || raw === '未定级') return null;
-  const label = /^[SABCDEF]$/.test(raw) ? `${raw}级款` : `${raw}款`;
+  const normalized = raw.toUpperCase().replace(/\s+/g, '').replace(/级$/, '');
+  const display = raw || '未定级';
+  const label = /^[SABC]$/.test(normalized) ? `${normalized}级` : display;
+  const isLong = label.length > 8;
   return (
     <span
+      title={display}
       className={cn(
-        'rounded-full border px-2 py-0.5 text-[11px] font-bold',
-        raw === 'S'
-          ? 'border-violet-200 bg-violet-50 text-violet-700'
-          : 'border-slate-200 bg-slate-50 text-slate-600'
+        'inline-flex max-w-[104px] items-center justify-center rounded-full border px-2.5 py-1 text-[11px] font-bold',
+        isLong && 'truncate',
+        normalized === 'S' && 'border-purple-200 bg-purple-100 text-purple-700',
+        normalized === 'A' && 'border-blue-200 bg-blue-50 text-blue-700',
+        normalized === 'B' && 'border-sky-200 bg-sky-50 text-sky-700',
+        normalized === 'C' && 'border-slate-200 bg-slate-100 text-slate-700',
+        normalized === 'EOL' && 'border-red-200 bg-red-50 text-red-700',
+        !['S', 'A', 'B', 'C', 'EOL'].includes(normalized) && 'border-slate-200 bg-slate-50 text-slate-600'
       )}
     >
       {label}
     </span>
   );
 };
+
+function getProductLevel(item: InventoryItem) {
+  return String(item.product_actual_position || item.productLevel || '').trim();
+}
+
+function normalizeLevel(level?: string) {
+  return String(level || '').trim().toUpperCase().replace(/\s+/g, '').replace(/级$/, '');
+}
+
+function levelSortRank(level?: string) {
+  const normalized = normalizeLevel(level);
+  const rank: Record<string, number> = { S: 0, A: 1, B: 2, C: 3, EOL: 4 };
+  return rank[normalized] ?? 99;
+}
 
 interface PreviewModalProps {
   isOpen: boolean;
@@ -498,6 +519,7 @@ export default function InventoryList() {
   const [brandFilter, setBrandFilter] = useState<string>('all');
   const [searchTerm, setSearchTerm] = useState<string>('');
   const [drilldown, setDrilldown] = useState<{ dimension: 'last' | 'sole'; bucket: 'no_code' | 'has_code_no_3d' | 'completed_3d' } | null>(null);
+  const [levelSortDirection, setLevelSortDirection] = useState<'none' | 'asc' | 'desc'>('none');
   const [items, setItems] = useState<InventoryItem[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -599,16 +621,25 @@ export default function InventoryList() {
       else out = out.filter((x) => x.lastStatus !== 'matched' && x.soleStatus !== 'matched');
     }
 
-    // 默认排序：生效在前，其次草稿，最后作废
+    // 默认排序：生效在前，其次草稿，最后作废；产品定级排序由表头显式触发。
     const pri: Record<string, number> = { active: 0, draft: 1, other: 2, obsolete: 3 };
     out = [...out].sort((a, b) => {
+      if (levelSortDirection !== 'none') {
+        const ra = levelSortRank(getProductLevel(a));
+        const rb = levelSortRank(getProductLevel(b));
+        if (ra !== rb) return levelSortDirection === 'asc' ? ra - rb : rb - ra;
+        const la = getProductLevel(a);
+        const lb = getProductLevel(b);
+        const levelCmp = la.localeCompare(lb, 'zh-CN', { numeric: true });
+        if (levelCmp !== 0) return levelSortDirection === 'asc' ? levelCmp : -levelCmp;
+      }
       const pa = pri[String(a?.data_status || '')] ?? 9;
       const pb = pri[String(b?.data_status || '')] ?? 9;
       if (pa !== pb) return pa - pb;
       return String(a?.style_wms || '').localeCompare(String(b?.style_wms || ''), 'en', { numeric: true });
     });
     return out;
-  }, [brandFilter, has3DFilter, items, searchTerm, drilldown]);
+  }, [brandFilter, has3DFilter, items, searchTerm, drilldown, levelSortDirection]);
 
   return (
     <div className="space-y-6 animate-in fade-in duration-500 pb-10">
@@ -696,6 +727,21 @@ export default function InventoryList() {
             <thead className="text-xs text-slate-500 bg-slate-50 uppercase border-b border-slate-200">
               <tr>
                 <th className="px-5 py-3 font-medium">款号 (Style_WMS)</th>
+                <th className="px-5 py-3 font-medium w-[120px] text-center">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setLevelSortDirection((prev) => (prev === 'none' ? 'asc' : prev === 'asc' ? 'desc' : 'none'))
+                    }
+                    className="inline-flex items-center justify-center gap-1 rounded-md px-2 py-1 hover:bg-slate-100"
+                    title="按 S > A > B > C > EOL > 其他排序"
+                  >
+                    产品定级 (Level)
+                    <span className="text-[10px] text-slate-400">
+                      {levelSortDirection === 'asc' ? '↑' : levelSortDirection === 'desc' ? '↓' : '↕'}
+                    </span>
+                  </button>
+                </th>
                 <th className="px-5 py-3 font-medium">品牌</th>
                 <th className="px-5 py-3 font-medium">颜色 (Color)</th>
                 <th className="px-5 py-3 font-medium">材质 (Material)</th>
@@ -711,7 +757,7 @@ export default function InventoryList() {
             <tbody className="divide-y divide-slate-100">
               {!isLoading && filteredItems.length === 0 && (
                 <tr>
-                  <td colSpan={11} className="px-5 py-12 text-center text-sm text-slate-500">
+                  <td colSpan={12} className="px-5 py-12 text-center text-sm text-slate-500">
                     当前筛选条件下无款式数据
                   </td>
                 </tr>
@@ -729,10 +775,10 @@ export default function InventoryList() {
                   )}
                 >
                   <td className="px-5 py-4 font-medium text-slate-900">
-                    <div className="flex items-center gap-2">
-                      <span>{item.style_wms}</span>
-                      <LevelBadge level={item.product_actual_position || item.productLevel} />
-                    </div>
+                    {item.style_wms}
+                  </td>
+                  <td className="px-5 py-4 w-[120px] text-center">
+                    <LevelBadge level={getProductLevel(item)} />
                   </td>
                   <td className="px-5 py-4 text-slate-600">
                     <span className="bg-slate-100 px-2.5 py-1 rounded-md text-xs font-medium">{item.brand}</span>
