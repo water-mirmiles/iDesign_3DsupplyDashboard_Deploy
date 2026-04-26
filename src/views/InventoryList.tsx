@@ -47,7 +47,7 @@ type AssetMetaResponse = {
 
 type AssetFilter = 'all' | 'matched' | 'missing';
 
-const SEARCH_HISTORY_KEY = 'searchHistory';
+const SEARCH_HISTORY_KEY = 'supply3d_search_history';
 
 function styleStatusLabel(status: string) {
   switch (status) {
@@ -125,15 +125,6 @@ function toggleValue(list: string[], value: string) {
 function getDateValue(v?: string) {
   const s = String(v || '').trim();
   return /^\d{4}-\d{2}-\d{2}/.test(s) ? s.slice(0, 10) : '';
-}
-
-function readSearchHistory() {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(SEARCH_HISTORY_KEY) || '[]');
-    return Array.isArray(parsed) ? parsed.map((x) => String(x || '').trim()).filter(Boolean).slice(0, 10) : [];
-  } catch {
-    return [];
-  }
 }
 
 interface PreviewModalProps {
@@ -538,9 +529,15 @@ export default function InventoryList() {
     targetAudience?: string;
   }>({ isOpen: false, assetCode: '', type: 'last' });
   const [searchTerm, setSearchTerm] = useState<string>('');
-  const [searchHistory, setSearchHistory] = useState<string[]>([]);
+  const [searchHistory, setSearchHistory] = useState<string[]>(() => {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(SEARCH_HISTORY_KEY) || '[]');
+      return Array.isArray(parsed) ? parsed.map((item) => String(item || '').trim()).filter(Boolean).slice(0, 10) : [];
+    } catch {
+      return [];
+    }
+  });
   const [isSearchFocused, setIsSearchFocused] = useState(false);
-  const [isSearchHistoryLoaded, setIsSearchHistoryLoaded] = useState(false);
   const [isAdvancedOpen, setIsAdvancedOpen] = useState(false);
   const [selectedLevels, setSelectedLevels] = useState<string[]>([]);
   const [selectedBrands, setSelectedBrands] = useState<string[]>([]);
@@ -611,16 +608,6 @@ export default function InventoryList() {
       setIsLoading(false);
     }
   }, []);
-
-  useEffect(() => {
-    setSearchHistory(readSearchHistory());
-    setIsSearchHistoryLoaded(true);
-  }, []);
-
-  useEffect(() => {
-    if (!isSearchHistoryLoaded) return;
-    localStorage.setItem(SEARCH_HISTORY_KEY, JSON.stringify(searchHistory.slice(0, 10)));
-  }, [isSearchHistoryLoaded, searchHistory]);
 
   useEffect(() => {
     // Dashboard 点击品牌跳转：通过 localStorage 预设过滤
@@ -803,7 +790,7 @@ export default function InventoryList() {
         {/* Toolbar */}
         <div className="p-4 border-b border-slate-200 flex flex-wrap gap-4 justify-between items-center bg-slate-50/50">
           <div className="flex flex-wrap items-center gap-3">
-            <div className="relative">
+            <div className="relative w-72 overflow-visible">
               <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
               <input 
                 type="text" 
@@ -817,10 +804,13 @@ export default function InventoryList() {
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') saveSearchKeyword(searchTerm);
                 }}
-                className="pl-9 pr-4 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent w-72"
+                className="w-full pl-9 pr-4 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
               />
               {isSearchFocused === true && searchTerm === '' && searchHistory.length > 0 && (
-                <div className="absolute left-0 top-full z-[100] mt-2 w-72 rounded-xl border border-slate-200 bg-white p-3 shadow-lg dark:border-slate-700 dark:bg-slate-900">
+                <div
+                  className="absolute left-0 top-full z-[100] mt-1 w-full rounded-lg border border-slate-200 bg-white p-3 shadow-2xl dark:border-slate-700 dark:bg-slate-900"
+                  onMouseDown={(e) => e.preventDefault()}
+                >
                   <div className="mb-2 flex items-center justify-between">
                     <span className="text-xs font-semibold text-slate-500 dark:text-slate-300">最近搜索</span>
                   </div>
