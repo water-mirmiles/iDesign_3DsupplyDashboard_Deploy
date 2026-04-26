@@ -110,6 +110,9 @@ export interface InventoryItem {
   /** 是否命中 3D 大底物理文件（对账结果） */
   has3DSole?: boolean;
   data_status: 'active' | 'draft' | 'obsolete' | 'other'; // 状态（other=未命中词库的兜底类）
+  /** 产品定级，来自主表 product_actual_position（已清洗为 S/A/B/C/EOL 等） */
+  product_actual_position?: string;
+  productLevel?: string;
   /** 男/女/童等业务受众（3D 标准尺度，可选，来自主表列 target_audience） */
   target_audience?: string;
   lastUpdated: string; // 最后更新

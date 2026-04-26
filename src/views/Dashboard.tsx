@@ -90,6 +90,11 @@ type DashboardStatsResponse = {
   trends?: { assetTrend?: AssetTrendStats[] };
   trendHistory?: TrendHistoryPoint[];
   inventory?: Array<any>;
+  styleMetadata?: Array<{ style_wms: string; brand: string; status: string; level: string; hasId: boolean; has3D: boolean }>;
+  filterOptions?: {
+    statuses?: string[];
+    levels?: string[];
+  };
   /** 主表状态列原始值普查（全表物理行） */
   rawStatusAudit?: Array<{ value: string; rowCount: number }>;
   error?: string;
@@ -120,39 +125,25 @@ function ChartEmptyState({ title, description }: { title: string; description: s
   );
 }
 
-/** 无 inventory 时，用后端分桶的榜单合并（生效+草稿） */
-function mergeBrandDigitizationRows(a: any[] = [], b: any[] = []) {
-  const map = new Map<string, { brand: string; totalEffective: number; hasCode: number; has3D: number }>();
-  const ingest = (row: any) => {
-    const brand = String(row?.brand || '').trim();
-    if (!brand) return;
-    const cur = map.get(brand) || { brand, totalEffective: 0, hasCode: 0, has3D: 0 };
-    cur.totalEffective += Number(row?.totalEffective || 0);
-    cur.hasCode += Number(row?.hasCode || 0);
-    cur.has3D += Number(row?.has3D || 0);
-    map.set(brand, cur);
-  };
-  for (const r of a) ingest(r);
-  for (const r of b) ingest(r);
-  return Array.from(map.values())
-    .map((x) => {
-      const segment_no_code = Math.max(0, x.totalEffective - x.hasCode);
-      const segment_has_code_no_3d = Math.max(0, x.hasCode - x.has3D);
-      const segment_completed_3d = Math.max(0, x.has3D);
-      const completionRate = x.totalEffective > 0 ? Math.round((x.has3D / x.totalEffective) * 1000) / 10 : 0;
-      return {
-        brand: x.brand,
-        totalEffective: x.totalEffective,
-        hasCode: x.hasCode,
-        has3D: x.has3D,
-        segment_no_code,
-        segment_has_code_no_3d,
-        segment_completed_3d,
-        completionRate,
-      };
-    })
-    .sort((x, y) => (y.totalEffective || 0) - (x.totalEffective || 0))
-    .slice(0, 30);
+function statusLabel(status: string) {
+  const s = String(status || '').trim();
+  if (s === 'active') return '生效';
+  if (s === 'draft') return '草稿';
+  if (s === 'obsolete') return '作废';
+  if (s === 'other') return '其他';
+  return s || '未知';
+}
+
+function levelLabel(level: string) {
+  const s = String(level || '').trim();
+  if (!s || s === '未定级') return '未定级';
+  if (/^[SABCDEF]$/.test(s)) return `${s}级`;
+  return s;
+}
+
+function isLinkedCode(v: any) {
+  const s = String(v ?? '').trim();
+  return s !== '' && s !== '-' && s !== '0';
 }
 
 export default function Dashboard() {
@@ -160,8 +151,10 @@ export default function Dashboard() {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [isForceSyncing, setIsForceSyncing] = useState(false);
-  const [statusScope, setStatusScope] = useState<'effective' | 'includeDraft' | 'total'>('effective');
   const [mandatoryStatus, setMandatoryStatus] = useState<MandatoryFilesResponse | null>(null);
+  const [selectedStatuses, setSelectedStatuses] = useState<string[]>(['active']);
+  const [selectedLevels, setSelectedLevels] = useState<string[]>([]);
+  const [filtersInitialized, setFiltersInitialized] = useState(false);
 
   const [trendPeriod, setTrendPeriod] = useState<TimePeriod>('week');
   const [chartData, setChartData] = useState<TrendHistoryPoint[]>([]);
@@ -171,158 +164,90 @@ export default function Dashboard() {
     return mandatoryStatus !== null && mainTable?.ready === false;
   }, [mandatoryStatus]);
 
-  /** 入库款号按归一化状态计数（与 Tab 求和一致；无分桶快照时回落 scopeKPIs） */
-  const invStatusCounts = useMemo(() => {
-    const sd: any = stats?.statusBuckets?.total?.kpis?.statusDist ?? stats?.kpis?.statusDist;
-    if (!sd) return null;
-    return {
-      effective: Number(sd.active ?? 0),
-      draft: Number(sd.draft ?? 0),
-      obsolete: Number(sd.obsolete ?? 0),
-      other: Number(sd.other ?? 0),
-    };
-  }, [stats?.statusBuckets?.total?.kpis?.statusDist, stats?.kpis?.statusDist]);
+  const statusOptions = useMemo(() => {
+    const fromApi = stats?.filterOptions?.statuses || [];
+    const preferred = ['active', 'draft', 'obsolete'];
+    const all = Array.from(new Set([...preferred, ...fromApi])).filter(Boolean);
+    return all.filter((s) => s !== 'other' || fromApi.includes('other'));
+  }, [stats?.filterOptions?.statuses]);
+
+  const levelOptions = useMemo(() => {
+    const levels = stats?.filterOptions?.levels || [];
+    return levels.filter(Boolean);
+  }, [stats?.filterOptions?.levels]);
+
+  useEffect(() => {
+    if (!stats || filtersInitialized) return;
+    setSelectedStatuses(statusOptions.includes('active') ? ['active'] : statusOptions);
+    setSelectedLevels(levelOptions);
+    setFiltersInitialized(true);
+  }, [filtersInitialized, levelOptions, stats, statusOptions]);
+
+  const filteredInventory = useMemo(() => {
+    const inv = stats?.inventory || [];
+    return inv.filter((item) => {
+      const status = String(item?.data_status || '').trim();
+      const level = String(item?.product_actual_position ?? item?.productLevel ?? '未定级').trim() || '未定级';
+      return selectedStatuses.includes(status) && selectedLevels.includes(level);
+    });
+  }, [selectedLevels, selectedStatuses, stats?.inventory]);
 
   const brandTotalAll = useMemo(() => {
-    const inv = stats?.inventory || [];
     const set = new Set<string>();
-    for (const it of inv) {
+    for (const it of filteredInventory) {
       const b = String(it?.brand || '').trim();
       if (b) set.add(b);
     }
     if (set.size > 0) return set.size;
-    const n = Number(stats?.meta?.uniqueBrandCount);
-    if (Number.isFinite(n) && n > 0) return n;
-    return stats?.brandCoverage?.length || 0;
-  }, [stats?.inventory, stats?.meta?.uniqueBrandCount, stats?.brandCoverage]);
+    return 0;
+  }, [filteredInventory]);
 
   const scopeKPIs = useMemo(() => {
-    const sb: any = stats?.statusBuckets || null;
-    const fallback = stats?.kpis || null;
-    const eff = sb?.effective?.kpis || null;
-    const dra = sb?.draft?.kpis || null;
-    const tot = sb?.total?.kpis || null;
-
-    const merge = (a: any, b: any) => {
-      const A = a || {};
-      const B = b || {};
-      const totalStyles = Number(A.totalStyles || 0) + Number(B.totalStyles || 0);
-      const matchedLasts = Number(A.matchedLasts || A.last3DCount || 0) + Number(B.matchedLasts || B.last3DCount || 0);
-      const matchedSoles = Number(A.matchedSoles || A.sole3DCount || 0) + Number(B.matchedSoles || B.sole3DCount || 0);
-      const stylesWithAny3D = Number(A.stylesWithAny3D || 0) + Number(B.stylesWithAny3D || 0);
-      const lastCodeLinked = Number(A.lastCodeLinked || 0) + Number(B.lastCodeLinked || 0);
-      const soleCodeLinked = Number(A.soleCodeLinked || 0) + Number(B.soleCodeLinked || 0);
-
-      const last3DCoverage = totalStyles > 0 ? Math.round((matchedLasts / totalStyles) * 1000) / 10 : 0;
-      const sole3DCoverage = totalStyles > 0 ? Math.round((matchedSoles / totalStyles) * 1000) / 10 : 0;
-      const lastCoverage = totalStyles > 0 ? Math.round((matchedLasts / totalStyles) * 100) : 0;
-      const soleCoverage = totalStyles > 0 ? Math.round((matchedSoles / totalStyles) * 100) : 0;
-      const any3DCoveragePercent = totalStyles > 0 ? Math.round((stylesWithAny3D / totalStyles) * 100) : 0;
-      const lastCodeLinkRate = totalStyles > 0 ? Math.round((lastCodeLinked / totalStyles) * 1000) / 10 : 0;
-      const soleCodeLinkRate = totalStyles > 0 ? Math.round((soleCodeLinked / totalStyles) * 1000) / 10 : 0;
-
-      return {
-        styles: { totalAll: totalStyles, totalEffective: totalStyles },
-        totalStyles,
-        activeStyles: totalStyles,
-        matched3DLasts: matchedLasts,
-        matched3DSoles: matchedSoles,
-        last3DCount: matchedLasts,
-        sole3DCount: matchedSoles,
-        stylesWithAny3D,
-        any3DCoveragePercent,
-        last3DCoverage,
-        sole3DCoverage,
-        lastCoverage,
-        soleCoverage,
-        lastCodeLinked,
-        soleCodeLinked,
-        lastCodeLinkRate,
-        soleCodeLinkRate,
-        deltaActiveStyles: 0,
-        deltaMatched3DLasts: 0,
-        deltaMatched3DSoles: 0,
-      };
+    const totalStyles = filteredInventory.length;
+    const matchedLasts = filteredInventory.filter((x) => x?.has3DLast === true || String(x?.lastStatus || '') === 'matched').length;
+    const matchedSoles = filteredInventory.filter((x) => x?.has3DSole === true || String(x?.soleStatus || '') === 'matched').length;
+    const lastCodeLinked = filteredInventory.filter((x) => isLinkedCode(x?.lastCode)).length;
+    const soleCodeLinked = filteredInventory.filter((x) => isLinkedCode(x?.soleCode)).length;
+    const stylesWithAny3D = filteredInventory.filter(
+      (x) => x?.has3DLast === true || x?.has3DSole === true || String(x?.lastStatus || '') === 'matched' || String(x?.soleStatus || '') === 'matched'
+    ).length;
+    const pct1 = (num: number) => (totalStyles > 0 ? Math.round((num / totalStyles) * 1000) / 10 : 0);
+    const pct0 = (num: number) => (totalStyles > 0 ? Math.round((num / totalStyles) * 100) : 0);
+    return {
+      styles: { totalAll: totalStyles, totalEffective: totalStyles },
+      totalStyles,
+      activeStyles: totalStyles,
+      matched3DLasts: matchedLasts,
+      matched3DSoles: matchedSoles,
+      last3DCount: matchedLasts,
+      sole3DCount: matchedSoles,
+      stylesWithAny3D,
+      any3DCoveragePercent: pct0(stylesWithAny3D),
+      last3DCoverage: pct1(matchedLasts),
+      sole3DCoverage: pct1(matchedSoles),
+      lastCoverage: pct0(matchedLasts),
+      soleCoverage: pct0(matchedSoles),
+      lastCodeLinked,
+      soleCodeLinked,
+      lastCodeLinkRate: pct1(lastCodeLinked),
+      soleCodeLinkRate: pct1(soleCodeLinked),
+      deltaActiveStyles: 0,
+      deltaMatched3DLasts: 0,
+      deltaMatched3DSoles: 0,
     };
+  }, [filteredInventory]);
 
-    if (!sb) return fallback;
-    if (statusScope === 'effective') return eff || fallback;
-    if (statusScope === 'includeDraft') return merge(eff, dra);
-    // 全量池：必须用 statusBuckets.total（含作废），禁止误用 draft 或仅生效的顶层 kpis
-    const t = tot;
-    if (t && typeof t.totalStyles === 'number') {
-      return {
-        ...t,
-        styles: {
-          totalAll: t.totalStyles,
-          totalEffective: stats?.kpis?.styles?.totalEffective ?? stats?.kpis?.activeStyles ?? 0,
-        },
-      };
-    }
-    return fallback;
-  }, [stats, statusScope]);
-
-  /** 与详细清单一致：当前 Tab 口径下 has3DLast === true 的行数（优先于分桶 KPI 展示） */
-  const kpiLast3DMatchedFromInventory = useMemo(() => {
-    const inv = stats?.inventory || [];
-    if (!inv.length) return null;
-    const want = (ds: string) => {
-      const s = String(ds || '').trim();
-      if (statusScope === 'effective') return s === 'active';
-      if (statusScope === 'includeDraft') return s === 'active' || s === 'draft';
-      return true;
-    };
-    return inv.filter((it) => want(String(it?.data_status || '')) && it.has3DLast === true).length;
-  }, [stats?.inventory, statusScope]);
-
-  const kpiSole3DMatchedFromInventory = useMemo(() => {
-    const inv = stats?.inventory || [];
-    if (!inv.length) return null;
-    const want = (ds: string) => {
-      const s = String(ds || '').trim();
-      if (statusScope === 'effective') return s === 'active';
-      if (statusScope === 'includeDraft') return s === 'active' || s === 'draft';
-      return true;
-    };
-    return inv.filter((it) => {
-      if (!want(String(it?.data_status || ''))) return false;
-      return it.has3DSole === true || String(it?.soleStatus || '') === 'matched';
-    }).length;
-  }, [stats?.inventory, statusScope]);
-
-  const displayLast3DKpi =
-    kpiLast3DMatchedFromInventory !== null ? kpiLast3DMatchedFromInventory : (scopeKPIs?.last3DCount ?? scopeKPIs?.matched3DLasts ?? 0);
-  const displaySole3DKpi =
-    kpiSole3DMatchedFromInventory !== null ? kpiSole3DMatchedFromInventory : (scopeKPIs?.sole3DCount ?? scopeKPIs?.matched3DSoles ?? 0);
-
-  /** 仅生效 / 含草稿 / 全量池：effective + draft + invalid(=obsolete) + other，与入库行数一致 */
-  const tabStyleTotalCount = useMemo(() => {
-    const c = invStatusCounts;
-    if (!c) return Number(scopeKPIs?.styles?.totalAll ?? scopeKPIs?.totalStyles ?? 0);
-    if (statusScope === 'effective') return c.effective;
-    if (statusScope === 'includeDraft') return c.effective + c.draft;
-    return c.effective + c.draft + c.obsolete + c.other;
-  }, [invStatusCounts, statusScope, scopeKPIs]);
+  const displayLast3DKpi = scopeKPIs?.last3DCount ?? scopeKPIs?.matched3DLasts ?? 0;
+  const displaySole3DKpi = scopeKPIs?.sole3DCount ?? scopeKPIs?.matched3DSoles ?? 0;
+  const tabStyleTotalCount = scopeKPIs?.totalStyles ?? scopeKPIs?.styles?.totalAll ?? 0;
 
   const digitizationStats = useCallback(
     (dim: 'last' | 'sole') => {
-      const inv = stats?.inventory || [];
-      const want = (s: string) => {
-        if (statusScope === 'effective') return s === 'active';
-        if (statusScope === 'includeDraft') return s === 'active' || s === 'draft';
-        return true; // 全量池：含作废 + 其他
-      };
+      const inv = filteredInventory;
       const codeField = dim === 'last' ? 'lastCode' : 'soleCode';
-      const statusField = dim === 'last' ? 'lastStatus' : 'soleStatus';
-      const isLinkedCode = (v: any) => {
-        const t = String(v ?? '').trim();
-        return t !== '' && t !== '-' && t !== '0';
-      };
 
       const byBrand = new Map<string, { brand: string; total: number; hasCode: number; has3D: number }>();
       for (const it of inv) {
-        const s = String(it?.data_status || '').trim();
-        if (!want(s)) continue;
         const brand = String(it?.brand || 'Unknown').trim() || 'Unknown';
         const cur = byBrand.get(brand) || { brand, total: 0, hasCode: 0, has3D: 0 };
         cur.total += 1;
@@ -367,7 +292,7 @@ export default function Dashboard() {
         .sort((a, b) => (b.totalEffective || 0) - (a.totalEffective || 0))
         .slice(0, 30);
     },
-    [stats?.inventory, statusScope]
+    [filteredInventory]
   );
 
   useEffect(() => {
@@ -506,20 +431,16 @@ export default function Dashboard() {
     if (Array.isArray(inv) && inv.length > 0) return digitizationStats('last');
     const sb: any = stats?.statusBuckets;
     if (!sb) return stats?.lastDigitizationStats || [];
-    if (statusScope === 'effective') return sb.effective?.lastDigitizationStats || stats?.lastDigitizationStats || [];
-    if (statusScope === 'total') return sb.total?.lastDigitizationStats || [];
-    return mergeBrandDigitizationRows(sb.effective?.lastDigitizationStats, sb.draft?.lastDigitizationStats);
-  }, [stats?.inventory, stats?.statusBuckets, stats?.lastDigitizationStats, statusScope, digitizationStats]);
+    return sb.effective?.lastDigitizationStats || stats?.lastDigitizationStats || [];
+  }, [stats?.inventory, stats?.statusBuckets, stats?.lastDigitizationStats, digitizationStats]);
 
   const soleChartRows = useMemo(() => {
     const inv = stats?.inventory;
     if (Array.isArray(inv) && inv.length > 0) return digitizationStats('sole');
     const sb: any = stats?.statusBuckets;
     if (!sb) return stats?.soleDigitizationStats || [];
-    if (statusScope === 'effective') return sb.effective?.soleDigitizationStats || stats?.soleDigitizationStats || [];
-    if (statusScope === 'total') return sb.total?.soleDigitizationStats || [];
-    return mergeBrandDigitizationRows(sb.effective?.soleDigitizationStats, sb.draft?.soleDigitizationStats);
-  }, [stats?.inventory, stats?.statusBuckets, stats?.soleDigitizationStats, statusScope, digitizationStats]);
+    return sb.effective?.soleDigitizationStats || stats?.soleDigitizationStats || [];
+  }, [stats?.inventory, stats?.statusBuckets, stats?.soleDigitizationStats, digitizationStats]);
 
   return (
     <div className="space-y-6 animate-in fade-in duration-500 pb-10">
@@ -535,36 +456,6 @@ export default function Dashboard() {
           )}
         </div>
         <div className="shrink-0 flex items-center gap-3">
-          <div className="inline-flex items-center rounded-lg border border-slate-200 bg-white shadow-sm overflow-hidden">
-            <button
-              className={cn(
-                'px-3 py-2 text-sm font-medium transition-colors',
-                statusScope === 'effective' ? 'bg-slate-900 text-white' : 'bg-white text-slate-700 hover:bg-slate-50'
-              )}
-              onClick={() => setStatusScope('effective')}
-            >
-              仅生效款
-            </button>
-            <button
-              className={cn(
-                'px-3 py-2 text-sm font-medium transition-colors border-l border-slate-200',
-                statusScope === 'includeDraft' ? 'bg-slate-900 text-white' : 'bg-white text-slate-700 hover:bg-slate-50'
-              )}
-              onClick={() => setStatusScope('includeDraft')}
-            >
-              包含草稿
-            </button>
-            <button
-              className={cn(
-                'px-3 py-2 text-sm font-medium transition-colors border-l border-slate-200',
-                statusScope === 'total' ? 'bg-slate-900 text-white' : 'bg-white text-slate-700 hover:bg-slate-50'
-              )}
-              onClick={() => setStatusScope('total')}
-            >
-              全量池
-            </button>
-          </div>
-
           <button
             onClick={() => void handleForceSync()}
             disabled={isForceSyncing}
@@ -622,6 +513,91 @@ export default function Dashboard() {
         </div>
       )}
 
+      {!isCoreMainMissing && stats && (
+        <div className="w-full rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div>
+              <h3 className="text-base font-semibold text-slate-900">筛选中心</h3>
+              <p className="mt-1 text-xs text-slate-500">
+                按款式状态和产品定级取交集，KPI 与品牌排行实时重算。
+              </p>
+            </div>
+            <div className="text-xs text-slate-500">
+              当前命中 <span className="font-semibold text-slate-900">{filteredInventory.length}</span> / {stats.inventory?.length || 0} 款
+            </div>
+          </div>
+          <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
+            <div>
+              <div className="mb-2 text-xs font-medium text-slate-500">款式状态</div>
+              <div className="flex flex-wrap gap-2">
+                {statusOptions.map((status) => {
+                  const checked = selectedStatuses.includes(status);
+                  return (
+                    <label
+                      key={status}
+                      className={cn(
+                        'inline-flex cursor-pointer items-center gap-2 rounded-lg border px-3 py-2 text-sm font-medium transition-colors',
+                        checked ? 'border-slate-900 bg-slate-900 text-white' : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                      )}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={() =>
+                          setSelectedStatuses((prev) =>
+                            prev.includes(status) ? prev.filter((x) => x !== status) : [...prev, status]
+                          )
+                        }
+                        className="h-3.5 w-3.5 accent-slate-900"
+                      />
+                      {statusLabel(status)}
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+            <div>
+              <div className="mb-2 text-xs font-medium text-slate-500">产品定级</div>
+              <div className="flex flex-wrap gap-2">
+                {levelOptions.length === 0 ? (
+                  <span className="text-sm text-slate-400">暂无产品定级字段</span>
+                ) : (
+                  levelOptions.map((level) => {
+                    const checked = selectedLevels.includes(level);
+                    return (
+                      <label
+                        key={level}
+                        className={cn(
+                          'inline-flex cursor-pointer items-center gap-2 rounded-lg border px-3 py-2 text-sm font-semibold transition-colors',
+                          checked ? 'border-violet-600 bg-violet-50 text-violet-700' : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                        )}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() =>
+                            setSelectedLevels((prev) =>
+                              prev.includes(level) ? prev.filter((x) => x !== level) : [...prev, level]
+                            )
+                          }
+                          className="h-3.5 w-3.5 accent-violet-600"
+                        />
+                        {levelLabel(level)}
+                      </label>
+                    );
+                  })
+                )}
+              </div>
+            </div>
+          </div>
+          {filteredInventory.length === 0 && (
+            <div className="mt-4 rounded-lg border border-dashed border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-500">
+              当前筛选条件下无款式数据
+            </div>
+          )}
+        </div>
+      )}
+
       {/* KPI Cards - 5 Cards Layout */}
       {!isCoreMainMissing && <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-5 gap-4">
         {/* Card 1: Total Brands */}
@@ -653,11 +629,9 @@ export default function Dashboard() {
             <div className="mt-1 text-xs text-slate-500">
               当前口径：
               <span className="font-medium text-slate-700">
-                {statusScope === 'effective'
-                  ? '仅生效'
-                  : statusScope === 'includeDraft'
-                    ? '生效+草稿'
-                    : '全量池（effective + draft + invalid）'}
+                {selectedStatuses.map(statusLabel).join('、') || '未选择状态'}
+                {' · '}
+                {selectedLevels.map(levelLabel).join('、') || '未选择定级'}
               </span>
             </div>
           </div>

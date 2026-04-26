@@ -75,6 +75,24 @@ const DataStatusBadge = ({ status }: { status: InventoryItem['data_status'] }) =
   }
 };
 
+const LevelBadge = ({ level }: { level?: string }) => {
+  const raw = String(level || '').trim();
+  if (!raw || raw === '未定级') return null;
+  const label = /^[SABCDEF]$/.test(raw) ? `${raw}级款` : `${raw}款`;
+  return (
+    <span
+      className={cn(
+        'rounded-full border px-2 py-0.5 text-[11px] font-bold',
+        raw === 'S'
+          ? 'border-violet-200 bg-violet-50 text-violet-700'
+          : 'border-slate-200 bg-slate-50 text-slate-600'
+      )}
+    >
+      {label}
+    </span>
+  );
+};
+
 interface PreviewModalProps {
   isOpen: boolean;
   onClose: () => void;
@@ -691,6 +709,13 @@ export default function InventoryList() {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
+              {!isLoading && filteredItems.length === 0 && (
+                <tr>
+                  <td colSpan={11} className="px-5 py-12 text-center text-sm text-slate-500">
+                    当前筛选条件下无款式数据
+                  </td>
+                </tr>
+              )}
               {filteredItems.map((item) => (
                 <tr
                   key={item.id}
@@ -703,7 +728,12 @@ export default function InventoryList() {
                         : 'hover:bg-slate-50/50'
                   )}
                 >
-                  <td className="px-5 py-4 font-medium text-slate-900">{item.style_wms}</td>
+                  <td className="px-5 py-4 font-medium text-slate-900">
+                    <div className="flex items-center gap-2">
+                      <span>{item.style_wms}</span>
+                      <LevelBadge level={item.product_actual_position || item.productLevel} />
+                    </div>
+                  </td>
                   <td className="px-5 py-4 text-slate-600">
                     <span className="bg-slate-100 px-2.5 py-1 rounded-md text-xs font-medium">{item.brand}</span>
                   </td>

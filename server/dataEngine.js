@@ -251,6 +251,12 @@ function normalizeInventoryStatus(v) {
   return 'other';
 }
 
+function normalizeProductLevel(v) {
+  const s = String(v ?? '').trim().toUpperCase().replace(/\s+/g, '');
+  if (!s) return '未定级';
+  return s.endsWith('级') ? s.slice(0, -1) || '未定级' : s;
+}
+
 /** 列出所有未落入 active/draft/obsolete 的原始词汇（只计 other） */
 function auditMainTableOtherStatusDistribution(main, statusCol) {
   const counts = new Map();
@@ -2175,6 +2181,8 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
   let soleSuccessPrinted = 0;
   let brandFallbackPrinted = 0;
   const unrecognizedStatusSamples = [];
+  const filterStatusSet = new Set();
+  const filterLevelSet = new Set();
   for (let i = 0; i < main.rows.length; i++) {
     const row = main.rows[i] || {};
     const styleVal = styleCol ? normalize(row?.[styleCol]) : '';
@@ -2195,6 +2203,9 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
     }
     const invStatus = normalizeInventoryStatus(rawStatusVal);
     statusDist[invStatus] += 1;
+    filterStatusSet.add(invStatus);
+    const productLevel = normalizeProductLevel(getRowFieldLoose(row, 'product_actual_position', main.headers));
+    filterLevelSet.add(productLevel);
 
     const lastResolved = (() => {
       // 强制路径：优先直接取 associated_last_type；若列名在生产快照中变体，则自动探测 FK 列
@@ -2371,6 +2382,8 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
       soleStatus: has3DSole ? 'matched' : 'missing',
       has3DSole,
       data_status: invStatus,
+      product_actual_position: productLevel,
+      productLevel,
       lastUpdated: dateDirName || '',
       updatedBy: 'Storage',
       sourceTable: main.fileName,
@@ -2433,6 +2446,18 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
   const soleDigitizationStats = statusBuckets.effective.soleDigitizationStats;
 
   const inventoryOut = inventory.map(({ __has3DAny, __has3DLast, __has3DSole, ...rest }) => rest);
+  const styleMetadata = inventoryOut.map((row) => ({
+    style_wms: row.style_wms,
+    brand: row.brand,
+    status: row.data_status,
+    level: row.product_actual_position || row.productLevel || '未定级',
+    hasId: Boolean(normalize(row.lastCode || row.soleCode)),
+    has3D: row.has3DLast === true || row.has3DSole === true,
+  }));
+  const filterOptions = {
+    statuses: Array.from(filterStatusSet.values()).filter(Boolean),
+    levels: Array.from(filterLevelSet.values()).filter(Boolean).sort((a, b) => String(a).localeCompare(String(b), 'zh-CN', { numeric: true })),
+  };
 
   return {
     dateDirName,
@@ -2478,6 +2503,8 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
     lastDigitizationStats,
     soleDigitizationStats,
     inventory: inventoryOut,
+    styleMetadata,
+    filterOptions,
     rawStatusAudit,
     meta: {
       mainTable: main.fileName,
@@ -2595,6 +2622,8 @@ export async function processAllData({ storageRoot }) {
     lastDigitizationStats: latest.lastDigitizationStats || [],
     soleDigitizationStats: latest.soleDigitizationStats || [],
     inventory: latest.inventory,
+    styleMetadata: latest.styleMetadata || [],
+    filterOptions: latest.filterOptions || { statuses: [], levels: [] },
     trendHistory,
     trends: {
       // legacy: 保留字段，避免老 UI 依赖；但新 UI 请使用 trendHistory
