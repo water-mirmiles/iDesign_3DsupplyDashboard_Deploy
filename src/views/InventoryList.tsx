@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Search, Filter, Download, MoreHorizontal, CheckCircle2, XCircle, Database, Box, Layers, X, DownloadCloud, ChevronDown } from 'lucide-react';
+import { Search, Filter, Download, MoreHorizontal, CheckCircle2, XCircle, Database, Box, Layers, X, DownloadCloud } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { InventoryItem } from '@/types';
 import ThreeDViewer from '@/components/ThreeDViewer';
@@ -44,6 +44,10 @@ type AssetMetaResponse = {
   } | null;
   error?: string;
 };
+
+type AssetFilter = 'all' | 'matched' | 'missing';
+
+const SEARCH_HISTORY_KEY = 'inventorySearchHistory';
 
 function styleStatusLabel(status: string) {
   switch (status) {
@@ -112,6 +116,24 @@ function levelSortRank(level?: string) {
   const normalized = normalizeLevel(level);
   const rank: Record<string, number> = { S: 0, A: 1, B: 2, C: 3, EOL: 4 };
   return rank[normalized] ?? 99;
+}
+
+function toggleValue(list: string[], value: string) {
+  return list.includes(value) ? list.filter((x) => x !== value) : [...list, value];
+}
+
+function getDateValue(v?: string) {
+  const s = String(v || '').trim();
+  return /^\d{4}-\d{2}-\d{2}/.test(s) ? s.slice(0, 10) : '';
+}
+
+function readSearchHistory() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(SEARCH_HISTORY_KEY) || '[]');
+    return Array.isArray(parsed) ? parsed.map((x) => String(x || '').trim()).filter(Boolean).slice(0, 10) : [];
+  } catch {
+    return [];
+  }
 }
 
 interface PreviewModalProps {
@@ -515,9 +537,17 @@ export default function InventoryList() {
     type: 'last' | 'sole';
     targetAudience?: string;
   }>({ isOpen: false, assetCode: '', type: 'last' });
-  const [has3DFilter, setHas3DFilter] = useState<string>('all');
-  const [brandFilter, setBrandFilter] = useState<string>('all');
   const [searchTerm, setSearchTerm] = useState<string>('');
+  const [searchHistory, setSearchHistory] = useState<string[]>(() => readSearchHistory());
+  const [showSearchHistory, setShowSearchHistory] = useState(false);
+  const [isAdvancedOpen, setIsAdvancedOpen] = useState(false);
+  const [selectedLevels, setSelectedLevels] = useState<string[]>([]);
+  const [selectedBrands, setSelectedBrands] = useState<string[]>([]);
+  const [selectedStatuses, setSelectedStatuses] = useState<string[]>([]);
+  const [lastAssetFilter, setLastAssetFilter] = useState<AssetFilter>('all');
+  const [soleAssetFilter, setSoleAssetFilter] = useState<AssetFilter>('all');
+  const [dateFrom, setDateFrom] = useState('');
+  const [dateTo, setDateTo] = useState('');
   const [drilldown, setDrilldown] = useState<{ dimension: 'last' | 'sole'; bucket: 'no_code' | 'has_code_no_3d' | 'completed_3d' } | null>(null);
   const [levelSortDirection, setLevelSortDirection] = useState<'none' | 'asc' | 'desc'>('none');
   const [items, setItems] = useState<InventoryItem[]>([]);
@@ -529,6 +559,29 @@ export default function InventoryList() {
       setPreviewModal({ isOpen: true, assetCode, type, targetAudience });
     }
   };
+
+  const saveSearchKeyword = useCallback((keyword: string) => {
+    const q = keyword.trim();
+    if (!q) return;
+    setSearchHistory((prev) => {
+      const next = [q, ...prev.filter((item) => item.toLowerCase() !== q.toLowerCase())].slice(0, 10);
+      localStorage.setItem(SEARCH_HISTORY_KEY, JSON.stringify(next));
+      return next;
+    });
+    setShowSearchHistory(false);
+  }, []);
+
+  const resetAllFilters = useCallback(() => {
+    setSearchTerm('');
+    setSelectedLevels([]);
+    setSelectedBrands([]);
+    setSelectedStatuses([]);
+    setLastAssetFilter('all');
+    setSoleAssetFilter('all');
+    setDateFrom('');
+    setDateTo('');
+    setDrilldown(null);
+  }, []);
 
   const loadInventory = useCallback(async () => {
     setIsLoading(true);
@@ -550,7 +603,7 @@ export default function InventoryList() {
     try {
       const preset = localStorage.getItem('inventoryBrandFilter');
       if (preset) {
-        setBrandFilter(preset);
+        setSelectedBrands([preset]);
         localStorage.removeItem('inventoryBrandFilter');
       }
       const dd = localStorage.getItem('inventoryDrilldown');
@@ -587,9 +640,45 @@ export default function InventoryList() {
     return Array.from(set.values()).sort((a, b) => a.localeCompare(b));
   }, [items]);
 
+  const levelOptions = useMemo(() => {
+    const set = new Set<string>();
+    for (const it of items) {
+      const level = getProductLevel(it) || '未定级';
+      set.add(level);
+    }
+    return Array.from(set.values()).sort((a, b) => {
+      const ra = levelSortRank(a);
+      const rb = levelSortRank(b);
+      if (ra !== rb) return ra - rb;
+      return a.localeCompare(b, 'zh-CN', { numeric: true });
+    });
+  }, [items]);
+
+  const statusOptions = useMemo(() => {
+    const pri: Record<string, number> = { active: 0, draft: 1, obsolete: 2, other: 3 };
+    const set = new Set<string>();
+    for (const it of items) {
+      const status = String(it.data_status || '').trim();
+      if (status) set.add(status);
+    }
+    return Array.from(set.values()).sort((a, b) => (pri[a] ?? 9) - (pri[b] ?? 9));
+  }, [items]);
+
+  const activeAdvancedFilterCount = useMemo(() => {
+    return (
+      selectedLevels.length +
+      selectedBrands.length +
+      selectedStatuses.length +
+      (lastAssetFilter !== 'all' ? 1 : 0) +
+      (soleAssetFilter !== 'all' ? 1 : 0) +
+      (dateFrom ? 1 : 0) +
+      (dateTo ? 1 : 0) +
+      (drilldown ? 1 : 0)
+    );
+  }, [dateFrom, dateTo, drilldown, lastAssetFilter, selectedBrands.length, selectedLevels.length, selectedStatuses.length, soleAssetFilter]);
+
   const filteredItems = useMemo(() => {
     let out = items;
-    if (brandFilter !== 'all') out = out.filter((x) => (x.brand || '').trim() === brandFilter);
     const q = searchTerm.trim().toLowerCase();
     if (q) {
       out = out.filter((item) => {
@@ -597,9 +686,18 @@ export default function InventoryList() {
         const brand = String(item.brand || '').toLowerCase();
         const lastCode = String(item.lastCode || '').toLowerCase();
         const soleCode = String(item.soleCode || '').toLowerCase();
-        return style.includes(q) || brand.includes(q) || lastCode.includes(q) || soleCode.includes(q);
+        const level = String(getProductLevel(item)).toLowerCase();
+        return style.includes(q) || brand.includes(q) || lastCode.includes(q) || soleCode.includes(q) || level.includes(q);
       });
     }
+
+    if (selectedLevels.length > 0) out = out.filter((x) => selectedLevels.includes(getProductLevel(x) || '未定级'));
+    if (selectedBrands.length > 0) out = out.filter((x) => selectedBrands.includes((x.brand || '').trim()));
+    if (selectedStatuses.length > 0) out = out.filter((x) => selectedStatuses.includes(String(x.data_status || '').trim()));
+    if (lastAssetFilter !== 'all') out = out.filter((x) => x.lastStatus === lastAssetFilter);
+    if (soleAssetFilter !== 'all') out = out.filter((x) => x.soleStatus === soleAssetFilter);
+    if (dateFrom) out = out.filter((x) => getDateValue(x.lastUpdated) >= dateFrom);
+    if (dateTo) out = out.filter((x) => getDateValue(x.lastUpdated) <= dateTo);
 
     // 图表钻取：按责任区间过滤（无 UI 暴露，来自 Dashboard 点击）
     if (drilldown) {
@@ -614,11 +712,6 @@ export default function InventoryList() {
           out = out.filter((x) => Boolean(String(x.soleCode || '').trim()) && x.soleStatus !== 'matched');
         if (drilldown.bucket === 'completed_3d') out = out.filter((x) => x.soleStatus === 'matched');
       }
-    }
-
-    if (has3DFilter !== 'all') {
-      if (has3DFilter === 'yes') out = out.filter((x) => x.lastStatus === 'matched' || x.soleStatus === 'matched');
-      else out = out.filter((x) => x.lastStatus !== 'matched' && x.soleStatus !== 'matched');
     }
 
     // 默认排序：生效在前，其次草稿，最后作废；产品定级排序由表头显式触发。
@@ -639,7 +732,19 @@ export default function InventoryList() {
       return String(a?.style_wms || '').localeCompare(String(b?.style_wms || ''), 'en', { numeric: true });
     });
     return out;
-  }, [brandFilter, has3DFilter, items, searchTerm, drilldown, levelSortDirection]);
+  }, [
+    dateFrom,
+    dateTo,
+    drilldown,
+    items,
+    lastAssetFilter,
+    levelSortDirection,
+    searchTerm,
+    selectedBrands,
+    selectedLevels,
+    selectedStatuses,
+    soleAssetFilter,
+  ]);
 
   return (
     <div className="space-y-6 animate-in fade-in duration-500 pb-10">
@@ -648,11 +753,21 @@ export default function InventoryList() {
           <h1 className="text-2xl font-semibold text-slate-900">款号详细清单</h1>
           <p className="text-sm text-slate-500 mt-1">管理所有款号及其 3D 资产的匹配状态</p>
         </div>
-        <div className="flex gap-3">
-          <button className="flex items-center gap-2 px-4 py-2 bg-white border border-slate-200 text-slate-700 text-sm font-medium rounded-lg hover:bg-slate-50 transition-colors shadow-sm">
+        <div className="flex items-center gap-3">
+          <button
+            type="button"
+            onClick={() => setIsAdvancedOpen(true)}
+            className="flex items-center gap-2 px-4 py-2 bg-white border border-slate-200 text-slate-700 text-sm font-medium rounded-lg hover:bg-slate-50 transition-colors shadow-sm"
+          >
             <Filter className="w-4 h-4" />
             高级筛选
+            {activeAdvancedFilterCount > 0 && (
+              <span className="rounded-full bg-blue-600 px-1.5 py-0.5 text-[10px] font-bold text-white">{activeAdvancedFilterCount}</span>
+            )}
           </button>
+          <span className="text-sm text-slate-500">
+            当前命中：<span className="font-semibold text-slate-900">{filteredItems.length}</span> 条 / 共 {items.length} 条
+          </span>
           <button className="flex items-center gap-2 px-4 py-2 bg-white border border-slate-200 text-slate-700 text-sm font-medium rounded-lg hover:bg-slate-50 transition-colors shadow-sm">
             <Download className="w-4 h-4" />
             导出报表
@@ -670,41 +785,63 @@ export default function InventoryList() {
                 type="text" 
                 placeholder="搜索款号或品牌..." 
                 value={searchTerm}
-                onChange={(e) => setSearchTerm(e.target.value)}
-                className="pl-9 pr-4 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent w-64"
+                onChange={(e) => {
+                  setSearchTerm(e.target.value);
+                  setShowSearchHistory(e.target.value.trim() === '');
+                }}
+                onFocus={() => {
+                  if (!searchTerm.trim()) setShowSearchHistory(true);
+                }}
+                onBlur={() => setShowSearchHistory(false)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') saveSearchKeyword(searchTerm);
+                }}
+                className="pl-9 pr-4 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent w-72"
               />
+              {showSearchHistory && !searchTerm.trim() && searchHistory.length > 0 && (
+                <div className="absolute left-0 top-full z-30 mt-2 w-72 rounded-xl border border-slate-200 bg-white p-3 shadow-xl">
+                  <div className="mb-2 flex items-center justify-between">
+                    <span className="text-xs font-semibold text-slate-500">最近搜索</span>
+                    <button
+                      type="button"
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        localStorage.removeItem(SEARCH_HISTORY_KEY);
+                        setSearchHistory([]);
+                      }}
+                      className="text-xs text-slate-400 hover:text-red-500"
+                    >
+                      清除历史
+                    </button>
+                  </div>
+                  <div className="space-y-1">
+                    {searchHistory.map((item) => (
+                      <button
+                        type="button"
+                        key={item}
+                        onMouseDown={(e) => {
+                          e.preventDefault();
+                          setSearchTerm(item);
+                          setShowSearchHistory(false);
+                        }}
+                        className="block w-full truncate rounded-lg px-2 py-2 text-left text-sm text-slate-700 hover:bg-slate-50"
+                        title={item}
+                      >
+                        {item}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
-            
-            {/* Brand Filter Mock */}
-            <div className="relative">
-              <select
-                value={brandFilter}
-                onChange={(e) => setBrandFilter(e.target.value)}
-                className="appearance-none pl-3 pr-8 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white text-slate-600 font-medium"
-              >
-                <option value="all">所有品牌</option>
-                {brandOptions.map((b) => (
-                  <option key={b} value={b}>
-                    {b}
-                  </option>
-                ))}
-              </select>
-              <ChevronDown className="w-4 h-4 absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
-            </div>
-
-            {/* Has 3D Filter */}
-            <div className="relative">
-              <select 
-                value={has3DFilter}
-                onChange={(e) => setHas3DFilter(e.target.value)}
-                className="appearance-none pl-3 pr-8 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white text-slate-600 font-medium"
-              >
-                <option value="all">3D 文件: 全部</option>
-                <option value="yes">有 3D 文件</option>
-                <option value="no">无 3D 文件</option>
-              </select>
-              <ChevronDown className="w-4 h-4 absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
-            </div>
+            <button
+              type="button"
+              onClick={() => saveSearchKeyword(searchTerm)}
+              className="inline-flex items-center gap-2 rounded-lg bg-slate-900 px-3 py-2 text-sm font-medium text-white shadow-sm hover:bg-slate-800"
+            >
+              <Search className="h-4 w-4" />
+              搜索
+            </button>
           </div>
           <div className="text-sm text-slate-500">
             共 <span className="font-medium text-slate-900">{filteredItems.length}</span> 条记录
@@ -870,6 +1007,181 @@ export default function InventoryList() {
           </span>
         </div>
       </div>
+
+      {isAdvancedOpen && (
+        <div className="fixed inset-0 z-50 flex justify-end bg-slate-900/30 backdrop-blur-sm">
+          <div className="flex h-full w-full max-w-xl flex-col bg-white shadow-2xl">
+            <div className="flex items-start justify-between border-b border-slate-200 px-6 py-5">
+              <div>
+                <h2 className="text-lg font-semibold text-slate-900">高级筛选</h2>
+                <p className="mt-1 text-sm text-slate-500">
+                  当前命中 {filteredItems.length} 条 / 共 {items.length} 条
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsAdvancedOpen(false)}
+                className="rounded-lg p-2 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+                aria-label="关闭高级筛选"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            <div className="flex-1 space-y-6 overflow-y-auto px-6 py-5">
+              <section>
+                <div className="mb-3 text-sm font-semibold text-slate-900">产品定级 (Level)</div>
+                <div className="grid grid-cols-2 gap-2">
+                  {levelOptions.map((level) => (
+                    <label key={level} className="flex cursor-pointer items-center gap-2 rounded-lg border border-slate-200 px-3 py-2 hover:bg-slate-50">
+                      <input
+                        type="checkbox"
+                        checked={selectedLevels.includes(level)}
+                        onChange={() => setSelectedLevels((prev) => toggleValue(prev, level))}
+                        className="h-4 w-4 accent-blue-600"
+                      />
+                      <LevelBadge level={level} />
+                    </label>
+                  ))}
+                </div>
+              </section>
+
+              <section>
+                <div className="mb-3 flex items-center justify-between">
+                  <div className="text-sm font-semibold text-slate-900">品牌 (Brand)</div>
+                  {selectedBrands.length > 0 && (
+                    <button type="button" onClick={() => setSelectedBrands([])} className="text-xs text-blue-600 hover:text-blue-700">
+                      清空品牌
+                    </button>
+                  )}
+                </div>
+                <div className="grid max-h-56 grid-cols-2 gap-2 overflow-y-auto pr-1">
+                  {brandOptions.map((brand) => (
+                    <label key={brand} className="flex cursor-pointer items-center gap-2 rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 hover:bg-slate-50">
+                      <input
+                        type="checkbox"
+                        checked={selectedBrands.includes(brand)}
+                        onChange={() => setSelectedBrands((prev) => toggleValue(prev, brand))}
+                        className="h-4 w-4 accent-blue-600"
+                      />
+                      <span className="truncate" title={brand}>{brand}</span>
+                    </label>
+                  ))}
+                </div>
+              </section>
+
+              <section className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                <div>
+                  <div className="mb-3 text-sm font-semibold text-slate-900">楦头状态</div>
+                  <div className="grid grid-cols-3 gap-2">
+                    {[
+                      ['all', '全部'],
+                      ['matched', '已匹配'],
+                      ['missing', '缺失'],
+                    ].map(([value, label]) => (
+                      <button
+                        key={value}
+                        type="button"
+                        onClick={() => setLastAssetFilter(value as AssetFilter)}
+                        className={cn(
+                          'rounded-lg border px-3 py-2 text-sm font-medium',
+                          lastAssetFilter === value ? 'border-blue-600 bg-blue-600 text-white' : 'border-slate-200 bg-slate-50 text-slate-700 hover:bg-white'
+                        )}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div>
+                  <div className="mb-3 text-sm font-semibold text-slate-900">大底状态</div>
+                  <div className="grid grid-cols-3 gap-2">
+                    {[
+                      ['all', '全部'],
+                      ['matched', '已匹配'],
+                      ['missing', '缺失'],
+                    ].map(([value, label]) => (
+                      <button
+                        key={value}
+                        type="button"
+                        onClick={() => setSoleAssetFilter(value as AssetFilter)}
+                        className={cn(
+                          'rounded-lg border px-3 py-2 text-sm font-medium',
+                          soleAssetFilter === value ? 'border-blue-600 bg-blue-600 text-white' : 'border-slate-200 bg-slate-50 text-slate-700 hover:bg-white'
+                        )}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </section>
+
+              <section>
+                <div className="mb-3 text-sm font-semibold text-slate-900">业务状态 (Data_Status)</div>
+                <div className="flex flex-wrap gap-2">
+                  {statusOptions.map((status) => (
+                    <button
+                      key={status}
+                      type="button"
+                      onClick={() => setSelectedStatuses((prev) => toggleValue(prev, status))}
+                      className={cn(
+                        'rounded-lg border px-3 py-2 text-sm font-medium',
+                        selectedStatuses.includes(status)
+                          ? 'border-blue-600 bg-blue-600 text-white'
+                          : 'border-slate-200 bg-slate-50 text-slate-700 hover:bg-white'
+                      )}
+                    >
+                      {styleStatusLabel(status)}
+                    </button>
+                  ))}
+                </div>
+              </section>
+
+              <section>
+                <div className="mb-3 text-sm font-semibold text-slate-900">更新时间段</div>
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <label className="text-xs font-medium text-slate-500">
+                    从
+                    <input
+                      type="date"
+                      value={dateFrom}
+                      onChange={(e) => setDateFrom(e.target.value)}
+                      className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 outline-none focus:ring-2 focus:ring-blue-500"
+                    />
+                  </label>
+                  <label className="text-xs font-medium text-slate-500">
+                    到
+                    <input
+                      type="date"
+                      value={dateTo}
+                      onChange={(e) => setDateTo(e.target.value)}
+                      className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 outline-none focus:ring-2 focus:ring-blue-500"
+                    />
+                  </label>
+                </div>
+              </section>
+            </div>
+
+            <div className="flex items-center justify-between border-t border-slate-200 px-6 py-4">
+              <button
+                type="button"
+                onClick={resetAllFilters}
+                className="rounded-lg border border-slate-200 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
+              >
+                重置所有筛选
+              </button>
+              <button
+                type="button"
+                onClick={() => setIsAdvancedOpen(false)}
+                className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800"
+              >
+                查看结果
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <PreviewModal
         isOpen={previewModal.isOpen}
