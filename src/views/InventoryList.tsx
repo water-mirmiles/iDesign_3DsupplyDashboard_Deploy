@@ -47,7 +47,7 @@ type AssetMetaResponse = {
 
 type AssetFilter = 'all' | 'matched' | 'missing';
 
-const SEARCH_HISTORY_KEY = 'supply3d_search_history';
+const SEARCH_HISTORY_KEY = 'supply3d_search_history_v2';
 
 function styleStatusLabel(status: string) {
   switch (status) {
@@ -529,14 +529,7 @@ export default function InventoryList() {
     targetAudience?: string;
   }>({ isOpen: false, assetCode: '', type: 'last' });
   const [searchTerm, setSearchTerm] = useState<string>('');
-  const [searchHistory, setSearchHistory] = useState<string[]>(() => {
-    try {
-      const parsed = JSON.parse(localStorage.getItem(SEARCH_HISTORY_KEY) || '[]');
-      return Array.isArray(parsed) ? parsed.map((item) => String(item || '').trim()).filter(Boolean).slice(0, 10) : [];
-    } catch {
-      return [];
-    }
-  });
+  const [searchHistory, setSearchHistory] = useState<string[]>([]);
   const [isSearchFocused, setIsSearchFocused] = useState(false);
   const [isAdvancedOpen, setIsAdvancedOpen] = useState(false);
   const [selectedLevels, setSelectedLevels] = useState<string[]>([]);
@@ -558,13 +551,15 @@ export default function InventoryList() {
     }
   };
 
-  const saveSearchKeyword = useCallback((keyword: string) => {
-    const q = keyword.trim();
+  const handlePerformSearch = useCallback((term: string) => {
+    const q = term.trim();
     if (!q) return;
     setSearchHistory((prev) => {
-      const next = [q, ...prev.filter((item) => item.toLowerCase() !== q.toLowerCase())].slice(0, 10);
-      localStorage.setItem(SEARCH_HISTORY_KEY, JSON.stringify(next));
-      return next;
+      const newHistory = [q, ...prev.filter((item) => item.trim().toLowerCase() !== q.toLowerCase())].slice(0, 10);
+      localStorage.setItem(SEARCH_HISTORY_KEY, JSON.stringify(newHistory));
+      // eslint-disable-next-line no-console
+      console.log('✅ 搜索历史已存入磁盘:', newHistory);
+      return newHistory;
     });
     setIsSearchFocused(false);
   }, []);
@@ -607,6 +602,19 @@ export default function InventoryList() {
     } finally {
       setIsLoading(false);
     }
+  }, []);
+
+  useEffect(() => {
+    let savedHistory: string[] = [];
+    try {
+      const parsed = JSON.parse(localStorage.getItem(SEARCH_HISTORY_KEY) || '[]');
+      savedHistory = Array.isArray(parsed) ? parsed.map((item) => String(item || '').trim()).filter(Boolean).slice(0, 10) : [];
+    } catch {
+      savedHistory = [];
+    }
+    setSearchHistory(savedHistory);
+    // eslint-disable-next-line no-console
+    console.log('📦 搜索历史已从磁盘读取:', savedHistory);
   }, []);
 
   useEffect(() => {
@@ -789,8 +797,8 @@ export default function InventoryList() {
       <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
         {/* Toolbar */}
         <div className="p-4 border-b border-slate-200 flex flex-wrap gap-4 justify-between items-center bg-slate-50/50">
-          <div className="flex flex-wrap items-center gap-3">
-            <div className="relative w-72 overflow-visible">
+          <div className="flex flex-1 flex-wrap items-center gap-3">
+            <div className="relative min-w-[18rem] max-w-md flex-1 overflow-visible">
               <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
               <input 
                 type="text" 
@@ -802,19 +810,19 @@ export default function InventoryList() {
                   window.setTimeout(() => setIsSearchFocused(false), 120);
                 }}
                 onKeyDown={(e) => {
-                  if (e.key === 'Enter') saveSearchKeyword(searchTerm);
+                  if (e.key === 'Enter') handlePerformSearch(searchTerm);
                 }}
                 className="w-full pl-9 pr-4 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
               />
-              {isSearchFocused === true && searchTerm === '' && searchHistory.length > 0 && (
+              {isSearchFocused === true && searchHistory.length > 0 && (
                 <div
-                  className="absolute left-0 top-full z-[100] mt-1 w-full rounded-lg border border-slate-200 bg-white p-3 shadow-2xl dark:border-slate-700 dark:bg-slate-900"
+                  className="absolute left-0 top-full z-[9999] mt-1 w-full rounded-lg border border-slate-200 bg-white p-3 shadow-xl dark:border-slate-700 dark:bg-slate-900"
                   onMouseDown={(e) => e.preventDefault()}
                 >
                   <div className="mb-2 flex items-center justify-between">
                     <span className="text-xs font-semibold text-slate-500 dark:text-slate-300">最近搜索</span>
                   </div>
-                  <div className="space-y-1">
+                  <div className="space-y-1" onMouseDown={(e) => e.preventDefault()}>
                     {searchHistory.map((item) => (
                       <div
                         key={item}
@@ -862,7 +870,7 @@ export default function InventoryList() {
             </div>
             <button
               type="button"
-              onClick={() => saveSearchKeyword(searchTerm)}
+              onClick={() => handlePerformSearch(searchTerm)}
               className="inline-flex items-center gap-2 rounded-lg bg-slate-900 px-3 py-2 text-sm font-medium text-white shadow-sm hover:bg-slate-800"
             >
               <Search className="h-4 w-4" />
