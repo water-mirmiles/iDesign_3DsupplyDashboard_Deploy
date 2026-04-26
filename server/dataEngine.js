@@ -21,6 +21,27 @@ function stripExt(fileName) {
   return fileName.replace(/\.[^.]+$/, '');
 }
 
+const MANDATORY_DATA_TABLE_MATCHERS = [
+  { tableName: 'ods_pdm_pdm_product_info_df', keywords: ['product_info'] },
+  { tableName: 'ods_pdm_pdm_base_last_df', keywords: ['base_last'] },
+  { tableName: 'ods_pdm_pdm_base_heel_df', keywords: ['base_heel'] },
+];
+
+export function matchesMandatoryDataTableFileName(fileName, tableName) {
+  const ext = path.extname(String(fileName || '')).toLowerCase();
+  if (ext !== '.xlsx') return false;
+  const table = normalizeLower(tableName);
+  const name = normalizeLower(path.basename(String(fileName || '')));
+  const logical = normalizeLower(getLogicalTableName(fileName));
+  const spec = MANDATORY_DATA_TABLE_MATCHERS.find((it) => normalizeLower(it.tableName) === table);
+  if (!spec) return logical === table || name.includes(table);
+  return spec.keywords.some((keyword) => name.includes(keyword) || logical.includes(keyword));
+}
+
+function findMandatoryDataTableFileName(xlsxNames, tableName) {
+  return xlsxNames.find((fn) => matchesMandatoryDataTableFileName(fn, tableName)) || null;
+}
+
 function buildJoinIndexKey(tableName, fieldName) {
   return `${normalizeLower(tableName)}::${normalizeLower(fieldName)}`;
 }
@@ -302,12 +323,26 @@ const DEFAULT_MAPPING = [
   },
 ];
 
+function mergeMappingWithDefaults(mappingArr) {
+  const defaultKeys = new Set(DEFAULT_MAPPING.map((it) => normalizeLower(it?.standardKey)));
+  const merged = [];
+  const seen = new Set();
+  for (const item of mappingArr || []) {
+    const key = normalizeLower(item?.standardKey);
+    if (!key) continue;
+    if (defaultKeys.has(key) || seen.has(key)) continue;
+    merged.push(item);
+    seen.add(key);
+  }
+  return [...merged, ...DEFAULT_MAPPING];
+}
+
 function resolveMappingFromStorage(storageRoot) {
   const mappingConfigPath = path.join(storageRoot, 'mapping_config.json');
   const mappingConfig = safeJsonRead(mappingConfigPath);
   const fromFile = pickMappingArray(mappingConfig);
   const hasMappingFile = Boolean(fromFile?.length);
-  const mappingArr = hasMappingFile ? fromFile : DEFAULT_MAPPING;
+  const mappingArr = mergeMappingWithDefaults(hasMappingFile ? fromFile : []);
   return { mappingArr, hasMappingFile, usedDefaultMapping: !hasMappingFile, mappingConfigPath };
 }
 
@@ -1006,10 +1041,12 @@ function collectReferencedLogicalTablesFromStandardMap(standardMap) {
 function applyMainColumnFallbacks(mainTable, cols) {
   if (!mainTable?.headers?.length) return cols;
   const h = new Set(mainTable.headers.map((x) => normalizeLower(String(x))));
+  const hasHeader = (col) => Boolean(col && h.has(normalizeLower(col)));
+  const firstExisting = (candidates) => candidates.find((col) => hasHeader(col)) || '';
   const out = { ...cols };
-  if (!out.styleCol && h.has('style_wms')) out.styleCol = 'style_wms';
-  if (!out.brandCol && h.has('brand_name')) out.brandCol = 'brand_name';
-  if (!out.statusCol && h.has('data_status')) out.statusCol = 'data_status';
+  if (!hasHeader(out.styleCol)) out.styleCol = firstExisting(['style_wms', 'style', 'style_code']);
+  if (!hasHeader(out.brandCol)) out.brandCol = firstExisting(['brand_name', 'brand', 'brand_code', 'brand_id']);
+  if (!hasHeader(out.statusCol)) out.statusCol = firstExisting(['data_status', 'status']);
   return out;
 }
 
@@ -1042,6 +1079,7 @@ async function loadReferencedXlsxTablesForFolder(folderPath, standardMap, logPre
     const hit =
       xlsxNames.find((fn) => normalizeLower(getLogicalTableName(fn)) === want) ||
       xlsxNames.find((fn) => normalizeLower(fn).includes(want)) ||
+      findMandatoryDataTableFileName(xlsxNames, logical) ||
       null;
     if (!hit || seenFile.has(hit)) continue;
     seenFile.add(hit);
@@ -1905,7 +1943,9 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
 
   // 生产看板强制主表：ods_pdm_pdm_product_info_df（逻辑名）
   const forcedMain =
-    xlsxTables.find((t) => normalizeLower(getLogicalTableName(t.fileName)) === normalizeLower(PRODUCT_MAIN_LOGICAL)) || null;
+    xlsxTables.find((t) => normalizeLower(getLogicalTableName(t.fileName)) === normalizeLower(PRODUCT_MAIN_LOGICAL)) ||
+    xlsxTables.find((t) => matchesMandatoryDataTableFileName(t.fileName, PRODUCT_MAIN_LOGICAL)) ||
+    findTableByNameKeywords(tablesMap, ['product_info']);
   const fb = applyMainColumnFallbacks(forcedMain, { styleCol, brandCol, statusCol });
   styleCol = fb.styleCol;
   brandCol = fb.brandCol;
@@ -2216,7 +2256,16 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
     const has3DSole = physicalMatchInAssetSet(solesSet, soleCodeVal);
     const has3DAny = has3DLast || has3DSole;
 
-    const brandVal = resolveFast(standardMap.get('brand'), row, brandCol);
+    const brandVal = (() => {
+      const mapped = resolveFast(standardMap.get('brand'), row, brandCol);
+      if (mapped) return mapped;
+      for (const cand of [brandCol, 'brand_name', 'brand', 'brand_code', 'brand_id']) {
+        const v = getRowFieldLoose(row, cand, main.headers);
+        const s = normalize(v);
+        if (s) return s;
+      }
+      return 'Unknown';
+    })();
     const targetAudienceRaw = getRowFieldLoose(row, 'target_audience', main.headers);
     const target_audience =
       targetAudienceRaw == null || String(targetAudienceRaw).trim() === ''
@@ -2282,6 +2331,9 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
 
   // 分桶：effective(active) / draft / obsolete / total（total = 全量，不按状态过滤）
   const allBrands = uniqBrandsFromInventoryRows(inventory);
+  if (inventory.length > 0 && allBrands.length === 1) {
+    aiTraceLineSync('警告：品牌解析可能失效，当前所有款项均归类为未知。');
+  }
   const bucketTotal = inventory;
   const bucketEffective = inventory.filter((x) => x.data_status === 'active');
   const bucketDraft = inventory.filter((x) => x.data_status === 'draft');

@@ -106,6 +106,20 @@ type MandatoryFilesResponse = {
   }>;
 };
 
+function ChartEmptyState({ title, description }: { title: string; description: string }) {
+  return (
+    <div className="flex h-full min-h-[360px] w-full items-center justify-center rounded-xl border border-dashed border-slate-200 bg-slate-50/70 px-6 text-center">
+      <div>
+        <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-white shadow-sm">
+          <FileWarning className="h-6 w-6 text-slate-400" />
+        </div>
+        <div className="mt-4 text-sm font-semibold text-slate-800">{title}</div>
+        <p className="mt-2 max-w-md text-xs leading-5 text-slate-500">{description}</p>
+      </div>
+    </div>
+  );
+}
+
 /** 无 inventory 时，用后端分桶的榜单合并（生效+草稿） */
 function mergeBrandDigitizationRows(a: any[] = [], b: any[] = []) {
   const map = new Map<string, { brand: string; totalEffective: number; hasCode: number; has3D: number }>();
@@ -802,6 +816,12 @@ export default function Dashboard() {
             <span className="text-xs text-slate-500">Total → HasCode → Has3D</span>
           </div>
           <div className="flex-1 min-h-[420px] w-full">
+            {!lastChartRows || lastChartRows.length === 0 ? (
+              <ChartEmptyState
+                title="暂无楦头品牌进度数据"
+                description="请确认核心主表、楦头关系表已上传，并完成一次看板重算。"
+              />
+            ) : (
             <ResponsiveContainer width="100%" height="100%">
               <BarChart data={lastChartRows || []} layout="vertical" margin={{ top: 10, right: 16, left: 20, bottom: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
@@ -883,6 +903,7 @@ export default function Dashboard() {
                 />
               </BarChart>
             </ResponsiveContainer>
+            )}
           </div>
         </div>
 
@@ -893,6 +914,12 @@ export default function Dashboard() {
             <span className="text-xs text-slate-500">Total → HasCode → Has3D</span>
           </div>
           <div className="flex-1 min-h-[420px] w-full">
+            {!soleChartRows || soleChartRows.length === 0 ? (
+              <ChartEmptyState
+                title="暂无大底品牌进度数据"
+                description="请确认核心主表、大底关系表已上传，并完成一次看板重算。"
+              />
+            ) : (
             <ResponsiveContainer width="100%" height="100%">
               <BarChart data={soleChartRows || []} layout="vertical" margin={{ top: 10, right: 16, left: 20, bottom: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
@@ -974,6 +1001,7 @@ export default function Dashboard() {
                 />
               </BarChart>
             </ResponsiveContainer>
+            )}
           </div>
         </div>
       </div>}

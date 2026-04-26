@@ -69,12 +69,16 @@ export default function DataCenter() {
     try {
       const resp = await fetch(`/api/check-mandatory-files?t=${Date.now()}`);
       const json = (await resp.json()) as MandatoryFilesResponse;
-      if (resp.ok && json?.ok) setMandatoryStatus(json);
+      if (resp.ok && json?.ok) {
+        setMandatoryStatus(json);
+        return json;
+      }
     } catch {
       // 保持上一次检测结果，避免短暂网络抖动清空清单
     } finally {
       setIsCheckingMandatory(false);
     }
+    return null;
   }, []);
 
   const loadHistory = async () => {
@@ -135,6 +139,11 @@ export default function DataCenter() {
   const mandatoryReadyCount = useMemo(() => {
     return MANDATORY_DATA_FILES.filter((file) => mandatoryReadyByTable.get(file.tableName)?.ready).length;
   }, [mandatoryReadyByTable]);
+
+  const areAllMandatoryFilesReady = (status: MandatoryFilesResponse | null) => {
+    if (!status?.items?.length) return false;
+    return MANDATORY_DATA_FILES.every((file) => status.items.some((item) => item.tableName === file.tableName && item.ready));
+  };
 
   const handlePickFile = () => {
     setUploadError(null);
@@ -268,9 +277,8 @@ export default function DataCenter() {
 
     setIsUploading(true);
     setUploadError(null);
-    if (activeTab === '3d') {
-      setPipelineSyncing(true);
-    }
+    const hadAllMandatoryFiles = areAllMandatoryFilesReady(mandatoryStatus);
+    if (activeTab === '3d') setPipelineSyncing(true);
 
     try {
       let anyUploadOk = false;
@@ -286,10 +294,16 @@ export default function DataCenter() {
         }
       }
       await loadHistory();
-      await loadMandatoryStatus();
+      const nextMandatoryStatus = await loadMandatoryStatus();
+      const shouldForceSync =
+        anyUploadOk &&
+        (activeTab === '3d' || (!hadAllMandatoryFiles && areAllMandatoryFilesReady(nextMandatoryStatus || mandatoryStatus)));
       if (anyUploadOk) {
         try {
-          await triggerDashboardPhysicalSync();
+          if (shouldForceSync) {
+            setPipelineSyncing(true);
+            await triggerDashboardPhysicalSync();
+          }
         } finally {
           if (activeTab === '3d' && anyUploadOk) {
             try {
@@ -305,9 +319,7 @@ export default function DataCenter() {
       setUploadError(message);
     } finally {
       setIsUploading(false);
-      if (activeTab === '3d') {
-        setPipelineSyncing(false);
-      }
+      setPipelineSyncing(false);
     }
   };
 
@@ -321,7 +333,7 @@ export default function DataCenter() {
       <div>
         <h1 className="text-2xl font-semibold text-slate-900">数据导入中心</h1>
         <p className="text-sm text-slate-500 mt-1">上传业务表格与 3D 资产文件，系统将自动进行匹配</p>
-        {activeTab === '3d' && pipelineSyncing && (
+        {pipelineSyncing && (
           <div className="mt-3 flex items-center gap-2 text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 w-full max-w-2xl">
             <RefreshCw className="w-4 h-4 shrink-0 animate-spin" />
             正在重算 3D 对账、看板与清单数据（与后端物理文件对齐）…

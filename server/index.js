@@ -26,6 +26,7 @@ import {
   forceSyncLatestProduction,
   inferMainTableFromSmartSuggestions,
   isTruthyActiveStatus,
+  matchesMandatoryDataTableFileName,
   parseJoinPathFromConfig,
   persistFinalDashboardData,
   processAllData,
@@ -950,19 +951,13 @@ async function checkMandatoryDataTables() {
   const latestDir = await getLatestDateDataTablesDir();
   const exists = await fse.pathExists(latestDir);
   const files = exists ? await listFileNames(latestDir) : [];
-  const byLogicalName = new Map();
-
-  for (const fileName of files) {
-    if (!isExcelFileName(fileName)) continue;
-    const logicalName = getLogicalTableName(fileName);
-    if (!byLogicalName.has(logicalName)) byLogicalName.set(logicalName, fileName);
-  }
+  const excelFiles = files.filter((fileName) => isExcelFileName(fileName));
 
   return {
     latestDir,
     latestDate: isDateDirName(path.basename(latestDir)) ? path.basename(latestDir) : null,
     items: MANDATORY_DATA_TABLES.map((tableName) => {
-      const fileName = byLogicalName.get(tableName) || null;
+      const fileName = excelFiles.find((name) => matchesMandatoryDataTableFileName(name, tableName)) || null;
       return {
         tableName,
         ready: Boolean(fileName),
