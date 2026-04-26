@@ -9,6 +9,12 @@ import { AssetTrendStats } from '@/types';
 import { CORE_MAIN_TABLE_NAME } from '@/lib/dataManifest';
 
 type TrendHistoryPoint = { date: string; styles: number; lasts3D: number; soles3D: number };
+type AssetKpiStats = {
+  uniqueFiles: number;
+  coveredStyles: number;
+  bindingRate: string;
+  coverageRate: string;
+};
 
 type DashboardStatsResponse = {
   ok: boolean;
@@ -35,10 +41,12 @@ type DashboardStatsResponse = {
     last3DCoverage?: number;
     lastCodeLinked?: number;
     lastCodeLinkRate?: number;
+    lastStats?: AssetKpiStats;
     soleCodeLinked?: number;
     soleCodeLinkRate?: number;
     sole3DCount?: number;
     sole3DCoverage?: number;
+    soleStats?: AssetKpiStats;
     /** 生效款中至少命中楦或底之一 */
     stylesWithAny3D?: number;
     /** (生效款且 has3D) / 生效款总数 · 百分比 */
@@ -293,6 +301,18 @@ export default function Dashboard() {
     const matchedSoles = filteredInventory.filter((x) => x?.has3DSole === true || String(x?.soleStatus || '') === 'matched').length;
     const lastCodeLinked = filteredInventory.filter((x) => isLinkedCode(x?.lastCode)).length;
     const soleCodeLinked = filteredInventory.filter((x) => isLinkedCode(x?.soleCode)).length;
+    const uniqueLastFiles = new Set(
+      filteredInventory
+        .filter((x) => x?.has3DLast === true || String(x?.lastStatus || '') === 'matched')
+        .map((x) => String(x?.lastCode ?? '').trim())
+        .filter(isLinkedCode)
+    ).size;
+    const uniqueSoleFiles = new Set(
+      filteredInventory
+        .filter((x) => x?.has3DSole === true || String(x?.soleStatus || '') === 'matched')
+        .map((x) => String(x?.soleCode ?? '').trim())
+        .filter(isLinkedCode)
+    ).size;
     const stylesWithAny3D = filteredInventory.filter(
       (x) => x?.has3DLast === true || x?.has3DSole === true || String(x?.lastStatus || '') === 'matched' || String(x?.soleStatus || '') === 'matched'
     ).length;
@@ -316,14 +336,26 @@ export default function Dashboard() {
       soleCodeLinked,
       lastCodeLinkRate: pct1(lastCodeLinked),
       soleCodeLinkRate: pct1(soleCodeLinked),
+      lastStats: {
+        uniqueFiles: uniqueLastFiles,
+        coveredStyles: matchedLasts,
+        bindingRate: `${pct1(lastCodeLinked)}%`,
+        coverageRate: `${pct1(matchedLasts)}%`,
+      },
+      soleStats: {
+        uniqueFiles: uniqueSoleFiles,
+        coveredStyles: matchedSoles,
+        bindingRate: `${pct1(soleCodeLinked)}%`,
+        coverageRate: `${pct1(matchedSoles)}%`,
+      },
       deltaActiveStyles: 0,
       deltaMatched3DLasts: 0,
       deltaMatched3DSoles: 0,
     };
   }, [filteredInventory]);
 
-  const displayLast3DKpi = scopeKPIs?.last3DCount ?? scopeKPIs?.matched3DLasts ?? 0;
-  const displaySole3DKpi = scopeKPIs?.sole3DCount ?? scopeKPIs?.matched3DSoles ?? 0;
+  const displayLast3DKpi = scopeKPIs?.lastStats?.uniqueFiles ?? 0;
+  const displaySole3DKpi = scopeKPIs?.soleStats?.uniqueFiles ?? 0;
   const tabStyleTotalCount = scopeKPIs?.totalStyles ?? scopeKPIs?.styles?.totalAll ?? 0;
 
   const digitizationStats = useCallback(
@@ -822,6 +854,12 @@ export default function Dashboard() {
               {getTrendBadge(stats?.kpis?.delta3DLasts ?? stats?.kpis?.deltaMatched3DLasts)}
             </div>
             <div className="mt-1 text-xs text-slate-500">
+              3D 关联款号数量：{' '}
+              <span className="font-medium text-slate-700">
+                {(scopeKPIs?.lastStats?.coveredStyles ?? scopeKPIs?.matched3DLasts ?? 0).toLocaleString()}
+              </span>
+            </div>
+            <div className="mt-1 text-xs text-slate-500">
               编号绑定率：{' '}
               <span className="font-medium text-slate-700">
                 {scopeKPIs?.lastCodeLinkRate ?? 0}%
@@ -850,6 +888,9 @@ export default function Dashboard() {
                 {displaySole3DKpi.toLocaleString()}
               </span>
               {getTrendBadge(stats?.kpis?.delta3DSoles ?? stats?.kpis?.deltaMatched3DSoles)}
+            </div>
+            <div className="mt-1 text-xs text-slate-500">
+              3D 关联款号数量: <span className="font-medium text-slate-700">{(scopeKPIs?.soleStats?.coveredStyles ?? scopeKPIs?.matched3DSoles ?? 0).toLocaleString()}</span>
             </div>
             <div className="mt-1 text-xs text-slate-500">
               编号绑定率: <span className="font-medium text-slate-700">{scopeKPIs?.soleCodeLinkRate ?? 0}%</span>

@@ -1560,6 +1560,18 @@ function computeBucketKPIs(rows) {
   const stylesWithAny3D = rows.filter((x) => Boolean(x.__has3DAny)).length;
   const lastCodeLinked = rows.filter((x) => isLinkedCode(x?.lastCode)).length;
   const soleCodeLinked = rows.filter((x) => isLinkedCode(x?.soleCode)).length;
+  const uniqueLastCodes = new Set(
+    rows
+      .filter((x) => x?.has3DLast === true || Boolean(x?.__has3DLast))
+      .map((x) => normalize(x?.lastCode))
+      .filter(isLinkedCode)
+  );
+  const uniqueSoleCodes = new Set(
+    rows
+      .filter((x) => x?.has3DSole === true || Boolean(x?.__has3DSole))
+      .map((x) => normalize(x?.soleCode))
+      .filter(isLinkedCode)
+  );
 
   const lastCoverage = totalStyles > 0 ? Math.round((matchedLasts / totalStyles) * 100) : 0;
   const last3DCoverage = totalStyles > 0 ? Math.round((matchedLasts / totalStyles) * 1000) / 10 : 0;
@@ -1581,10 +1593,22 @@ function computeBucketKPIs(rows) {
     last3DCoverage,
     lastCodeLinked,
     lastCodeLinkRate,
+    lastStats: {
+      uniqueFiles: uniqueLastCodes.size,
+      coveredStyles: matchedLasts,
+      bindingRate: `${lastCodeLinkRate}%`,
+      coverageRate: `${last3DCoverage}%`,
+    },
     soleCodeLinked,
     soleCodeLinkRate,
     sole3DCount: matchedSoles,
     sole3DCoverage,
+    soleStats: {
+      uniqueFiles: uniqueSoleCodes.size,
+      coveredStyles: matchedSoles,
+      bindingRate: `${soleCodeLinkRate}%`,
+      coverageRate: `${sole3DCoverage}%`,
+    },
   };
 }
 
@@ -2493,10 +2517,12 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
       last3DCoverage: kpisEffective.last3DCoverage,
       lastCodeLinked: kpisEffective.lastCodeLinked,
       lastCodeLinkRate: kpisEffective.lastCodeLinkRate,
+      lastStats: kpisEffective.lastStats,
       soleCodeLinked: kpisEffective.soleCodeLinked,
       soleCodeLinkRate: kpisEffective.soleCodeLinkRate,
       sole3DCount: kpisEffective.sole3DCount,
       sole3DCoverage: kpisEffective.sole3DCoverage,
+      soleStats: kpisEffective.soleStats,
       // force-sync 实时计数（对账用）：仍沿用全循环累计值（便于排查）
       __forceSync: forceSyncLog
         ? {
@@ -2608,10 +2634,22 @@ export async function processAllData({ storageRoot, operator = 'System', operati
       last3DCoverage: kpis.last3DCoverage ?? kpis.lastCoverage,
       lastCodeLinked: kpis.lastCodeLinked ?? 0,
       lastCodeLinkRate: kpis.lastCodeLinkRate ?? 0,
+      lastStats: kpis.lastStats || {
+        uniqueFiles: 0,
+        coveredStyles: kpis.matchedLasts ?? 0,
+        bindingRate: `${kpis.lastCodeLinkRate ?? 0}%`,
+        coverageRate: `${kpis.last3DCoverage ?? kpis.lastCoverage ?? 0}%`,
+      },
       soleCodeLinked: kpis.soleCodeLinked ?? 0,
       soleCodeLinkRate: kpis.soleCodeLinkRate ?? 0,
       sole3DCount: kpis.sole3DCount ?? kpis.matchedSoles,
       sole3DCoverage: kpis.sole3DCoverage ?? kpis.soleCoverage,
+      soleStats: kpis.soleStats || {
+        uniqueFiles: 0,
+        coveredStyles: kpis.matchedSoles ?? 0,
+        bindingRate: `${kpis.soleCodeLinkRate ?? 0}%`,
+        coverageRate: `${kpis.sole3DCoverage ?? kpis.soleCoverage ?? 0}%`,
+      },
       // alias for API consumers
       sole3DMatched: kpis.sole3DCount ?? kpis.matchedSoles,
       stylesWithAny3D: kpis.stylesWithAny3D,
