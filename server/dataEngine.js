@@ -24,7 +24,7 @@ function stripExt(fileName) {
 const MANDATORY_DATA_TABLE_MATCHERS = [
   { tableName: 'ods_pdm_pdm_product_info_df', keywords: ['product_info'] },
   { tableName: 'ods_pdm_pdm_base_last_df', keywords: ['base_last'] },
-  { tableName: 'ods_pdm_pdm_base_heel_df', keywords: ['base_heel'] },
+  { tableName: 'ods_pdm_pdm_base_mold_df', keywords: ['base_mold'] },
   { tableName: 'ods_wms_base_brand_df', keywords: ['base_brand'] },
 ];
 
@@ -111,6 +111,41 @@ function buildIdToBrandNameIndex(tbl) {
     const name = namev == null ? '' : normalize(namev);
     if (!k || !name) continue;
     if (!idx.has(k)) idx.set(k, name);
+  }
+  return idx;
+}
+
+function parseMaybeJsonArrayCell(value) {
+  if (Array.isArray(value)) return value;
+  let s = String(value ?? '').trim();
+  if (!s) return null;
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    s = s.slice(1, -1);
+  }
+  s = s.replace(/\\"/g, '"').replace(/\\\\/g, '\\').trim();
+  if (!s.startsWith('[') || !s.endsWith(']')) return null;
+  try {
+    const parsed = JSON.parse(s);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function buildStyleToMoldCodeIndex(tbl) {
+  if (!tbl?.rows?.length) return null;
+  const idx = new Map();
+  for (const r of tbl.rows) {
+    const codev = getRowFieldLoose(r, 'code', tbl.headers);
+    const code = codev == null ? '' : normalize(codev);
+    if (!code) continue;
+    const links = parseMaybeJsonArrayCell(getRowFieldLoose(r, 'link_product_number', tbl.headers));
+    if (!links?.length) continue;
+    for (const item of links) {
+      const style = String(item ?? '').trim().toUpperCase();
+      if (!style) continue;
+      if (!idx.has(style)) idx.set(style, code);
+    }
   }
   return idx;
 }
@@ -335,7 +370,7 @@ function pickMappingArray(mappingConfig) {
 /**
  * 无 mapping_config.json 时的内置映射（与生产 PDM 主表/维表一致），保证零配置部署可算全量 KPI。
  * 主表：ods_pdm_pdm_product_info_df；款号 style_wms；状态 data_status；
- * 楦：associated_last_type -> base_last.id -> code；底：associated_sole_info -> base_heel.id -> code。
+ * 楦：associated_last_type -> base_last.id -> code；底：associated_sole_info -> base_mold.id -> code。
  */
 const DEFAULT_PRODUCT_MAIN = 'ods_pdm_pdm_product_info_df';
 
@@ -370,8 +405,8 @@ const DEFAULT_MAPPING = [
     standardKey: 'soleCode',
     joinPath: [
       'ods_pdm_pdm_product_info_df.associated_sole_info',
-      'ods_pdm_pdm_base_heel_df.id',
-      'ods_pdm_pdm_base_heel_df.code',
+      'ods_pdm_pdm_base_mold_df.id',
+      'ods_pdm_pdm_base_mold_df.code',
     ],
   },
 ];
@@ -1912,7 +1947,7 @@ export async function validateJoinPathSuggestionsWithGoldenXlsx({
         }
       }
 
-      // soleCode：尝试 associated_sole_info -> base_mold_df.id -> code，再尝试 associated_heel_info -> base_heel_df.id -> code
+      // soleCode：强制 associated_sole_info -> base_mold_df.id -> code
       if (normalizeLower(targetStandardKey) === 'solecode') {
         const altMold = tryAlt([
           'ods_pdm_pdm_product_info_df.associated_sole_info',
@@ -1928,25 +1963,6 @@ export async function validateJoinPathSuggestionsWithGoldenXlsx({
               'ods_pdm_pdm_product_info_df.associated_sole_info',
               'ods_pdm_pdm_base_mold_df.id',
               'ods_pdm_pdm_base_mold_df.code',
-            ],
-            valid: true,
-          });
-          continue;
-        }
-        const altHeel = tryAlt([
-          'ods_pdm_pdm_product_info_df.associated_heel_info',
-          'ods_pdm_pdm_base_heel_df.id',
-          'ods_pdm_pdm_base_heel_df.code',
-        ]);
-        if (altHeel.ok && altHeel.value === golden) {
-          resolved = altHeel.value;
-          passed = true;
-          validated.push({
-            targetStandardKey,
-            path: [
-              'ods_pdm_pdm_product_info_df.associated_heel_info',
-              'ods_pdm_pdm_base_heel_df.id',
-              'ods_pdm_pdm_base_heel_df.code',
             ],
             valid: true,
           });
@@ -2051,57 +2067,19 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
     getTableFromMap('ods_pdm_pdm_base_last_df', tablesMap) || findTableByNameKeywords(tablesMap, ['base_last_df', 'pdm_base_last_df']);
   const forcedLastIndex = buildIdToCodeIndex(forcedLastTbl);
 
-  // soleCode：强制走 base_heel_df（按物理文件名包含 base_heel_df 的最新 XLSX）
+  // soleCode：强制走 base_mold_df（主表 associated_sole_info -> mold.id -> code）
   const forcedSoleTbl =
-    getTableFromMap('ods_pdm_pdm_base_heel_df', tablesMap) ||
-    findTableByNameKeywords(tablesMap, ['base_heel_df', 'pdm_base_heel_df']);
+    getTableFromMap('ods_pdm_pdm_base_mold_df', tablesMap) ||
+    findTableByNameKeywords(tablesMap, ['base_mold_df', 'pdm_base_mold_df']) ||
+    loadLatestMandatoryTableFromDataTablesRoot(dataTablesDir, 'ods_pdm_pdm_base_mold_df');
   const forcedSoleIndex = buildIdToCodeIndex(forcedSoleTbl);
-
-  // 兜底：若主表没有 sole 外键（生产表常见为空），则用 base_mold_df.link_product_number 的 JSON 数组包含 style_wms 来反查 code
-  const moldTbl =
-    getTableFromMap('ods_pdm_pdm_base_mold_df', tablesMap) || findTableByNameKeywords(tablesMap, ['base_mold_df', 'pdm_base_mold_df']);
-  const moldStyleToCode = (() => {
-    if (!moldTbl?.rows?.length) return null;
-    const out = new Map();
-    for (const r of moldTbl.rows) {
-      const codev = getRowFieldLoose(r, 'code', moldTbl.headers);
-      const code = codev == null ? '' : normalize(codev);
-      if (!code) continue;
-      const links = getRowFieldLoose(r, 'link_product_number', moldTbl.headers);
-      const arr = Array.isArray(links)
-        ? links
-        : (() => {
-            let s = String(links ?? '').trim();
-            if (!s) return null;
-            // 生产数据常见形态：'"[\"A\",\"B\"]"'（外层多一层引号）
-            if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
-              s = s.slice(1, -1);
-            }
-            // 处理常见转义：\" -> "，\\ -> \
-            s = s.replace(/\\"/g, '"').replace(/\\\\/g, '\\').trim();
-            if (!s.startsWith('[') || !s.endsWith(']')) return null;
-            try {
-              const parsed = JSON.parse(s);
-              return Array.isArray(parsed) ? parsed : null;
-            } catch {
-              return null;
-            }
-          })();
-      if (!arr?.length) continue;
-      for (const it of arr) {
-        const styleKey = String(it ?? '').trim().toUpperCase();
-        if (!styleKey) continue;
-        if (!out.has(styleKey)) out.set(styleKey, code);
-      }
-    }
-    return out;
-  })();
+  const forcedSoleStyleIndex = buildStyleToMoldCodeIndex(forcedSoleTbl);
 
   if (!forcedLastTbl || !forcedLastIndex) {
     traceDim(`楦头维表未加载/无法建索引：期望 base_last_df；实际 lastTbl=${forcedLastTbl?.fileName || '(null)'}`);
   }
   if (!forcedSoleTbl || !forcedSoleIndex) {
-    traceDim(`大底维表未加载/无法建索引：期望 base_heel_df；实际 soleTbl=${forcedSoleTbl?.fileName || '(null)'}`);
+    traceDim(`大底/模具维表未加载/无法建索引：期望 base_mold_df；实际 soleTbl=${forcedSoleTbl?.fileName || '(null)'}`);
   }
 
   const forcedBrandTbl =
@@ -2194,6 +2172,7 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
   let activeSeen = 0;
   let matchSamplePrinted = 0;
   let soleTracePrinted = 0;
+  let soleSuccessPrinted = 0;
   let brandFallbackPrinted = 0;
   const unrecognizedStatusSamples = [];
   for (let i = 0; i < main.rows.length; i++) {
@@ -2251,14 +2230,7 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
 
     const soleResolved = (() => {
       let fk = getRowFieldLoose(row, 'associated_sole_info', main.headers);
-      // 强制锁定：优先 associated_sole_info；若为空则回退 associated_heel_info（生产数据常见字段变体）
-      if (fk == null || normalize(fk) === '') {
-        const alt = getRowFieldLoose(row, 'associated_heel_info', main.headers);
-        if (alt != null && normalize(alt) !== '') {
-          fk = alt;
-          if (wantTrace) traceDim(`大底处理：associated_sole_info 为空，回退使用 associated_heel_info=${String(alt).trim()}`);
-        }
-      }
+      // 强制锁定：大底只允许 associated_sole_info -> base_mold_df.id -> code。
       const fkRaw = String(fk ?? '').trim();
       const fkKey = normalizeJoinIdKey(fk);
       if (soleTracePrinted < 3) {
@@ -2279,18 +2251,27 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
       if (fkKey && forcedSoleIndex) {
         const code = forcedSoleIndex.get(fkKey);
         if (code) {
-          if (wantTrace) traceDim(`大底处理：主表 ID ${fkKey} -> 在 base_heel_df 找到行 -> 提取 code = ${code}`);
+          if (soleSuccessPrinted < 20) {
+            soleSuccessPrinted += 1;
+            // eslint-disable-next-line no-console
+            console.log(`[Sole-Success] 主表ID ${fkKey} -> 模具表Code ${code}`);
+          }
+          if (wantTrace) traceDim(`大底处理：主表 ID ${fkKey} -> 在 base_mold_df 找到行 -> 提取 code = ${code}`);
           return { code, linked: true, fkKey, fkRaw: fkKey };
         }
-        if (wantTrace) traceDim(`大底处理：主表 ID ${fkKey} -> 在 base_heel_df 未找到行`);
+        if (wantTrace) traceDim(`大底处理：主表 ID ${fkKey} -> 在 base_mold_df 未找到行`);
       }
 
-      // ARRAY_CONTAINS 兜底：base_mold_df.link_product_number 包含 style_wms
-      if (moldStyleToCode && styleUpper) {
-        const code = moldStyleToCode.get(styleUpper);
+      if (styleUpper && forcedSoleStyleIndex) {
+        const code = forcedSoleStyleIndex.get(styleUpper);
         if (code) {
-          if (wantTrace) traceDim(`大底处理：ARRAY_CONTAINS 命中（base_mold_df.link_product_number 包含 ${styleUpper}）-> code=${code}`);
-          return { code, linked: true, fkKey: '', fkRaw: '' };
+          if (soleSuccessPrinted < 20) {
+            soleSuccessPrinted += 1;
+            // eslint-disable-next-line no-console
+            console.log(`[Sole-Success] 主表ID ${fkKey || styleUpper} -> 模具表Code ${code}`);
+          }
+          if (wantTrace) traceDim(`大底处理：style_wms ${styleUpper} -> base_mold_df.link_product_number 包含匹配 -> code = ${code}`);
+          return { code, linked: true, fkKey: fkKey || styleUpper, fkRaw: fkKey || styleUpper };
         }
       }
 

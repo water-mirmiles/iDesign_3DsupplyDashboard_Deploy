@@ -31,10 +31,10 @@ export const MANDATORY_DATA_FILES: MandatoryDataFile[] = [
   {
     role: 'sole-relation',
     requiredLabel: '必填 C',
-    tableName: 'ods_pdm_pdm_base_heel_df',
-    expectedFileName: 'ods_pdm_pdm_base_heel_df.xlsx',
-    title: '大底关系表',
-    description: '将主表的 Sole ID 换算为可匹配 3D 文件的 Sole Code。',
+    tableName: 'ods_pdm_pdm_base_mold_df',
+    expectedFileName: 'ods_pdm_pdm_base_mold_df.xlsx',
+    title: '大底/模具关系表',
+    description: '将主表的 Sole ID 换算为可匹配 3D 文件的大底/模具 Code。',
   },
   {
     role: 'brand-master',

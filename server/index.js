@@ -929,7 +929,7 @@ function isExcelFileName(name) {
 const MANDATORY_DATA_TABLES = [
   'ods_pdm_pdm_product_info_df',
   'ods_pdm_pdm_base_last_df',
-  'ods_pdm_pdm_base_heel_df',
+  'ods_pdm_pdm_base_mold_df',
   'ods_wms_base_brand_df',
 ];
 
@@ -2411,10 +2411,9 @@ app.post('/api/ai-parse-multi-sql', async (req, res) => {
         '4) 严禁输出“未找到”。',
         '5) 【材质 LT04 专项】如果黄金材质为 LT04/或对话中描述为拼接：你必须同时输出 concatMappingSuggestions，standardKey="materialCode"，operator="CONCAT"，parts=2。每个 part 必须包含 joinPath，并尽量利用 parent_id 等层级关联把父段(LT)与子段(04)从各自列取出。',
         '',
-        '【重要线索：JSON 数组成员关联（专攻 soleCode）】',
-        '请特别注意 ods_pdm_pdm_base_mold_df 表：它与主表的关联不是传统 ID 对应。',
-        '关联方式：主表的款号 style_wms（例如 SBOX26008M）被包含在维表 ods_pdm_pdm_base_mold_df.link_product_number 的 JSON 数组字符串中。',
-        '因此 soleCode 必须输出一种“包含关系”路径：请在 joinPathSuggestions 的 soleCode 条目里额外输出 operator="ARRAY_CONTAINS"，并在 hop 中使用 targetField="link_product_number" 表达该包含匹配；命中后在终端段取 valueField="code" 作为最终底号。',
+        '【重要线索：大底/模具关联（专攻 soleCode）】',
+        '请特别注意 ods_pdm_pdm_base_mold_df 表：soleCode 必须优先使用主表 associated_sole_info 与 ods_pdm_pdm_base_mold_df.id 做字符串等值匹配。',
+        '命中后在 ods_pdm_pdm_base_mold_df.code 取最终大底/模具编号；不要改用 base_heel_df。',
         '',
         goldenSection,
         '',
