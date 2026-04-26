@@ -3,9 +3,10 @@ import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, Legend, ResponsiveContainer, LabelList,
   AreaChart, Area
 } from 'recharts';
-import { Box, Layers, Hash, Factory, Loader2, Activity, TrendingUp, AlertCircle } from 'lucide-react';
+import { Box, Layers, Hash, Factory, Loader2, Activity, TrendingUp, AlertCircle, FileWarning } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { AssetTrendStats } from '@/types';
+import { CORE_MAIN_TABLE_NAME } from '@/lib/dataManifest';
 
 type TrendHistoryPoint = { date: string; styles: number; lasts3D: number; soles3D: number };
 
@@ -14,7 +15,7 @@ type DashboardStatsResponse = {
   source?: 'final_dashboard_data' | 'live';
   generatedAt?: string;
   dates: { latest: string; prev: string };
-  mapping: { hasConfig: boolean; configPath: string };
+  mapping: { hasConfig: boolean; configPath: string; usedDefaultMapping?: boolean };
   meta: {
     mainTable: string | null;
     requiredCols?: string[];
@@ -96,6 +97,15 @@ type DashboardStatsResponse = {
 
 type TimePeriod = 'day' | 'week' | 'month' | 'quarter' | 'year';
 
+type MandatoryFilesResponse = {
+  ok: boolean;
+  items: Array<{
+    tableName: string;
+    ready: boolean;
+    fileName: string | null;
+  }>;
+};
+
 /** 无 inventory 时，用后端分桶的榜单合并（生效+草稿） */
 function mergeBrandDigitizationRows(a: any[] = [], b: any[] = []) {
   const map = new Map<string, { brand: string; totalEffective: number; hasCode: number; has3D: number }>();
@@ -137,9 +147,15 @@ export default function Dashboard() {
   const [error, setError] = useState<string | null>(null);
   const [isForceSyncing, setIsForceSyncing] = useState(false);
   const [statusScope, setStatusScope] = useState<'effective' | 'includeDraft' | 'total'>('effective');
+  const [mandatoryStatus, setMandatoryStatus] = useState<MandatoryFilesResponse | null>(null);
 
   const [trendPeriod, setTrendPeriod] = useState<TimePeriod>('week');
   const [chartData, setChartData] = useState<TrendHistoryPoint[]>([]);
+
+  const isCoreMainMissing = useMemo(() => {
+    const mainTable = mandatoryStatus?.items.find((item) => item.tableName === CORE_MAIN_TABLE_NAME);
+    return mandatoryStatus !== null && mainTable?.ready === false;
+  }, [mandatoryStatus]);
 
   /** 入库款号按归一化状态计数（与 Tab 求和一致；无分桶快照时回落 scopeKPIs） */
   const invStatusCounts = useMemo(() => {
@@ -367,6 +383,23 @@ export default function Dashboard() {
     };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    const run = async () => {
+      try {
+        const resp = await fetch(`/api/check-mandatory-files?t=${Date.now()}`);
+        const json = (await resp.json()) as MandatoryFilesResponse;
+        if (!cancelled && resp.ok && json?.ok) setMandatoryStatus(json);
+      } catch {
+        // 缺失检测失败时不阻断原有看板加载
+      }
+    };
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const handleForceSync = async () => {
     if (isForceSyncing) return;
     setIsForceSyncing(true);
@@ -534,7 +567,25 @@ export default function Dashboard() {
         </div>
       </div>
 
+      {isCoreMainMissing && (
+        <div className="flex min-h-[520px] w-full items-center justify-center rounded-2xl border border-dashed border-slate-300 bg-white px-6 py-16 text-center shadow-sm">
+          <div className="max-w-2xl">
+            <div className="mx-auto flex h-20 w-20 items-center justify-center rounded-full bg-slate-100">
+              <FileWarning className="h-10 w-10 text-slate-400" />
+            </div>
+            <h2 className="mt-6 text-2xl font-semibold text-slate-900">核心主表缺失</h2>
+            <p className="mt-3 text-base text-slate-600">
+              请先前往数据中心上传 <span className="font-mono font-semibold text-slate-900">ods_pdm_pdm_product_info_df.xlsx</span>
+            </p>
+            <p className="mt-2 text-sm text-slate-500">
+              该表提供款号、品牌、状态和关联 ID。缺少它时，看板无法生成可信统计。
+            </p>
+          </div>
+        </div>
+      )}
+
       {!isLoading &&
+        !isCoreMainMissing &&
         stats &&
         (!stats.meta?.mainTable ||
           (!stats.mapping?.hasConfig &&
@@ -551,14 +602,14 @@ export default function Dashboard() {
         </div>
       )}
 
-      {error && (
+      {!isCoreMainMissing && error && (
         <div className="bg-red-50 border border-red-200 rounded-xl p-4 text-sm text-red-700">
           {error}
         </div>
       )}
 
       {/* KPI Cards - 5 Cards Layout */}
-      <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-5 gap-4">
+      {!isCoreMainMissing && <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-5 gap-4">
         {/* Card 1: Total Brands */}
         <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm flex flex-col justify-between">
           <div className="flex justify-between items-start">
@@ -696,7 +747,7 @@ export default function Dashboard() {
             </div>
           </div>
         </div>
-      </div>
+      </div>}
 
       {/* 3D 资产新增趋势（暂时隐藏；需要时把 false 改成 true） */}
       {false && (
@@ -743,7 +794,7 @@ export default function Dashboard() {
       )}
 
       {/* Digitization Leaderboards */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      {!isCoreMainMissing && <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Last Digitization */}
         <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm flex flex-col">
           <div className="flex justify-between items-center mb-6">
@@ -925,7 +976,7 @@ export default function Dashboard() {
             </ResponsiveContainer>
           </div>
         </div>
-      </div>
+      </div>}
     </div>
   );
 }

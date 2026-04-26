@@ -1,7 +1,8 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { UploadCloud, FileSpreadsheet, Box, CheckCircle2, Clock, FileWarning, Search, Info, Calendar, Play, Trash2, RefreshCw } from 'lucide-react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { UploadCloud, FileSpreadsheet, Box, CheckCircle2, Clock, FileWarning, Search, Info, Calendar, Play, Trash2, RefreshCw, Circle } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { ImportHistory } from '@/types';
+import { MANDATORY_DATA_FILES } from '@/lib/dataManifest';
 
 const mockHistory: ImportHistory[] = [
   { id: '1', fileName: '20240520_StyleList.xlsx', type: 'xlsx', status: 'success', uploadTime: '2024-05-20 14:30', snapshotDate: '2024-05-20', operator: 'Admin', matchedCount: 1250, version: 'v1.2', updateType: 'overwrite', targetTable: '款号主表' },
@@ -23,6 +24,17 @@ type UploadQueueItem = {
   existsCheckPending?: boolean;
 };
 
+type MandatoryFilesResponse = {
+  ok: boolean;
+  latestDate: string | null;
+  latestDir: string | null;
+  items: Array<{
+    tableName: string;
+    ready: boolean;
+    fileName: string | null;
+  }>;
+};
+
 function formatBytes(bytes: number) {
   const units = ['B', 'KB', 'MB', 'GB'];
   let v = bytes;
@@ -42,6 +54,8 @@ export default function DataCenter() {
   const [autoOverwrite, setAutoOverwrite] = useState(true);
   const [pipelineSyncing, setPipelineSyncing] = useState(false);
   const [history, setHistory] = useState<ImportHistory[]>(mockHistory);
+  const [mandatoryStatus, setMandatoryStatus] = useState<MandatoryFilesResponse | null>(null);
+  const [isCheckingMandatory, setIsCheckingMandatory] = useState(false);
 
   const xlsxInputRef = useRef<HTMLInputElement | null>(null);
   const assetInputRef = useRef<HTMLInputElement | null>(null);
@@ -49,6 +63,19 @@ export default function DataCenter() {
   const accept = useMemo(() => {
     return activeTab === 'xlsx' ? '.xlsx,.xls' : '.obj,.stl,.3dm';
   }, [activeTab]);
+
+  const loadMandatoryStatus = useCallback(async () => {
+    setIsCheckingMandatory(true);
+    try {
+      const resp = await fetch(`/api/check-mandatory-files?t=${Date.now()}`);
+      const json = (await resp.json()) as MandatoryFilesResponse;
+      if (resp.ok && json?.ok) setMandatoryStatus(json);
+    } catch {
+      // 保持上一次检测结果，避免短暂网络抖动清空清单
+    } finally {
+      setIsCheckingMandatory(false);
+    }
+  }, []);
 
   const loadHistory = async () => {
     try {
@@ -85,7 +112,29 @@ export default function DataCenter() {
 
   useEffect(() => {
     void loadHistory();
-  }, []);
+    void loadMandatoryStatus();
+    const id = window.setInterval(() => {
+      void loadMandatoryStatus();
+    }, 5000);
+    const onFocus = () => void loadMandatoryStatus();
+    window.addEventListener('focus', onFocus);
+    return () => {
+      window.clearInterval(id);
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [loadMandatoryStatus]);
+
+  const mandatoryReadyByTable = useMemo(() => {
+    const map = new Map<string, { ready: boolean; fileName: string | null }>();
+    for (const item of mandatoryStatus?.items || []) {
+      map.set(item.tableName, { ready: item.ready, fileName: item.fileName });
+    }
+    return map;
+  }, [mandatoryStatus]);
+
+  const mandatoryReadyCount = useMemo(() => {
+    return MANDATORY_DATA_FILES.filter((file) => mandatoryReadyByTable.get(file.tableName)?.ready).length;
+  }, [mandatoryReadyByTable]);
 
   const handlePickFile = () => {
     setUploadError(null);
@@ -237,6 +286,7 @@ export default function DataCenter() {
         }
       }
       await loadHistory();
+      await loadMandatoryStatus();
       if (anyUploadOk) {
         try {
           await triggerDashboardPhysicalSync();
@@ -308,6 +358,69 @@ export default function DataCenter() {
 
         {/* Upload Area */}
         <div className="p-8">
+          <div className="mb-6 rounded-xl border border-slate-200 bg-slate-50/70 p-5 shadow-sm w-full">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <h3 className="text-base font-semibold text-slate-900">数据准备核对清单 (Must-have Files)</h3>
+                <p className="mt-1 text-xs text-slate-500">
+                  自动扫描最新数据目录
+                  {mandatoryStatus?.latestDate ? `：${mandatoryStatus.latestDate}` : ''}
+                  ，已就绪 {mandatoryReadyCount}/{MANDATORY_DATA_FILES.length}。
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => void loadMandatoryStatus()}
+                className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-700 shadow-sm hover:bg-slate-50"
+              >
+                <RefreshCw className={cn('h-3.5 w-3.5', isCheckingMandatory && 'animate-spin')} />
+                重新检测
+              </button>
+            </div>
+
+            <div className="mt-4 grid grid-cols-1 gap-3 lg:grid-cols-3">
+              {MANDATORY_DATA_FILES.map((file) => {
+                const status = mandatoryReadyByTable.get(file.tableName);
+                const isReady = Boolean(status?.ready);
+                return (
+                  <div
+                    key={file.tableName}
+                    className={cn(
+                      'rounded-lg border bg-white p-4',
+                      isReady ? 'border-emerald-200' : 'border-slate-200'
+                    )}
+                  >
+                    <div className="flex items-start gap-3">
+                      {isReady ? (
+                        <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-emerald-500" />
+                      ) : (
+                        <Circle className="mt-0.5 h-5 w-5 shrink-0 text-slate-300" />
+                      )}
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="rounded-md bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-600">
+                            {file.requiredLabel}
+                          </span>
+                          <span className={cn('text-xs font-semibold', isReady ? 'text-emerald-700' : 'text-slate-500')}>
+                            {isReady ? '[已就绪]' : '[缺失]'}
+                          </span>
+                        </div>
+                        <div className="mt-2 text-sm font-semibold text-slate-900">{file.title}</div>
+                        <div className="mt-1 truncate font-mono text-xs text-slate-600" title={file.tableName}>
+                          {file.tableName}
+                        </div>
+                        <p className="mt-2 text-xs leading-5 text-slate-500">{file.description}</p>
+                        <p className="mt-2 text-[11px] text-slate-400">
+                          {isReady ? `已匹配文件：${status?.fileName}` : `建议上传：${file.expectedFileName}`}
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
           {activeTab === '3d' && (
             <div className="mb-4 flex flex-wrap items-center justify-between gap-3 p-3 rounded-lg border border-amber-100 bg-amber-50/50">
               <label className="flex items-center gap-2.5 text-sm text-slate-800 cursor-pointer select-none">

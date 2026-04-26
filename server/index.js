@@ -925,6 +925,53 @@ function isExcelFileName(name) {
   return ext === '.xlsx' || ext === '.xls';
 }
 
+const MANDATORY_DATA_TABLES = [
+  'ods_pdm_pdm_product_info_df',
+  'ods_pdm_pdm_base_last_df',
+  'ods_pdm_pdm_base_heel_df',
+];
+
+async function getLatestDateDataTablesDir() {
+  await ensureStorageDirs();
+  const root = getResolvedDataTablesRoot();
+  if (!(await fse.pathExists(root))) return root;
+
+  const entries = await fse.readdir(root, { withFileTypes: true });
+  const dateDirs = entries
+    .filter((e) => e.isDirectory() && isDateDirName(e.name))
+    .map((e) => e.name)
+    .sort((a, b) => b.localeCompare(a));
+
+  if (dateDirs.length > 0) return path.join(root, dateDirs[0]);
+  return getLatestDataTablesDir();
+}
+
+async function checkMandatoryDataTables() {
+  const latestDir = await getLatestDateDataTablesDir();
+  const exists = await fse.pathExists(latestDir);
+  const files = exists ? await listFileNames(latestDir) : [];
+  const byLogicalName = new Map();
+
+  for (const fileName of files) {
+    if (!isExcelFileName(fileName)) continue;
+    const logicalName = getLogicalTableName(fileName);
+    if (!byLogicalName.has(logicalName)) byLogicalName.set(logicalName, fileName);
+  }
+
+  return {
+    latestDir,
+    latestDate: isDateDirName(path.basename(latestDir)) ? path.basename(latestDir) : null,
+    items: MANDATORY_DATA_TABLES.map((tableName) => {
+      const fileName = byLogicalName.get(tableName) || null;
+      return {
+        tableName,
+        ready: Boolean(fileName),
+        fileName,
+      };
+    }),
+  };
+}
+
 function readFirstSheet(workbook) {
   const sheetName = workbook.SheetNames?.[0];
   if (!sheetName) return null;
@@ -3539,6 +3586,21 @@ app.get('/api/history', async (_req, res) => {
 
   items.sort((a, b) => (a.uploadTime < b.uploadTime ? 1 : -1));
   res.json({ ok: true, items });
+});
+
+app.get('/api/check-mandatory-files', async (_req, res) => {
+  try {
+    const status = await checkMandatoryDataTables();
+    return res.json({
+      ok: true,
+      ...status,
+      latestDir: path.relative(STORAGE_ROOT, status.latestDir).split(path.sep).join('/'),
+    });
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.error('[mandatory-files] check failed', e);
+    return res.status(500).json({ ok: false, error: e instanceof Error ? e.message : 'mandatory file check failed' });
+  }
 });
 
 // 真实看板统计：优先读认证落盘的 final_dashboard_data.json，否则实时聚合
