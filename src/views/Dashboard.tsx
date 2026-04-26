@@ -147,6 +147,15 @@ function normalizeLevelForFilter(level: string) {
   return s.endsWith('级') ? s.slice(0, -1) || '未定级' : s;
 }
 
+function levelSelectionMatches(selectedLevel: string, optionLevel: string, coreLevels: string[]) {
+  const selectedNormalized = normalizeLevelForFilter(selectedLevel);
+  const optionNormalized = normalizeLevelForFilter(optionLevel);
+  if (coreLevels.includes(selectedNormalized) || coreLevels.includes(optionNormalized)) {
+    return selectedNormalized === optionNormalized;
+  }
+  return selectedLevel === optionLevel || selectedNormalized === optionNormalized;
+}
+
 function isLinkedCode(v: any) {
   const s = String(v ?? '').trim();
   return s !== '' && s !== '-' && s !== '0';
@@ -167,6 +176,7 @@ export default function Dashboard() {
   const [trendPeriod, setTrendPeriod] = useState<TimePeriod>('week');
   const [chartData, setChartData] = useState<TrendHistoryPoint[]>([]);
   const coreLevelOptions = useMemo(() => ['S', 'A', 'B', 'C', 'EOL'], []);
+  const defaultLevelOptions = useMemo(() => ['S', 'A', 'B', 'C'], []);
 
   const isCoreMainMissing = useMemo(() => {
     const mainTable = mandatoryStatus?.items.find((item) => item.tableName === CORE_MAIN_TABLE_NAME);
@@ -201,34 +211,50 @@ export default function Dashboard() {
     [coreLevelOptions, selectedLevels]
   );
 
+  const allStatusesSelected = useMemo(
+    () => statusOptions.length > 0 && statusOptions.every((status) => selectedStatuses.includes(status)),
+    [selectedStatuses, statusOptions]
+  );
+
+  const allLevelsSelected = useMemo(
+    () =>
+      levelOptions.length > 0 &&
+      levelOptions.every((level) => selectedLevels.some((selected) => levelSelectionMatches(selected, level, coreLevelOptions))),
+    [coreLevelOptions, levelOptions, selectedLevels]
+  );
+
   const selectedLevelSummary = useMemo(() => {
-    if (selectedLevels.length === 0) return '全部定级';
+    if (allLevelsSelected) return '全部定级';
+    if (selectedLevels.length === 0) return '未选择定级';
     const core = coreLevelOptions.filter((level) => selectedLevels.some((x) => normalizeLevelForFilter(x) === level));
     const parts = [...core.map(levelLabel)];
     if (selectedOtherCount > 0) parts.push(`其他 ${selectedOtherCount} 项`);
-    return parts.join('、') || '全部定级';
-  }, [coreLevelOptions, selectedLevels, selectedOtherCount]);
+    return parts.join('、') || '未选择定级';
+  }, [allLevelsSelected, coreLevelOptions, selectedLevels, selectedOtherCount]);
+
+  const selectedStatusSummary = useMemo(() => {
+    if (allStatusesSelected) return '全部状态';
+    return selectedStatuses.map(statusLabel).join('、') || '未选择状态';
+  }, [allStatusesSelected, selectedStatuses]);
+
+  const criteriaText = useMemo(
+    () => `当前统计口径：${selectedStatusSummary} · ${selectedLevelSummary}`,
+    [selectedLevelSummary, selectedStatusSummary]
+  );
 
   useEffect(() => {
     if (!stats || filtersInitialized) return;
     setSelectedStatuses(statusOptions.includes('active') ? ['active'] : statusOptions);
-    setSelectedLevels([]);
+    setSelectedLevels(defaultLevelOptions);
     setFiltersInitialized(true);
-  }, [filtersInitialized, stats, statusOptions]);
+  }, [defaultLevelOptions, filtersInitialized, stats, statusOptions]);
 
   const filteredInventory = useMemo(() => {
     const inv = stats?.inventory || [];
     return inv.filter((item) => {
       const status = String(item?.data_status || '').trim();
       const rawLevel = String(item?.product_actual_position ?? item?.productLevel ?? '未定级').trim() || '未定级';
-      const normalizedLevel = normalizeLevelForFilter(rawLevel);
-      const levelMatched =
-        selectedLevels.length === 0 ||
-        selectedLevels.some((level) => {
-          const selectedNormalized = normalizeLevelForFilter(level);
-          if (coreLevelOptions.includes(selectedNormalized)) return normalizedLevel === selectedNormalized;
-          return rawLevel === level || normalizedLevel === selectedNormalized;
-        });
+      const levelMatched = selectedLevels.some((level) => levelSelectionMatches(level, rawLevel, coreLevelOptions));
       return selectedStatuses.includes(status) && levelMatched;
     });
   }, [coreLevelOptions, selectedLevels, selectedStatuses, stats?.inventory]);
@@ -567,7 +593,7 @@ export default function Dashboard() {
               type="button"
               onClick={() => {
                 setSelectedStatuses(statusOptions.includes('active') ? ['active'] : statusOptions);
-                setSelectedLevels([]);
+                setSelectedLevels(defaultLevelOptions);
                 setOtherLevelSearch('');
                 setIsOtherLevelsOpen(false);
               }}
@@ -580,6 +606,16 @@ export default function Dashboard() {
             <div className="flex shrink-0 items-center gap-3">
               <div className="text-xs font-medium text-slate-500">款式状态</div>
               <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setSelectedStatuses(statusOptions)}
+                  className={cn(
+                    'inline-flex items-center rounded-lg border px-3 py-2 text-sm font-medium transition-colors',
+                    allStatusesSelected ? 'border-blue-600 bg-blue-600 text-white shadow-sm' : 'border-slate-200 bg-slate-50 text-slate-700 hover:bg-white'
+                  )}
+                >
+                  全部
+                </button>
                 {statusOptions.map((status) => {
                   const checked = selectedStatuses.includes(status);
                   return (
@@ -606,6 +642,16 @@ export default function Dashboard() {
             <div className="relative flex min-w-0 flex-1 items-center gap-3">
               <div className="shrink-0 text-xs font-medium text-slate-500">产品定级</div>
               <div className="flex min-w-0 flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setSelectedLevels(levelOptions)}
+                  className={cn(
+                    'rounded-lg border px-3 py-2 text-sm font-semibold transition-colors',
+                    allLevelsSelected ? 'border-blue-600 bg-blue-600 text-white shadow-sm' : 'border-slate-200 bg-slate-50 text-slate-700 hover:bg-white'
+                  )}
+                >
+                  全部
+                </button>
                 {coreLevelOptions.map((level) => {
                   const checked = selectedLevels.some((x) => normalizeLevelForFilter(x) === level);
                   return (
@@ -626,67 +672,69 @@ export default function Dashboard() {
                     </button>
                   );
                 })}
-                <button
-                  type="button"
-                  onClick={() => setIsOtherLevelsOpen((v) => !v)}
-                  className={cn(
-                    'inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-sm font-semibold transition-colors',
-                    selectedOtherCount > 0
-                      ? 'border-blue-600 bg-blue-50 text-blue-700'
-                      : 'border-slate-200 bg-slate-50 text-slate-700 hover:bg-white'
+                <div className="relative">
+                  <button
+                    type="button"
+                    onClick={() => setIsOtherLevelsOpen((v) => !v)}
+                    className={cn(
+                      'inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-sm font-semibold transition-colors',
+                      selectedOtherCount > 0
+                        ? 'border-blue-600 bg-blue-50 text-blue-700'
+                        : 'border-slate-200 bg-slate-50 text-slate-700 hover:bg-white'
+                    )}
+                  >
+                    其他定级
+                    {selectedOtherCount > 0 && <span className="rounded-full bg-blue-600 px-1.5 py-0.5 text-[10px] text-white">{selectedOtherCount}</span>}
+                    <ChevronDown className={cn('h-4 w-4 transition-transform', isOtherLevelsOpen && 'rotate-180')} />
+                  </button>
+
+                  {isOtherLevelsOpen && (
+                    <div className="absolute left-0 top-full z-30 mt-2 w-[min(560px,calc(100vw-3rem))] rounded-xl border border-slate-200 bg-white p-3 shadow-xl">
+                      <div className="relative">
+                        <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+                        <input
+                          value={otherLevelSearch}
+                          onChange={(e) => setOtherLevelSearch(e.target.value)}
+                          placeholder="搜索其他定级..."
+                          className="w-full rounded-lg border border-slate-200 bg-slate-50 py-2 pl-9 pr-3 text-sm text-slate-700 outline-none focus:border-blue-300 focus:bg-white focus:ring-2 focus:ring-blue-100"
+                        />
+                      </div>
+                      <div className="mt-3 max-h-64 overflow-y-auto pr-1">
+                        {filteredOtherLevelOptions.length === 0 ? (
+                          <div className="rounded-lg bg-slate-50 px-3 py-6 text-center text-sm text-slate-400">没有匹配的其他定级</div>
+                        ) : (
+                          <div className="space-y-1">
+                            {filteredOtherLevelOptions.map((level) => {
+                              const checked = selectedLevels.includes(level);
+                              return (
+                                <label
+                                  key={level}
+                                  className="flex cursor-pointer items-start gap-2 rounded-lg px-2 py-2 text-sm text-slate-700 hover:bg-slate-50"
+                                >
+                                  <input
+                                    type="checkbox"
+                                    checked={checked}
+                                    onChange={() =>
+                                      setSelectedLevels((prev) =>
+                                        prev.includes(level) ? prev.filter((x) => x !== level) : [...prev, level]
+                                      )
+                                    }
+                                    className="mt-0.5 h-4 w-4 accent-blue-600"
+                                  />
+                                  <span className="leading-5">{levelLabel(level)}</span>
+                                </label>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    </div>
                   )}
-                >
-                  其他定级
-                  {selectedOtherCount > 0 && <span className="rounded-full bg-blue-600 px-1.5 py-0.5 text-[10px] text-white">{selectedOtherCount}</span>}
-                  <ChevronDown className={cn('h-4 w-4 transition-transform', isOtherLevelsOpen && 'rotate-180')} />
-                </button>
-                <span className="ml-auto whitespace-nowrap text-xs text-slate-500">
+                </div>
+                <span className="whitespace-nowrap text-xs text-slate-500">
                   当前命中 <span className="font-semibold text-slate-900">{filteredInventory.length}</span> / {stats.inventory?.length || 0} 款
                 </span>
               </div>
-
-              {isOtherLevelsOpen && (
-                <div className="absolute right-0 top-full z-30 mt-2 w-[min(560px,calc(100vw-3rem))] rounded-xl border border-slate-200 bg-white p-3 shadow-xl">
-                  <div className="relative">
-                    <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
-                    <input
-                      value={otherLevelSearch}
-                      onChange={(e) => setOtherLevelSearch(e.target.value)}
-                      placeholder="搜索其他定级..."
-                      className="w-full rounded-lg border border-slate-200 bg-slate-50 py-2 pl-9 pr-3 text-sm text-slate-700 outline-none focus:border-blue-300 focus:bg-white focus:ring-2 focus:ring-blue-100"
-                    />
-                  </div>
-                  <div className="mt-3 max-h-64 overflow-y-auto pr-1">
-                    {filteredOtherLevelOptions.length === 0 ? (
-                      <div className="rounded-lg bg-slate-50 px-3 py-6 text-center text-sm text-slate-400">没有匹配的其他定级</div>
-                    ) : (
-                      <div className="space-y-1">
-                        {filteredOtherLevelOptions.map((level) => {
-                          const checked = selectedLevels.includes(level);
-                          return (
-                            <label
-                              key={level}
-                              className="flex cursor-pointer items-start gap-2 rounded-lg px-2 py-2 text-sm text-slate-700 hover:bg-slate-50"
-                            >
-                              <input
-                                type="checkbox"
-                                checked={checked}
-                                onChange={() =>
-                                  setSelectedLevels((prev) =>
-                                    prev.includes(level) ? prev.filter((x) => x !== level) : [...prev, level]
-                                  )
-                                }
-                                className="mt-0.5 h-4 w-4 accent-blue-600"
-                              />
-                              <span className="leading-5">{levelLabel(level)}</span>
-                            </label>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )}
               {levelOptions.length === 0 && <span className="text-sm text-slate-400">暂无产品定级字段</span>}
             </div>
           </div>
@@ -726,13 +774,9 @@ export default function Dashboard() {
               <span className="text-3xl font-bold text-slate-900">{(tabStyleTotalCount || 0).toLocaleString()}</span>
               {getTrendBadge(stats?.kpis?.deltaTotalPoolStyles)}
             </div>
-            <div className="mt-1 text-xs text-slate-500">
-              当前口径：
-              <span className="font-medium text-slate-700">
-                {selectedStatuses.map(statusLabel).join('、') || '未选择状态'}
-                {' · '}
-                {selectedLevelSummary}
-              </span>
+            <div className="mt-1 max-w-full truncate text-xs text-slate-500" title={criteriaText}>
+              <span className="shrink-0">当前统计口径：</span>
+              <span className="font-medium text-slate-700">{criteriaText.replace(/^当前统计口径：/, '')}</span>
             </div>
           </div>
         </div>
