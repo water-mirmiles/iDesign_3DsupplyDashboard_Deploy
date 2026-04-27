@@ -56,7 +56,21 @@ const dotenvResult = dotenv.config({ path: ENV_PATH, debug: true });
 
 const app = express();
 /** 必须在其它路由与 body parser 之前：供 /storage 直出与 Three.js Range 拉取 */
-const STORAGE_ROOT = path.join(__dirname, 'storage');
+function resolveStorageRoot() {
+  const envRoot = String(process.env.SUPPLY3D_STORAGE_ROOT || process.env.STORAGE_ROOT || '').trim();
+  const candidates = [
+    envRoot,
+    path.join(__dirname, 'storage'),
+    path.resolve(process.cwd(), 'server', 'storage'),
+    path.resolve(process.cwd(), 'storage'),
+  ].filter(Boolean);
+  for (const p of candidates) {
+    if (fse.existsSync(p)) return path.resolve(p);
+  }
+  return path.resolve(path.join(__dirname, 'storage'));
+}
+
+const STORAGE_ROOT = resolveStorageRoot();
 
 app.use(cors());
 // eslint-disable-next-line no-console
@@ -83,11 +97,7 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 /** 与 package.json 中 `node server/index.js`（cwd=仓库根）对齐；若在 server/ 内直接 node index.js 则 cwd 为 server */
 function resolveProjectServerStorageDir() {
-  const cwd = process.cwd();
-  if (path.basename(cwd) === 'server') {
-    return path.join(cwd, 'storage');
-  }
-  return path.join(cwd, 'server', 'storage');
+  return STORAGE_ROOT;
 }
 
 /** 物理路径：等价于仓库根下 `server/storage`（见 resolveProjectServerStorageDir） */
@@ -97,7 +107,7 @@ const SCHEMA_DRAFT_PATH = path.join(DRAFT_STORAGE_DIR, 'schema_draft.json');
 const DIRS = {
   dataTables: path.join(STORAGE_ROOT, 'data_tables'),
   /** 与仓库根起算的 server/storage/data_tables，部署 cwd 在仓根时与 dataTables 对齐 */
-  dataTablesFromCwd: path.resolve(process.cwd(), 'server', 'storage', 'data_tables'),
+  dataTablesFromCwd: path.join(resolveProjectServerStorageDir(), 'data_tables'),
   lasts: path.join(STORAGE_ROOT, 'assets', 'lasts'),
   soles: path.join(STORAGE_ROOT, 'assets', 'soles'),
   sandbox: path.join(STORAGE_ROOT, 'sandbox'),
@@ -225,6 +235,7 @@ function getRequestOperator(req) {
 const MAPPING_CONFIG_PATH = path.join(STORAGE_ROOT, 'mapping_config.json');
 const FINAL_DASHBOARD_PATH = path.join(STORAGE_ROOT, 'final_dashboard_data.json');
 const FINAL_RESULTS_PATH = path.join(STORAGE_ROOT, 'final_results.json');
+const FULL_INVENTORY_CACHE_PATH = path.join(STORAGE_ROOT, 'full_inventory_cache.json');
 const ASSETS_META_PATH = path.join(STORAGE_ROOT, 'assets_meta.json');
 const USERS_PATH = path.join(STORAGE_ROOT, 'users.json');
 const UPLOAD_AUDIT_PATH = path.join(STORAGE_ROOT, 'upload_audit.json');
@@ -236,7 +247,14 @@ const UPLOAD_AUDIT_PATH = path.join(STORAGE_ROOT, 'upload_audit.json');
  */
 async function purgeStorageJsonExceptDataAndAssets() {
   const keepSub = new Set([path.resolve(DIRS.dataTables), path.resolve(path.join(STORAGE_ROOT, 'assets'))]);
-  const keepFiles = new Set([path.resolve(USERS_PATH), path.resolve(UPLOAD_AUDIT_PATH), path.resolve(ASSETS_META_PATH)]);
+  const keepFiles = new Set([
+    path.resolve(USERS_PATH),
+    path.resolve(UPLOAD_AUDIT_PATH),
+    path.resolve(ASSETS_META_PATH),
+    path.resolve(FULL_INVENTORY_CACHE_PATH),
+    path.resolve(FINAL_DASHBOARD_PATH),
+    path.resolve(FINAL_RESULTS_PATH),
+  ]);
   const shouldSkipDir = (absDir) => {
     const d = path.resolve(absDir);
     for (const k of keepSub) {
@@ -348,7 +366,7 @@ function findPhysicalAssetFileAbs(dirAbs, codeRaw) {
  * @returns {{ glb: string|null, obj: string|null, any: string|null, hits: string[] }}
  */
 function scanDirForAssetByCode(dirAbs, codeRaw) {
-  const want = String(codeRaw ?? '').trim().toLowerCase();
+  const want = normalizeAssetCodeKey(codeRaw);
   if (!want) return { glb: null, obj: null, any: null, hits: [] };
   let entries = [];
   try {
@@ -362,11 +380,12 @@ function scanDirForAssetByCode(dirAbs, codeRaw) {
   let any = null;
   for (const e of entries) {
     if (!e.isFile()) continue;
+    const ext = path.extname(e.name).toLowerCase();
+    if (!ASSET_3D_EXTS.includes(ext)) continue;
     const base = stripExtAssetName(e.name).trim().toLowerCase();
     if (base !== want) continue;
     const abs = path.join(dirAbs, e.name);
     hits.push(e.name);
-    const ext = path.extname(e.name).toLowerCase();
     if (!any) any = abs;
     if (ext === '.glb') glb = abs;
     if (ext === '.obj') obj = abs;
@@ -407,14 +426,204 @@ function isPathInsideAssetDir(fileAbs, dirAbs) {
 }
 
 async function readFinalDashboardSnapshot() {
-  try {
-    if (!(await fse.pathExists(FINAL_DASHBOARD_PATH))) return null;
-    const data = await fse.readJson(FINAL_DASHBOARD_PATH);
-    if (!data || typeof data !== 'object' || !data.kpis) return null;
-    return data;
-  } catch {
-    return null;
+  const candidates = [FULL_INVENTORY_CACHE_PATH, FINAL_DASHBOARD_PATH];
+  for (const p of candidates) {
+    try {
+      if (!(await fse.pathExists(p))) continue;
+      const data = await fse.readJson(p);
+      if (!data || typeof data !== 'object' || !data.kpis) continue;
+      return data;
+    } catch {
+      // try next snapshot source
+    }
   }
+  return null;
+}
+
+async function writeDashboardSnapshots(payload) {
+  await fse.ensureDir(STORAGE_ROOT);
+  await Promise.all([
+    fse.writeJson(FULL_INVENTORY_CACHE_PATH, payload, { spaces: 2 }),
+    fse.writeJson(FINAL_DASHBOARD_PATH, payload, { spaces: 2 }),
+    fse.writeJson(FINAL_RESULTS_PATH, payload, { spaces: 2 }),
+  ]);
+}
+
+function isLinkedInventoryCode(v) {
+  const s = String(v ?? '').trim();
+  return s !== '' && s !== '-' && s !== '0';
+}
+
+function scanAssetKeySet(dirAbs) {
+  const out = new Set();
+  try {
+    if (!fs.existsSync(dirAbs)) return out;
+    const entries = fs.readdirSync(dirAbs, { withFileTypes: true });
+    for (const e of entries) {
+      if (!e.isFile()) continue;
+      const ext = path.extname(e.name).toLowerCase();
+      if (!ASSET_3D_EXTS.includes(ext)) continue;
+      const key = normalizeAssetCodeKey(e.name);
+      if (key) out.add(key);
+    }
+  } catch {
+    // empty set means no physical asset hits
+  }
+  return out;
+}
+
+function computeInventoryKpisForCache(rows) {
+  const totalStyles = Array.isArray(rows) ? rows.length : 0;
+  const activeStyles = rows.filter((x) => x?.data_status === 'active').length;
+  const matchedLasts = rows.filter((x) => x?.has3DLast === true || String(x?.lastStatus || '') === 'matched').length;
+  const matchedSoles = rows.filter((x) => x?.has3DSole === true || String(x?.soleStatus || '') === 'matched').length;
+  const stylesWithAny3D = rows.filter((x) => x?.has3DLast === true || x?.has3DSole === true || String(x?.lastStatus || '') === 'matched' || String(x?.soleStatus || '') === 'matched').length;
+  const lastCodeLinked = rows.filter((x) => isLinkedInventoryCode(x?.lastCode)).length;
+  const soleCodeLinked = rows.filter((x) => isLinkedInventoryCode(x?.soleCode)).length;
+  const uniqueLastCodes = new Set(
+    rows
+      .filter((x) => x?.has3DLast === true || String(x?.lastStatus || '') === 'matched')
+      .map((x) => String(x?.lastCode ?? '').trim())
+      .filter(isLinkedInventoryCode)
+      .map(normalizeAssetCodeKey)
+  );
+  const uniqueSoleCodes = new Set(
+    rows
+      .filter((x) => x?.has3DSole === true || String(x?.soleStatus || '') === 'matched')
+      .map((x) => String(x?.soleCode ?? '').trim())
+      .filter(isLinkedInventoryCode)
+      .map(normalizeAssetCodeKey)
+  );
+  const pct0 = (n) => (totalStyles > 0 ? Math.round((n / totalStyles) * 100) : 0);
+  const pct1 = (n) => (totalStyles > 0 ? Math.round((n / totalStyles) * 1000) / 10 : 0);
+  return {
+    totalStyles,
+    activeStyles,
+    matchedLasts,
+    matchedSoles,
+    matched3DLasts: matchedLasts,
+    matched3DSoles: matchedSoles,
+    lastCoverage: pct0(matchedLasts),
+    soleCoverage: pct0(matchedSoles),
+    stylesWithAny3D,
+    any3DCoveragePercent: pct0(stylesWithAny3D),
+    last3DCount: matchedLasts,
+    last3DCoverage: pct1(matchedLasts),
+    lastCodeLinked,
+    lastCodeLinkRate: pct1(lastCodeLinked),
+    lastStats: {
+      uniqueFiles: uniqueLastCodes.size,
+      coveredStyles: matchedLasts,
+      bindingRate: `${pct1(lastCodeLinked)}%`,
+      coverageRate: `${pct1(matchedLasts)}%`,
+    },
+    soleCodeLinked,
+    soleCodeLinkRate: pct1(soleCodeLinked),
+    sole3DCount: matchedSoles,
+    sole3DCoverage: pct1(matchedSoles),
+    soleStats: {
+      uniqueFiles: uniqueSoleCodes.size,
+      coveredStyles: matchedSoles,
+      bindingRate: `${pct1(soleCodeLinked)}%`,
+      coverageRate: `${pct1(matchedSoles)}%`,
+    },
+  };
+}
+
+function applyIncrementalKpisToPayload(payload, changedRows) {
+  const inventory = Array.isArray(payload?.inventory) ? payload.inventory : [];
+  const statusDist = inventory.reduce(
+    (acc, row) => {
+      const key = ['active', 'draft', 'obsolete', 'other'].includes(String(row?.data_status || '')) ? String(row.data_status) : 'other';
+      acc[key] += 1;
+      return acc;
+    },
+    { active: 0, draft: 0, obsolete: 0, other: 0 }
+  );
+  const buckets = {
+    total: inventory,
+    effective: inventory.filter((x) => x?.data_status === 'active'),
+    draft: inventory.filter((x) => x?.data_status === 'draft'),
+    obsolete: inventory.filter((x) => x?.data_status === 'obsolete'),
+    other: inventory.filter((x) => !['active', 'draft', 'obsolete'].includes(String(x?.data_status || ''))),
+  };
+  const effectiveKpis = computeInventoryKpisForCache(buckets.effective);
+  payload.kpis = {
+    ...(payload.kpis || {}),
+    totalStyles: inventory.length,
+    activeStyles: effectiveKpis.totalStyles,
+    matched3DLasts: effectiveKpis.matchedLasts,
+    matched3DSoles: effectiveKpis.matchedSoles,
+    lastCoverage: effectiveKpis.lastCoverage,
+    soleCoverage: effectiveKpis.soleCoverage,
+    last3DCount: effectiveKpis.last3DCount,
+    last3DCoverage: effectiveKpis.last3DCoverage,
+    lastCodeLinked: effectiveKpis.lastCodeLinked,
+    lastCodeLinkRate: effectiveKpis.lastCodeLinkRate,
+    lastStats: effectiveKpis.lastStats,
+    soleCodeLinked: effectiveKpis.soleCodeLinked,
+    soleCodeLinkRate: effectiveKpis.soleCodeLinkRate,
+    sole3DCount: effectiveKpis.sole3DCount,
+    sole3DCoverage: effectiveKpis.sole3DCoverage,
+    soleStats: effectiveKpis.soleStats,
+    stylesWithAny3D: effectiveKpis.stylesWithAny3D,
+    any3DCoveragePercent: effectiveKpis.any3DCoveragePercent,
+    statusDist,
+    incremental3DSyncedAt: new Date().toISOString(),
+    incremental3DChangedRows: changedRows,
+  };
+  payload.statusBuckets = payload.statusBuckets || {};
+  for (const [name, rows] of Object.entries(buckets)) {
+    payload.statusBuckets[name] = {
+      ...(payload.statusBuckets[name] || {}),
+      kpis: {
+        ...(payload.statusBuckets[name]?.kpis || {}),
+        ...computeInventoryKpisForCache(rows),
+        ...(name === 'total' ? { statusDist } : {}),
+      },
+    };
+  }
+  payload.styleMetadata = inventory.map((row) => ({
+    style_wms: row.style_wms,
+    brand: row.brand,
+    status: row.data_status,
+    level: row.product_actual_position || row.productLevel || '未定级',
+    hasId: Boolean(isLinkedInventoryCode(row.lastCode) || isLinkedInventoryCode(row.soleCode)),
+    has3D: row.has3DLast === true || row.has3DSole === true,
+  }));
+  return payload;
+}
+
+async function incrementalSync3DCache() {
+  const payload = await readFinalDashboardSnapshot();
+  if (!payload || !Array.isArray(payload.inventory)) {
+    return { ok: false, reason: 'cache_missing', changedRows: 0, assetCounts: { lasts: 0, soles: 0 } };
+  }
+  const lastsSet = scanAssetKeySet(DIRS.lasts);
+  const solesSet = scanAssetKeySet(DIRS.soles);
+  let changedRows = 0;
+  for (const row of payload.inventory) {
+    const nextHasLast = isLinkedInventoryCode(row.lastCode) && lastsSet.has(normalizeAssetCodeKey(row.lastCode));
+    const nextHasSole = isLinkedInventoryCode(row.soleCode) && solesSet.has(normalizeAssetCodeKey(row.soleCode));
+    const before = `${row.has3DLast}|${row.lastStatus}|${row.has3DSole}|${row.soleStatus}`;
+    row.has3DLast = nextHasLast;
+    row.lastStatus = nextHasLast ? 'matched' : 'missing';
+    row.has3DSole = nextHasSole;
+    row.soleStatus = nextHasSole ? 'matched' : 'missing';
+    const after = `${row.has3DLast}|${row.lastStatus}|${row.has3DSole}|${row.soleStatus}`;
+    if (before !== after) changedRows += 1;
+  }
+  payload.generatedAt = new Date().toISOString();
+  payload.cache = {
+    ...(payload.cache || {}),
+    type: 'full_inventory_cache',
+    incremental3DSyncedAt: payload.generatedAt,
+    assetCounts: { lasts: lastsSet.size, soles: solesSet.size },
+    changedRows,
+  };
+  applyIncrementalKpisToPayload(payload, changedRows);
+  await writeDashboardSnapshots(payload);
+  return { ok: true, changedRows, assetCounts: { lasts: lastsSet.size, soles: solesSet.size }, generatedAt: payload.generatedAt };
 }
 
 async function purgeOldSnapshots() {
@@ -432,6 +641,7 @@ async function purgeOldSnapshots() {
   };
   await tryRemove(FINAL_RESULTS_PATH);
   await tryRemove(FINAL_DASHBOARD_PATH);
+  await tryRemove(FULL_INVENTORY_CACHE_PATH);
 
   // 删除任何包含 snapshot 关键字的缓存文件（仅 storage 根下递归）
   const walk = async (dir) => {
@@ -3761,17 +3971,24 @@ app.post('/api/upload', upload.array('files', 200), async (req, res) => {
     }
   }
 
+  const has3DAssetUpload = files.some((f) => {
+    const name = String(f?.originalname || f?.filename || '').toLowerCase();
+    return ['.obj', '.stl', '.glb', '.3dm'].includes(path.extname(name));
+  });
+  const incremental3D = has3DAssetUpload ? await incrementalSync3DCache() : null;
+
   res.json({
     ok: true,
     uploaded,
+    incremental3D,
   });
 });
 
 function detectCategoryFromPath(fullPath) {
-  const normalized = fullPath.split(path.sep).join('/');
-  if (normalized.includes('/storage/data_tables/')) return 'xlsx';
-  if (normalized.includes('/storage/assets/lasts/')) return '3d_lasts';
-  if (normalized.includes('/storage/assets/soles/')) return '3d_soles';
+  const rel = path.relative(STORAGE_ROOT, fullPath).split(path.sep).join('/');
+  if (rel.startsWith('data_tables/')) return 'xlsx';
+  if (rel.startsWith('assets/lasts/')) return '3d_lasts';
+  if (rel.startsWith('assets/soles/')) return '3d_soles';
   return 'unknown';
 }
 
@@ -3851,6 +4068,20 @@ app.get('/api/check-mandatory-files', async (_req, res) => {
     // eslint-disable-next-line no-console
     console.error('[mandatory-files] check failed', e);
     return res.status(500).json({ ok: false, error: e instanceof Error ? e.message : 'mandatory file check failed' });
+  }
+});
+
+app.post('/api/incremental-3d-sync', async (_req, res) => {
+  try {
+    const result = await incrementalSync3DCache();
+    if (!result.ok && result.reason === 'cache_missing') {
+      return res.status(409).json({ ok: false, error: 'full_inventory_cache.json missing; run force sync once', ...result });
+    }
+    return res.json(result);
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.error('[Incremental3D] sync failed', e);
+    return res.status(500).json({ ok: false, error: e instanceof Error ? e.message : 'incremental 3d sync failed' });
   }
 });
 
@@ -4195,7 +4426,7 @@ app.get('/api/asset-details', async (req, res) => {
 
     const linkedSoleCodes = !isSole ? Array.from(soleSet).sort((a, b) => a.localeCompare(b)) : [];
 
-    // status: processing 当 OBJ 有但 GLB 还没生成（后台转换中）
+    // OBJ 存在但 GLB 未生成时也返回 ready，前端 ThreeDViewer 会直接加载原始 OBJ。
     const hasObj = Boolean(scan.obj && fs.existsSync(scan.obj));
     const hasGlb = Boolean(scan.glb && fs.existsSync(scan.glb));
     if (!hasObj && !hasGlb) {
@@ -4213,11 +4444,11 @@ app.get('/api/asset-details', async (req, res) => {
 
     if (hasObj && !hasGlb) {
       // eslint-disable-next-line no-console
-      console.log('[Success] 物理文件已锁定，路径为：', scan.obj);
+      console.log('[Success] GLB 不可用，已回退原始 OBJ：', scan.obj);
       return res.json({
         ok: true,
-        status: 'processing',
-        message: '原始模型已就绪，预览转换中...',
+        status: 'ready',
+        message: 'GLB 不可用，已回退原始 OBJ 预览',
         type,
         code,
         file,

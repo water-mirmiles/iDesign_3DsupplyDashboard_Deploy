@@ -259,10 +259,11 @@ export default function DataCenter() {
     });
   };
 
-  /** 上传后强制重算看板并落盘，避免仍读未含新 3D 文件的旧快照 */
+  /** 上传业务表后强制重算看板；3D 文件上传走增量对账，避免重新解析 Excel。 */
   const triggerDashboardPhysicalSync = async () => {
     try {
-      const resp = await fetch('/api/force-sync-dashboard', {
+      const endpoint = activeTab === '3d' ? '/api/incremental-3d-sync' : '/api/force-sync-dashboard';
+      const resp = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username: getCurrentUsername() }),
@@ -270,11 +271,11 @@ export default function DataCenter() {
       const json = (await resp.json().catch(() => null)) as { ok?: boolean; error?: string } | null;
       if (!resp.ok || !json?.ok) {
         // eslint-disable-next-line no-console
-        console.warn('[DataCenter] force-sync-dashboard 失败', json?.error || resp.status);
+        console.warn(`[DataCenter] ${endpoint} 失败`, json?.error || resp.status);
       }
     } catch (e) {
       // eslint-disable-next-line no-console
-      console.warn('[DataCenter] force-sync-dashboard', e);
+      console.warn('[DataCenter] dashboard sync', e);
     }
   };
 
@@ -311,12 +312,14 @@ export default function DataCenter() {
       }
       await loadHistory();
       const nextMandatoryStatus = await loadMandatoryStatus();
-      const shouldForceSync =
+      const shouldSyncDashboard =
         anyUploadOk &&
-        (activeTab === '3d' || (!hadAllMandatoryFiles && areAllMandatoryFilesReady(nextMandatoryStatus || mandatoryStatus)));
+        activeTab !== '3d' &&
+        !hadAllMandatoryFiles &&
+        areAllMandatoryFilesReady(nextMandatoryStatus || mandatoryStatus);
       if (anyUploadOk) {
         try {
-          if (shouldForceSync) {
+          if (shouldSyncDashboard) {
             setPipelineSyncing(true);
             await triggerDashboardPhysicalSync();
           }
@@ -352,7 +355,7 @@ export default function DataCenter() {
         {pipelineSyncing && (
           <div className="mt-3 flex items-center gap-2 text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 w-full max-w-2xl">
             <RefreshCw className="w-4 h-4 shrink-0 animate-spin" />
-            正在重算 3D 对账、看板与清单数据（与后端物理文件对齐）…
+            {activeTab === '3d' ? '正在秒级同步 3D 对账缓存（不重新解析 Excel）…' : '正在重算看板与清单数据（与后端业务表对齐）…'}
           </div>
         )}
       </div>

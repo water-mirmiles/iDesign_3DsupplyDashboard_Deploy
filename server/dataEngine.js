@@ -2724,8 +2724,10 @@ export async function processAllData({ storageRoot, operator = 'System', operati
 export async function persistFinalDashboardData(storageRoot, payload) {
   const outPath = path.join(storageRoot, 'final_dashboard_data.json');
   const finalResultsPath = path.join(storageRoot, 'final_results.json');
+  const fullInventoryCachePath = path.join(storageRoot, 'full_inventory_cache.json');
   await fse.writeJson(outPath, payload, { spaces: 2 });
   await fse.writeJson(finalResultsPath, payload, { spaces: 2 });
+  await fse.writeJson(fullInventoryCachePath, payload, { spaces: 2 });
   return outPath;
 }
 
