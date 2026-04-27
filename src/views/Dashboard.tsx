@@ -5,6 +5,7 @@ import {
 } from 'recharts';
 import { Box, Layers, Hash, Factory, Loader2, Activity, TrendingUp, AlertCircle, FileWarning, ChevronDown, Search } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { getApiOperatorUsername } from '@/lib/requestOperator';
 import { AssetTrendStats } from '@/types';
 import { CORE_MAIN_TABLE_NAME } from '@/lib/dataManifest';
 
@@ -167,16 +168,6 @@ function levelSelectionMatches(selectedLevel: string, optionLevel: string, coreL
 function isLinkedCode(v: any) {
   const s = String(v ?? '').trim();
   return s !== '' && s !== '-' && s !== '0';
-}
-
-function getCurrentUsername() {
-  try {
-    const parsed = JSON.parse(localStorage.getItem('currentUser') || 'null');
-    if (parsed?.username) return String(parsed.username).trim();
-  } catch {
-    // ignore
-  }
-  return localStorage.getItem('username') || 'System';
 }
 
 export default function Dashboard() {
@@ -418,7 +409,8 @@ export default function Dashboard() {
       setIsLoading(true);
       setError(null);
       try {
-        const resp = await fetch(`/api/dashboard-stats?t=${Date.now()}`);
+        const op = encodeURIComponent(getApiOperatorUsername());
+        const resp = await fetch(`/api/dashboard-stats?t=${Date.now()}&username=${op}`);
         const json = (await resp.json()) as DashboardStatsResponse;
         if (!resp.ok || !json.ok) throw new Error(json.error || `加载失败（HTTP ${resp.status}）`);
         if (cancelled) return;
@@ -464,12 +456,13 @@ export default function Dashboard() {
       const resp = await fetch('/api/force-sync-dashboard', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: getCurrentUsername() }),
+        body: JSON.stringify({ username: getApiOperatorUsername() }),
       });
       const json = await resp.json().catch(() => null);
       if (!resp.ok || !json?.ok) throw new Error(json?.error || `重算失败（HTTP ${resp.status}）`);
       // 重算后强制拉取最新 stats（避免仍读旧快照）
-      const resp2 = await fetch(`/api/dashboard-stats?t=${Date.now()}`);
+      const op2 = encodeURIComponent(getApiOperatorUsername());
+      const resp2 = await fetch(`/api/dashboard-stats?t=${Date.now()}&username=${op2}`);
       const json2 = (await resp2.json()) as DashboardStatsResponse;
       if (!resp2.ok || !json2.ok) throw new Error(json2.error || `刷新失败（HTTP ${resp2.status}）`);
       // eslint-disable-next-line no-console

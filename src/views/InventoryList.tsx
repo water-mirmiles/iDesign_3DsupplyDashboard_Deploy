@@ -4,6 +4,7 @@ import { cn } from '@/lib/utils';
 import { InventoryItem } from '@/types';
 import ThreeDViewer from '@/components/ThreeDViewer';
 import { getStorageBaseUrl } from '@/lib/storageBaseUrl';
+import { getApiOperatorUsername } from '@/lib/requestOperator';
 import { formatMetricsForUi, type Last3DMetrics } from '@/lib/last3dMetrics';
 
 /** 生产环境走同源相对路径，避免弹窗请求打到用户本机 localhost */
@@ -676,7 +677,8 @@ export default function InventoryList() {
     setIsLoading(true);
     setError(null);
     try {
-      const resp = await fetch('/api/inventory-real');
+      const u = encodeURIComponent(getApiOperatorUsername());
+      const resp = await fetch(`/api/inventory-real?username=${u}`);
       const json = (await resp.json()) as InventoryRealResponse;
       if (!resp.ok || !json.ok) throw new Error(json.error || `加载失败（HTTP ${resp.status}）`);
       setItems(json.items || []);

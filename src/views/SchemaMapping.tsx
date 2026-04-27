@@ -11,19 +11,10 @@ import {
   Sparkles,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { getApiOperatorUsername } from '@/lib/requestOperator';
 import { GlobalSchemaField } from '@/types';
 
-const API_BASE = 'http://localhost:3001';
-
-function getCurrentUsername() {
-  try {
-    const parsed = JSON.parse(localStorage.getItem('currentUser') || 'null');
-    if (parsed?.username) return String(parsed.username).trim();
-  } catch {
-    // ignore
-  }
-  return localStorage.getItem('username') || 'System';
-}
+const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:3001';
 
 const initialStandardFields: GlobalSchemaField[] = [
   { id: 'f1', standardName: '款号', standardKey: 'styleCode', mappedSources: [], description: '产品的唯一标识符' },
@@ -1479,7 +1470,7 @@ export default function SchemaMapping({ onAfterCertify }: SchemaMappingProps = {
       setCertifyEngineRunning(true);
       setAuthSyncHint('');
       const syncPayload = {
-        username: getCurrentUsername(),
+        username: getApiOperatorUsername(),
         // 彻底避免前端把复杂对象隐式转成字符串（[object Object]）
         // 后端必须按 JSON 递归解析，严禁 split('->') 等字符串拆分逻辑
         mappingConfig: JSON.stringify({

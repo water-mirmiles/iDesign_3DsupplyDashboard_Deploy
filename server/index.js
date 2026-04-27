@@ -268,7 +268,23 @@ async function writeUploadAudit(payload) {
 
 function getRequestOperator(req) {
   const body = req?.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
-  return normalizeUsername(body.username || body.operator || body.currentUser?.username) || 'System';
+  const q = req?.query && typeof req.query === 'object' ? req.query : {};
+  const headerOp = normalizeUsername(
+    req?.headers?.['x-current-user'] ?? req?.headers?.['x-username'] ?? ''
+  );
+  const candidates = [
+    body.username,
+    body.operator,
+    body.currentUser?.username,
+    q.username,
+    q.operator,
+    headerOp,
+  ];
+  for (const c of candidates) {
+    const u = normalizeUsername(c);
+    if (u) return u;
+  }
+  return 'System';
 }
 const MAPPING_CONFIG_PATH = path.join(STORAGE_ROOT, 'mapping_config.json');
 const FINAL_DASHBOARD_PATH = path.join(STORAGE_ROOT, 'final_dashboard_data.json');
@@ -4262,7 +4278,9 @@ app.get('/api/dashboard-stats', async (req, res) => {
       );
       // 强制删除旧缓存（包含 final_results.json），避免读到旧残留
       await purgeOldSnapshots();
-      const payload = await processAllData({ storageRoot: STORAGE_ROOT });
+      const operator = getRequestOperator(req);
+      const operationTime = new Date();
+      const payload = await processAllData({ storageRoot: STORAGE_ROOT, operator, operationTime });
       await persistFinalDashboardData(STORAGE_ROOT, payload);
       return res.json({
         ok: true,
@@ -4417,7 +4435,9 @@ app.get('/api/inventory-real', async (req, res) => {
           snap ? 'yes' : 'no'
         } stale=${snapIsStale ? 'yes' : 'no'} snap.latest=${snapLatestDate || '(none)'} prod.latest=${latestProdDate || '(none)'}`
       );
-      const payload = await processAllData({ storageRoot: STORAGE_ROOT });
+      const operator = getRequestOperator(req);
+      const operationTime = new Date();
+      const payload = await processAllData({ storageRoot: STORAGE_ROOT, operator, operationTime });
       await persistFinalDashboardData(STORAGE_ROOT, payload);
       const items = (payload.inventory || []).map((it) => ({
         ...it,
@@ -4453,8 +4473,10 @@ app.get('/api/inventory-real', async (req, res) => {
       if (act.length > 0 && rate < 0.05) {
         // eslint-disable-next-line no-console
         console.log(`[Prod-Engine] inventory-real detected low lastCode link rate ${(rate * 100).toFixed(2)}% (${linked}/${act.length}); auto force recalc...`);
-        await forceSyncLatestProduction({ storageRoot: STORAGE_ROOT });
-        const payload = await processAllData({ storageRoot: STORAGE_ROOT });
+        const operator = getRequestOperator(req);
+        const operationTime = new Date();
+        await forceSyncLatestProduction({ storageRoot: STORAGE_ROOT, operator, operationTime });
+        const payload = await processAllData({ storageRoot: STORAGE_ROOT, operator, operationTime });
         await persistFinalDashboardData(STORAGE_ROOT, payload);
         const rebuilt = (payload.inventory || []).map((it) => ({
           ...it,
@@ -4586,7 +4608,9 @@ app.get('/api/asset-details', async (req, res) => {
       try {
         // eslint-disable-next-line no-console
         console.log(`[Realtime-Link] 物理资产已存在但关联为 0，现场全量重算并反查: type=${type} code=${code}`);
-        const payload = await processAllData({ storageRoot: STORAGE_ROOT });
+        const operator = getRequestOperator(req);
+        const operationTime = new Date();
+        const payload = await processAllData({ storageRoot: STORAGE_ROOT, operator, operationTime });
         await persistFinalDashboardData(STORAGE_ROOT, payload);
         inventory = Array.isArray(payload?.inventory) ? payload.inventory : [];
         ({ linkedStyles, linkedSoleCodes } = collectLinkedAssetRows(inventory, { isSole, code }));

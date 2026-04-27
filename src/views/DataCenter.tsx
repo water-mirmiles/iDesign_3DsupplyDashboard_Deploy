@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { UploadCloud, FileSpreadsheet, Box, CheckCircle2, Clock, FileWarning, Search, Info, Calendar, Play, Trash2, RefreshCw, Circle } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { getApiOperatorUsername } from '@/lib/requestOperator';
 import { ImportHistory } from '@/types';
 import { MANDATORY_DATA_FILES } from '@/lib/dataManifest';
 
@@ -34,16 +35,6 @@ type MandatoryFilesResponse = {
     fileName: string | null;
   }>;
 };
-
-function getCurrentUsername() {
-  try {
-    const parsed = JSON.parse(localStorage.getItem('currentUser') || 'null');
-    if (parsed?.username) return String(parsed.username).trim();
-  } catch {
-    // ignore
-  }
-  return localStorage.getItem('username') || 'System';
-}
 
 function formatBytes(bytes: number) {
   const units = ['B', 'KB', 'MB', 'GB'];
@@ -237,7 +228,7 @@ export default function DataCenter() {
     return new Promise<void>((resolve, reject) => {
       const form = new FormData();
       form.append('files', file);
-      form.append('username', getCurrentUsername());
+      form.append('username', getApiOperatorUsername());
 
       const xhr = new XMLHttpRequest();
       xhr.open('POST', '/api/upload', true);
@@ -266,7 +257,7 @@ export default function DataCenter() {
       const resp = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: getCurrentUsername() }),
+        body: JSON.stringify({ username: getApiOperatorUsername() }),
       });
       const json = (await resp.json().catch(() => null)) as { ok?: boolean; error?: string } | null;
       if (!resp.ok || !json?.ok) {

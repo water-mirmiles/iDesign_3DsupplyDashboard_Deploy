@@ -2748,6 +2748,14 @@ export async function processAllData({ storageRoot, operator = 'System', operati
   };
   // eslint-disable-next-line no-console
   console.log('Engine Final Stats Summary:', engineSummary);
+
+  const auditLabel = normalize(operator) || 'System';
+  if (Array.isArray(payload.inventory)) {
+    for (const row of payload.inventory) {
+      if (row && typeof row === 'object') row.updatedBy = auditLabel;
+    }
+  }
+
   return payload;
 }
 
