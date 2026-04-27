@@ -12,6 +12,7 @@ type Props = {
   fileUrl: string;
   glbUrl?: string | null;
   objUrl?: string | null;
+  assetStatus?: 'ready' | 'processing';
   /** 与清单行 `target_audience` 对齐；未传时按 MEN(275mm) 处理。仅对 legacy OBJ 路径生效。 */
   targetAudience?: string;
   /**
@@ -321,6 +322,7 @@ export default function ThreeDViewer({
   fileUrl,
   glbUrl,
   objUrl,
+  assetStatus,
   targetAudience,
   precomputedMetrics,
   precomputedKey,
@@ -436,7 +438,6 @@ export default function ThreeDViewer({
     const preferredGlbUrl = glbKey || (urlKey.toLowerCase().endsWith('.glb') ? urlKey : '');
     const preferredObjUrl = objKey || (preferredGlbUrl ? deriveObjUrlFromGlbUrl(preferredGlbUrl) : urlKey);
     const isGlb = Boolean(preferredGlbUrl);
-    const isStl = !preferredGlbUrl && preferredObjUrl.toLowerCase().endsWith('.stl');
     const glbBustedUrl = preferredGlbUrl
       ? `${preferredGlbUrl.split('#')[0]}${preferredGlbUrl.includes('?') ? '&' : '?'}_cb=${
           typeof glbCacheToken === 'number' || typeof glbCacheToken === 'string' ? String(glbCacheToken) : Date.now()
@@ -461,14 +462,56 @@ export default function ThreeDViewer({
           onError: (e) => onErrorRef.current?.(e),
         };
 
+        let headGlbStatusForMessage = 0;
+
+        const loadObjOrStlSource = async (sourceUrl: string, isFallback: boolean) => {
+          const headSource = await headValidateAssetUrl(sourceUrl);
+          if (!headSource.ok || headSource.isHtml) {
+            const msg = isFallback
+              ? `文件路径错误 (GLB:${headGlbStatusForMessage} / OBJ:${headSource.status})`
+              : `文件路径错误 (HTTP ${headSource.status})`;
+            setError(msg);
+            onErrorRef.current?.(new Error(msg));
+            setProgress(null);
+            return null;
+          }
+          if (sourceUrl.toLowerCase().endsWith('.stl')) {
+            const ab = await loadArrayBufferWithXhr(
+              sourceUrl,
+              (p) => {
+                if (!signal.aborted) setProgress(p);
+              },
+              signal
+            );
+            if (signal.aborted) return null;
+            const geometry = loaderStl.parse(ab);
+            return new THREE.Mesh(geometry, phongMat.clone());
+          }
+          const text = await loadTextWithXhr(
+            sourceUrl,
+            (p) => {
+              if (!signal.aborted) setProgress(p);
+            },
+            signal
+          );
+          if (signal.aborted) return null;
+          return loaderObj.parse(text);
+        };
+
         if (isGlb) {
           // 1) 优先 GLB（快）。若 GLB 404 / 加载失败，则自动降级 OBJ
           let headGlb: Awaited<ReturnType<typeof headValidateAssetUrl>> = { ok: false, status: 0, contentType: '', isHtml: false };
           try {
             headGlb = await withTimeout(headValidateAssetUrl(glbBustedUrl), GLB_PREVIEW_TIMEOUT_MS, 'GLB HEAD');
+            headGlbStatusForMessage = headGlb.status;
           } catch (e) {
+            headGlbStatusForMessage = 0;
             // eslint-disable-next-line no-console
             console.warn('[ThreeDViewer] GLB HEAD 超时/失败，立即降级 OBJ:', e);
+          }
+          if (!headGlb.ok && assetStatus === 'ready' && objFallbackUrl) {
+            // eslint-disable-next-line no-console
+            console.warn(`[ThreeDViewer] 后端状态 ready 但 GLB 不可访问(HTTP ${headGlb.status})，立即加载源文件降级。`);
           }
           if (headGlb.ok && !headGlb.isHtml) {
             try {
@@ -514,23 +557,8 @@ export default function ThreeDViewer({
           }
 
           // 2) OBJ 降级
-          const headObj = await headValidateAssetUrl(objFallbackUrl);
-          if (!headObj.ok || headObj.isHtml) {
-            const msg = `文件路径错误 (GLB:${headGlb.status} / OBJ:${headObj.status})`;
-            setError(msg);
-            onErrorRef.current?.(new Error(msg));
-            setProgress(null);
-            return;
-          }
-          const text = await loadTextWithXhr(
-            objFallbackUrl,
-            (p) => {
-              if (!signal.aborted) setProgress(p);
-            },
-            signal
-          );
-          if (signal.aborted) return;
-          const obj = loaderObj.parse(text);
+          const obj = await loadObjOrStlSource(objFallbackUrl, true);
+          if (!obj || signal.aborted) return;
           const ok = processLoadedObject(obj, {
             ...procBase,
             isGlb: false,
@@ -545,37 +573,8 @@ export default function ThreeDViewer({
         } else {
           // OBJ/STL 主路径
           const sourceUrl = objFallbackUrl || urlKey;
-          const headSource = await headValidateAssetUrl(sourceUrl);
-          if (!headSource.ok || headSource.isHtml) {
-            const msg = `文件路径错误 (HTTP ${headSource.status})`;
-            setError(msg);
-            onErrorRef.current?.(new Error(msg));
-            setProgress(null);
-            return;
-          }
-          let obj: THREE.Object3D;
-          if (isStl) {
-            const ab = await loadArrayBufferWithXhr(
-              sourceUrl,
-              (p) => {
-                if (!signal.aborted) setProgress(p);
-              },
-              signal
-            );
-            if (signal.aborted) return;
-            const geometry = loaderStl.parse(ab);
-            obj = new THREE.Mesh(geometry, phongMat.clone());
-          } else {
-            const text = await loadTextWithXhr(
-              sourceUrl,
-              (p) => {
-                if (!signal.aborted) setProgress(p);
-              },
-              signal
-            );
-            if (signal.aborted) return;
-            obj = loaderObj.parse(text);
-          }
+          const obj = await loadObjOrStlSource(sourceUrl, false);
+          if (!obj || signal.aborted) return;
           const ok = processLoadedObject(obj, {
             ...procBase,
             onMetrics: (m) => onMetricsRef.current?.(m),
@@ -639,7 +638,7 @@ export default function ThreeDViewer({
       }
       renderer.dispose();
     };
-  }, [urlKey, glbKey, objKey, targetAudience, precomputedMetrics, precomputedKey, glbCacheToken]);
+  }, [urlKey, glbKey, objKey, assetStatus, targetAudience, precomputedMetrics, precomputedKey, glbCacheToken]);
 
   return (
     <div className={className} ref={containerRef} style={{ position: 'relative', minHeight: 120, width: '100%', height: '100%' }}>

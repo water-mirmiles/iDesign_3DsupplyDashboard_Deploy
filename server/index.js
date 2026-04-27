@@ -333,6 +333,10 @@ function removeSiblingGlbOn3dAssetOverwrite(absoluteFilePath) {
 /** 与 dataEngine 物理对账一致：去后缀 + trim + 小写 */
 const ASSET_3D_EXTS = ['.glb', '.obj', '.stl', '.3dm'];
 
+function is3DAssetExt(ext) {
+  return ASSET_3D_EXTS.includes(String(ext || '').toLowerCase());
+}
+
 function stripExtAssetName(name) {
   return String(name ?? '').trim().replace(/\.[^.]+$/, '');
 }
@@ -367,6 +371,16 @@ function uploadTrace(message, detail = '') {
   console.log(`[Upload-Trace][${stamp}] ${message}${extra}`);
 }
 
+function appendModelingDebugLogSync(line) {
+  try {
+    const p = path.join(STORAGE_ROOT, 'modeling_debug.log');
+    fse.ensureDirSync(path.dirname(p));
+    fse.appendFileSync(p, `[${new Date().toISOString()}] ${String(line ?? '')}\n`, { encoding: 'utf8' });
+  } catch {
+    // debug logging must never block upload/preview
+  }
+}
+
 function findPhysicalAssetFileAbs(dirAbs, codeRaw) {
   const want = normalizeAssetCodeKey(codeRaw);
   if (!want) return null;
@@ -380,7 +394,7 @@ function findPhysicalAssetFileAbs(dirAbs, codeRaw) {
   for (const e of entries) {
     if (!e.isFile()) continue;
     const ext = path.extname(e.name).toLowerCase();
-    if (!ASSET_3D_EXTS.includes(ext)) continue;
+    if (!is3DAssetExt(ext)) continue;
     if (normalizeAssetCodeKey(e.name) !== want) continue;
     candidates.push(e.name);
   }
@@ -415,7 +429,7 @@ function scanDirForAssetByCode(dirAbs, codeRaw) {
   for (const e of entries) {
     if (!e.isFile()) continue;
     const ext = path.extname(e.name).toLowerCase();
-    if (!ASSET_3D_EXTS.includes(ext)) continue;
+    if (!is3DAssetExt(ext)) continue;
     const base = normalizeAssetCodeKey(e.name);
     const score = scoreClosestAssetName(want, base);
     if (score > closestScore) {
@@ -726,6 +740,29 @@ async function incrementalSync3DCache() {
   applyIncrementalKpisToPayload(payload, changedRows);
   await writeDashboardSnapshots(payload);
   return { ok: true, changedRows, assetCounts: { lasts: lastsSet.size, soles: solesSet.size }, generatedAt: payload.generatedAt };
+}
+
+function collectLinkedAssetRows(inventory, { isSole, code }) {
+  const key = normalizeAssetCodeKey(code);
+  const field = isSole ? 'soleCode' : 'lastCode';
+  const linkedStyles = [];
+  const soleSet = new Set();
+  for (const row of Array.isArray(inventory) ? inventory : []) {
+    const v = row?.[field];
+    if (normalizeAssetCodeKey(v) !== key) continue;
+    linkedStyles.push({
+      style_wms: String(row?.style_wms ?? '').trim() || '—',
+      data_status: row?.data_status ?? 'other',
+    });
+    if (!isSole) {
+      const sc = String(row?.soleCode ?? '').trim();
+      if (sc && sc !== '-' && sc !== '0') soleSet.add(sc);
+    }
+  }
+  return {
+    linkedStyles,
+    linkedSoleCodes: !isSole ? Array.from(soleSet).sort((a, b) => a.localeCompare(b)) : [],
+  };
 }
 
 async function purgeOldSnapshots() {
@@ -1484,6 +1521,11 @@ async function runObjToGlbPipeline(absoluteObjPath) {
     uploadTrace('转换结果/错误: success', `${outGlb}`);
   } catch (e) {
     uploadTrace('转换结果/错误:', e instanceof Error ? e.message : String(e));
+    appendModelingDebugLogSync(
+      `[3d-pipeline] obj2gltf failed | source=${absoluteObjPath} | command=${cmdString} | error=${
+        e instanceof Error ? e.stack || e.message : String(e)
+      }`
+    );
     // eslint-disable-next-line no-console
     console.error('[3d-pipeline] obj2gltf failed', absoluteObjPath, e);
     return;
@@ -4521,39 +4563,30 @@ app.get('/api/asset-details', async (req, res) => {
 
     const snap = await readFinalDashboardSnapshot();
     let inventory = Array.isArray(snap?.inventory) ? snap.inventory : [];
-    if (!inventory.length) {
-      try {
-        const payload = await processAllData({ storageRoot: STORAGE_ROOT });
-        inventory = payload.inventory || [];
-      } catch {
-        inventory = [];
-      }
-    }
-
-    const key = normalizeAssetCodeKey(code);
-    const field = isSole ? 'soleCode' : 'lastCode';
-    const linkedStyles = [];
-    const soleSet = new Set();
-
-    for (const row of inventory) {
-      const v = row?.[field];
-      if (normalizeAssetCodeKey(v) !== key) continue;
-      linkedStyles.push({
-        style_wms: String(row?.style_wms ?? '').trim() || '—',
-        data_status: row?.data_status ?? 'other',
-      });
-      if (!isSole) {
-        const sc = String(row?.soleCode ?? '').trim();
-        if (sc && sc !== '-' && sc !== '0') soleSet.add(sc);
-      }
-    }
-
-    const linkedSoleCodes = !isSole ? Array.from(soleSet).sort((a, b) => a.localeCompare(b)) : [];
+    let { linkedStyles, linkedSoleCodes } = collectLinkedAssetRows(inventory, { isSole, code });
 
     // OBJ/STL 等源文件存在但 GLB 未生成时也返回 ready，前端直接加载源文件或提供下载。
     const hasObj = Boolean(scan.obj && fs.existsSync(scan.obj));
     const hasGlb = Boolean(scan.glb && fs.existsSync(scan.glb));
     const hasAnySource = Boolean(scan.any && fs.existsSync(scan.any));
+
+    if (scan.success && linkedStyles.length === 0) {
+      // 缓存中的 inventory 可能落后于当前 Excel 主表；弹窗关联款号必须以实时聚合结果兜底。
+      try {
+        // eslint-disable-next-line no-console
+        console.log(`[Realtime-Link] 缓存关联为 0，现场重算主表并反查: type=${type} code=${code}`);
+        const payload = await processAllData({ storageRoot: STORAGE_ROOT });
+        await persistFinalDashboardData(STORAGE_ROOT, payload);
+        inventory = Array.isArray(payload?.inventory) ? payload.inventory : [];
+        ({ linkedStyles, linkedSoleCodes } = collectLinkedAssetRows(inventory, { isSole, code }));
+        // eslint-disable-next-line no-console
+        console.log(`[Realtime-Link] 现场反查完成: ${code} => ${linkedStyles.length} rows`);
+      } catch (recalcError) {
+        // eslint-disable-next-line no-console
+        console.warn('[Realtime-Link] 现场反查失败，保留缓存结果:', recalcError instanceof Error ? recalcError.message : recalcError);
+      }
+    }
+
     if (!hasObj && !hasGlb && !hasAnySource) {
       return res.status(404).json({
         ok: false,
@@ -4782,6 +4815,8 @@ async function start() {
     })().catch(() => {});
     // eslint-disable-next-line no-console
     console.log(`[server] listening on http://localhost:${port}`);
+    // eslint-disable-next-line no-console
+    console.log(`[Path-Check] 正在从以下物理路径读取数据：${path.resolve(STORAGE_ROOT)}`);
     // eslint-disable-next-line no-console
     console.log('[env] path:', ENV_PATH);
     // eslint-disable-next-line no-console

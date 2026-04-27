@@ -342,6 +342,7 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType, targetAudience }:
                 fileUrl={fileUrl}
                 glbUrl={viewerGlbUrl}
                 objUrl={viewerObjUrl}
+                assetStatus={details?.status}
                 targetAudience={targetAudience}
                 precomputedMetrics={fileUrl && fileUrl.toLowerCase().endsWith('.glb') ? precomputedFromApi : null}
                 precomputedKey={precomputedKey}
