@@ -2,7 +2,6 @@ import fs from 'node:fs';
 import fse from 'fs-extra';
 import path from 'path';
 import XLSX from 'xlsx';
-import { fileURLToPath } from 'url';
 import { getLogicalTableName } from './utils.js';
 
 function isDateDirName(name) {
@@ -11,6 +10,12 @@ function isDateDirName(name) {
 
 function normalize(s) {
   return String(s ?? '').trim();
+}
+
+function resolveServerStorageRoot() {
+  const fromCwd = path.resolve(process.cwd(), 'server', 'storage');
+  if (fse.existsSync(fromCwd)) return fromCwd;
+  return fromCwd;
 }
 
 function normalizeLower(s) {
@@ -449,8 +454,9 @@ function resolveMappingFromStorage(storageRoot) {
 
 /** 与 index.js getLatestDataTablesDir 对齐：优先 module 侧 storage，其次 cwd 下 server/storage/data_tables */
 function resolveDataTablesRootForStorage(storageRoot) {
-  const fromStorage = path.join(storageRoot, 'data_tables');
-  const fromCwd = path.resolve(process.cwd(), 'server', 'storage', 'data_tables');
+  const absoluteStorageRoot = path.resolve(storageRoot || resolveServerStorageRoot());
+  const fromStorage = path.join(absoluteStorageRoot, 'data_tables');
+  const fromCwd = path.join(resolveServerStorageRoot(), 'data_tables');
   try {
     if (fse.existsSync(fromStorage)) return fromStorage;
     if (fse.existsSync(fromCwd)) return fromCwd;
@@ -528,21 +534,15 @@ export function valuesEqualForJoin(a, b) {
 }
 
 function engineLogPath() {
-  const __filename = fileURLToPath(import.meta.url);
-  const __dirname = path.dirname(__filename);
-  return path.join(__dirname, 'storage', 'engine.log');
+  return path.join(resolveServerStorageRoot(), 'engine.log');
 }
 
 function engineAuditLogPath() {
-  const __filename = fileURLToPath(import.meta.url);
-  const __dirname = path.dirname(__filename);
-  return path.join(__dirname, 'storage', 'engine_audit.log');
+  return path.join(resolveServerStorageRoot(), 'engine_audit.log');
 }
 
 function aiTraceLogPath() {
-  const __filename = fileURLToPath(import.meta.url);
-  const __dirname = path.dirname(__filename);
-  return path.join(__dirname, 'storage', 'ai_trace.log');
+  return path.join(resolveServerStorageRoot(), 'ai_trace.log');
 }
 
 function appendEngineLogSync(line) {
@@ -1225,9 +1225,7 @@ function readSheetRows(fullPath) {
       if (loaded) return cache;
       loaded = true;
       try {
-        const __filename = fileURLToPath(import.meta.url);
-        const __dirname = path.dirname(__filename);
-        const p = path.join(__dirname, 'storage', 'ddl_schema_cache.json');
+        const p = path.join(resolveServerStorageRoot(), 'ddl_schema_cache.json');
         if (!fse.existsSync(p)) return (cache = null);
         const obj = fse.readJsonSync(p);
         if (!obj || typeof obj !== 'object') return (cache = null);

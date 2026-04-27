@@ -3,6 +3,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 import { getStorageBaseUrl } from '@/lib/storageBaseUrl';
 import { extractLast3DMetrics, type Last3DMetrics } from '@/lib/last3dMetrics';
 import { audienceLabelZh, getTargetLengthMm, parseAudience, type ShoeAudience } from '@/lib/shoeStandards';
@@ -399,6 +400,7 @@ export default function ThreeDViewer({
 
     const loaderObj = new OBJLoader();
     const loaderGltf = new GLTFLoader();
+    const loaderStl = new STLLoader();
 
     const disposeGeometries = (o: THREE.Object3D) => {
       o.traverse((n) => {
@@ -408,6 +410,7 @@ export default function ThreeDViewer({
     };
 
     const isGlb = urlKey.toLowerCase().endsWith('.glb');
+    const isStl = urlKey.toLowerCase().endsWith('.stl');
     const glbBustedUrl = isGlb
       ? `${urlKey.split('#')[0]}${urlKey.includes('?') ? '&' : '?'}_cb=${
           typeof glbCacheToken === 'number' || typeof glbCacheToken === 'string' ? String(glbCacheToken) : Date.now()
@@ -504,24 +507,38 @@ export default function ThreeDViewer({
             return;
           }
         } else {
-          // OBJ 主路径
-          const headObj = await headValidateAssetUrl(urlKey);
-          if (!headObj.ok || headObj.isHtml) {
-            const msg = `文件路径错误 (HTTP ${headObj.status})`;
+          // OBJ/STL 主路径
+          const headSource = await headValidateAssetUrl(urlKey);
+          if (!headSource.ok || headSource.isHtml) {
+            const msg = `文件路径错误 (HTTP ${headSource.status})`;
             setError(msg);
             onErrorRef.current?.(new Error(msg));
             setProgress(null);
             return;
           }
-          const text = await loadTextWithXhr(
-            urlKey,
-            (p) => {
-              if (!signal.aborted) setProgress(p);
-            },
-            signal
-          );
-          if (signal.aborted) return;
-          const obj = loaderObj.parse(text);
+          let obj: THREE.Object3D;
+          if (isStl) {
+            const ab = await loadArrayBufferWithXhr(
+              urlKey,
+              (p) => {
+                if (!signal.aborted) setProgress(p);
+              },
+              signal
+            );
+            if (signal.aborted) return;
+            const geometry = loaderStl.parse(ab);
+            obj = new THREE.Mesh(geometry, phongMat.clone());
+          } else {
+            const text = await loadTextWithXhr(
+              urlKey,
+              (p) => {
+                if (!signal.aborted) setProgress(p);
+              },
+              signal
+            );
+            if (signal.aborted) return;
+            obj = loaderObj.parse(text);
+          }
           const ok = processLoadedObject(obj, {
             ...procBase,
             onMetrics: (m) => onMetricsRef.current?.(m),

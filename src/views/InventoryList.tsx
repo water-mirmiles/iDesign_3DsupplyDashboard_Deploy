@@ -188,6 +188,7 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType, targetAudience }:
   const [precomputedKey, setPrecomputedKey] = useState<string>('');
   const [glbBust, setGlbBust] = useState(() => Date.now());
   const [scan3d, setScan3d] = useState(false);
+  const [reprocessing, setReprocessing] = useState(false);
 
   const apiType = assetType === 'last' ? 'lasts' : 'soles';
 
@@ -237,6 +238,24 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType, targetAudience }:
     }
   }, [apiType, assetCode]);
 
+  const handleReprocessAsset = useCallback(async () => {
+    if (!assetCode.trim() || reprocessing) return;
+    setReprocessing(true);
+    setFetchError(null);
+    try {
+      const qs = new URLSearchParams({ type: apiType, code: assetCode.trim() });
+      const resp = await fetch(`${API_BASE}/api/reprocess-asset?${qs.toString()}`, { method: 'POST' });
+      const json = (await resp.json().catch(() => null)) as { ok?: boolean; error?: string } | null;
+      if (!resp.ok || !json?.ok) throw new Error(json?.error || `重试失败（HTTP ${resp.status}）`);
+      setGlbBust(Date.now());
+      await loadPreviewData();
+    } catch (e) {
+      setFetchError(e instanceof Error ? e.message : '重试失败');
+    } finally {
+      setReprocessing(false);
+    }
+  }, [API_BASE, apiType, assetCode, loadPreviewData, reprocessing]);
+
   useEffect(() => {
     if (!isOpen || !assetCode.trim()) return;
     setShowAllStyles(false);
@@ -247,6 +266,7 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType, targetAudience }:
     setPrecomputedFromApi(null);
     setPrecomputedKey('');
     setScan3d(false);
+    setReprocessing(false);
     void loadPreviewData();
   }, [isOpen, assetCode, loadPreviewData]);
 
@@ -346,6 +366,16 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType, targetAudience }:
               <>
                 <XCircle className="w-14 h-14 text-red-400 mx-auto mb-4" />
                 <p className="text-red-300 font-medium">{fetchError}</p>
+                {notProcessed ? (
+                  <button
+                    type="button"
+                    onClick={() => void handleReprocessAsset()}
+                    disabled={reprocessing}
+                    className="mt-3 rounded-lg border border-red-300/40 bg-red-500/10 px-3 py-1.5 text-xs font-semibold text-red-100 hover:bg-red-500/20 disabled:opacity-60"
+                  >
+                    {reprocessing ? '正在重试...' : '重新触发预处理'}
+                  </button>
+                ) : null}
               </>
             ) : viewerError ? (
               <>

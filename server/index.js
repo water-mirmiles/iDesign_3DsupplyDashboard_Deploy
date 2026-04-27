@@ -335,6 +335,13 @@ function normalizeAssetCodeKey(codeOrFileName) {
   return stripExtAssetName(String(codeOrFileName ?? '').trim()).toLowerCase();
 }
 
+function uploadTrace(message, detail = '') {
+  const stamp = new Date().toISOString();
+  const extra = detail ? ` ${detail}` : '';
+  // eslint-disable-next-line no-console
+  console.log(`[Upload-Trace][${stamp}] ${message}${extra}`);
+}
+
 function findPhysicalAssetFileAbs(dirAbs, codeRaw) {
   const want = normalizeAssetCodeKey(codeRaw);
   if (!want) return null;
@@ -391,6 +398,18 @@ function scanDirForAssetByCode(dirAbs, codeRaw) {
     if (ext === '.obj') obj = abs;
   }
   return { glb, obj, any, hits };
+}
+
+function scanAllAssetDirsByCode(codeRaw) {
+  const lastScan = scanDirForAssetByCode(DIRS.lasts, codeRaw);
+  const soleScan = scanDirForAssetByCode(DIRS.soles, codeRaw);
+  if (lastScan.glb || lastScan.obj || lastScan.any) {
+    return { type: 'lasts', dir: DIRS.lasts, scan: lastScan };
+  }
+  if (soleScan.glb || soleScan.obj || soleScan.any) {
+    return { type: 'soles', dir: DIRS.soles, scan: soleScan };
+  }
+  return { type: 'lasts', dir: DIRS.lasts, scan: lastScan };
 }
 
 function formatBytesHuman(bytes) {
@@ -1377,12 +1396,27 @@ async function runObjToGlbPipeline(absoluteObjPath) {
   const asPosix = dir.split(path.sep).join('/');
   const typeKey = asPosix.includes('/assets/soles') && !asPosix.includes('/assets/lasts') ? 'soles' : 'lasts';
   const key = `${typeKey}:${normalizeAssetCodeKey(baseNameNoExt)}`;
+  const cmdString = `obj2gltf("${absoluteObjPath}", { binary: true }) -> "${outGlb}"`;
   // eslint-disable-next-line no-console
   console.log('[3d-pipeline] start', { absoluteObjPath, outGlb, key });
+  uploadTrace('正在尝试执行 obj2gltf 转换...');
+  uploadTrace(`转换命令: ${cmdString}`);
   try {
+    try {
+      fs.chmodSync(absoluteObjPath, 0o666);
+    } catch (chmodError) {
+      uploadTrace('转换前权限修正失败:', chmodError instanceof Error ? chmodError.message : String(chmodError));
+    }
     const glbBuf = await obj2gltf(absoluteObjPath, { binary: true });
     await fse.writeFile(outGlb, glbBuf);
+    try {
+      fs.chmodSync(outGlb, 0o666);
+    } catch {
+      // ignore: GLB is already written; preview can still fallback to OBJ if permissions block it.
+    }
+    uploadTrace('转换结果/错误: success', `${outGlb}`);
   } catch (e) {
+    uploadTrace('转换结果/错误:', e instanceof Error ? e.message : String(e));
     // eslint-disable-next-line no-console
     console.error('[3d-pipeline] obj2gltf failed', absoluteObjPath, e);
     return;
@@ -3932,7 +3966,15 @@ app.post('/api/upload', upload.array('files', 200), async (req, res) => {
   const uploadedAt = new Date().toISOString();
 
   for (const f of files) {
-    if (f.path) removeSiblingGlbOn3dAssetOverwrite(f.path);
+    if (!f.path) continue;
+    const absolutePath = path.resolve(f.path);
+    uploadTrace(`文件已保存至: ${absolutePath}`);
+    try {
+      fs.chmodSync(absolutePath, 0o666);
+    } catch (e) {
+      uploadTrace('文件权限修正失败:', e instanceof Error ? e.message : String(e));
+    }
+    removeSiblingGlbOn3dAssetOverwrite(absolutePath);
   }
 
   await refreshAssetsCache();
@@ -4426,10 +4468,11 @@ app.get('/api/asset-details', async (req, res) => {
 
     const linkedSoleCodes = !isSole ? Array.from(soleSet).sort((a, b) => a.localeCompare(b)) : [];
 
-    // OBJ 存在但 GLB 未生成时也返回 ready，前端 ThreeDViewer 会直接加载原始 OBJ。
+    // OBJ/STL 等源文件存在但 GLB 未生成时也返回 ready，前端直接加载源文件或提供下载。
     const hasObj = Boolean(scan.obj && fs.existsSync(scan.obj));
     const hasGlb = Boolean(scan.glb && fs.existsSync(scan.glb));
-    if (!hasObj && !hasGlb) {
+    const hasAnySource = Boolean(scan.any && fs.existsSync(scan.any));
+    if (!hasObj && !hasGlb && !hasAnySource) {
       return res.status(404).json({
         ok: false,
         error: 'File not found',
@@ -4442,13 +4485,13 @@ app.get('/api/asset-details', async (req, res) => {
       });
     }
 
-    if (hasObj && !hasGlb) {
+    if (!hasGlb) {
       // eslint-disable-next-line no-console
-      console.log('[Success] GLB 不可用，已回退原始 OBJ：', scan.obj);
+      console.log('[Success] GLB 不可用，已回退原始源文件：', scan.obj || scan.any);
       return res.json({
         ok: true,
         status: 'ready',
-        message: 'GLB 不可用，已回退原始 OBJ 预览',
+        message: 'GLB 不可用，已回退原始源文件预览',
         type,
         code,
         file,
@@ -4494,6 +4537,50 @@ app.get('/api/asset-file', (req, res) => {
     // eslint-disable-next-line no-console
     console.error('[api/asset-file]', e);
     return res.status(500).json({ ok: false, error: e instanceof Error ? e.message : 'asset-file failed' });
+  }
+});
+
+app.post('/api/reprocess-asset', async (req, res) => {
+  try {
+    const typeRaw = String(req.query?.type || req.body?.type || '').trim().toLowerCase();
+    const code = String(req.query?.code || req.body?.code || '').trim();
+    if (!code) return res.status(400).json({ ok: false, error: 'missing code' });
+
+    const explicitSole = typeRaw === 'soles' || typeRaw === 'sole';
+    const explicitLast = typeRaw === 'lasts' || typeRaw === 'last';
+    const resolved = explicitSole
+      ? { type: 'soles', dir: DIRS.soles, scan: scanDirForAssetByCode(DIRS.soles, code) }
+      : explicitLast
+        ? { type: 'lasts', dir: DIRS.lasts, scan: scanDirForAssetByCode(DIRS.lasts, code) }
+        : scanAllAssetDirsByCode(code);
+
+    const objAbs = resolved.scan.obj;
+    if (!objAbs || !fs.existsSync(objAbs)) {
+      return res.status(404).json({
+        ok: false,
+        error: 'OBJ source not found',
+        code,
+        type: resolved.type,
+        hits: resolved.scan.hits,
+      });
+    }
+
+    await runObjToGlbPipeline(objAbs);
+    await incrementalSync3DCache().catch(() => null);
+    const after = scanDirForAssetByCode(resolved.dir, code);
+    return res.json({
+      ok: true,
+      code,
+      type: resolved.type,
+      sourceObj: path.basename(objAbs),
+      glbReady: Boolean(after.glb && fs.existsSync(after.glb)),
+      fallbackReady: true,
+      hits: after.hits,
+    });
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.error('[api/reprocess-asset]', e);
+    return res.status(500).json({ ok: false, error: e instanceof Error ? e.message : 'reprocess failed' });
   }
 });
 
