@@ -23,6 +23,9 @@ type AssetDetailsResponse = {
   file: {
     exists: boolean;
     fileName: string | null;
+    url?: string;
+    previewUrl?: string;
+    fallbackUrl?: string;
     sizeBytes: number | null;
     sizeLabel: string | null;
     modifiedAt: string | null;
@@ -275,8 +278,9 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType, targetAudience }:
   const fileUrl = useMemo(() => {
     if (!isOpen) return null;
     if (!file?.exists || !file.fileName) return null;
+    if (file.previewUrl) return file.previewUrl.startsWith('http') ? file.previewUrl : `${getStorageBaseUrl()}${file.previewUrl}`;
     return `${getStorageBaseUrl()}/storage/assets/${apiType}/${encodeURIComponent(String(file.fileName))}`;
-  }, [isOpen, file?.exists, file?.fileName, apiType]);
+  }, [isOpen, file?.exists, file?.fileName, file?.previewUrl, apiType]);
 
   useEffect(() => {
     if (!isOpen || !fileUrl) return;

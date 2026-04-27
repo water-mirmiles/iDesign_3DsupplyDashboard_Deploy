@@ -56,21 +56,7 @@ const dotenvResult = dotenv.config({ path: ENV_PATH, debug: true });
 
 const app = express();
 /** 必须在其它路由与 body parser 之前：供 /storage 直出与 Three.js Range 拉取 */
-function resolveStorageRoot() {
-  const envRoot = String(process.env.SUPPLY3D_STORAGE_ROOT || process.env.STORAGE_ROOT || '').trim();
-  const candidates = [
-    envRoot,
-    path.join(__dirname, 'storage'),
-    path.resolve(process.cwd(), 'server', 'storage'),
-    path.resolve(process.cwd(), 'storage'),
-  ].filter(Boolean);
-  for (const p of candidates) {
-    if (fse.existsSync(p)) return path.resolve(p);
-  }
-  return path.resolve(path.join(__dirname, 'storage'));
-}
-
-const STORAGE_ROOT = resolveStorageRoot();
+const STORAGE_ROOT = path.resolve(__dirname, 'storage');
 
 app.use(cors());
 // eslint-disable-next-line no-console
@@ -4424,9 +4410,13 @@ app.get('/api/asset-details', async (req, res) => {
     };
     if (abs && fs.existsSync(abs)) {
       const st = fs.statSync(abs);
+      const relUrl = `/storage/assets/${type}/${encodeURIComponent(path.basename(abs))}`;
       file = {
         exists: true,
         fileName: path.basename(abs),
+        url: relUrl,
+        previewUrl: relUrl,
+        fallbackUrl: scan.obj ? `/storage/assets/${type}/${encodeURIComponent(path.basename(scan.obj))}` : relUrl,
         sizeBytes: st.size,
         sizeLabel: formatBytesHuman(st.size),
         modifiedAt: st.mtime.toISOString(),
@@ -4565,17 +4555,34 @@ app.post('/api/reprocess-asset', async (req, res) => {
       });
     }
 
-    await runObjToGlbPipeline(objAbs);
-    await incrementalSync3DCache().catch(() => null);
-    const after = scanDirForAssetByCode(resolved.dir, code);
+    const glbAbs = resolved.scan.glb || path.join(path.dirname(objAbs), `${path.basename(objAbs, path.extname(objAbs))}.glb`);
+    try {
+      if (glbAbs && fs.existsSync(glbAbs)) {
+        fs.unlinkSync(glbAbs);
+        uploadTrace('reprocess 已删除 GLB 缓存:', glbAbs);
+      }
+      fs.chmodSync(objAbs, 0o666);
+    } catch (e) {
+      uploadTrace('reprocess 预处理文件权限/删除失败:', e instanceof Error ? e.message : String(e));
+    }
+
+    void runObjToGlbPipeline(objAbs)
+      .then(() => incrementalSync3DCache().catch(() => null))
+      .catch((e) => {
+        // eslint-disable-next-line no-console
+        console.error('[api/reprocess-asset] async pipeline failed', e);
+      });
+
     return res.json({
       ok: true,
+      status: 'processing',
+      message: '正在处理中，预览已回退原始 OBJ',
       code,
       type: resolved.type,
       sourceObj: path.basename(objAbs),
-      glbReady: Boolean(after.glb && fs.existsSync(after.glb)),
+      glbReady: false,
       fallbackReady: true,
-      hits: after.hits,
+      hits: resolved.scan.hits,
     });
   } catch (e) {
     // eslint-disable-next-line no-console
