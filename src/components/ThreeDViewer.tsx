@@ -39,6 +39,17 @@ function resolveAssetUrl(fileUrl: string) {
   return `${getStorageBaseUrl()}/${u.replace(/^\//, '')}`;
 }
 
+/** 与后端 asset-details 返回的 /storage/... 路径配合，穿透 CDN/浏览器缓存 */
+function withCachePierce(url: string, token: string) {
+  const u = String(url || '').trim();
+  if (!u) return u;
+  const [beforeHash, ...restHash] = u.split('#');
+  const frag = restHash.length ? restHash.join('#') : undefined;
+  const sep = beforeHash.includes('?') ? '&' : '?';
+  const out = `${beforeHash}${sep}t=${encodeURIComponent(token)}`;
+  return frag !== undefined ? `${out}#${frag}` : out;
+}
+
 function centerObject(obj: THREE.Object3D) {
   const box = new THREE.Box3().setFromObject(obj);
   const c = box.getCenter(new THREE.Vector3());
@@ -438,12 +449,11 @@ export default function ThreeDViewer({
     const preferredGlbUrl = glbKey || (urlKey.toLowerCase().endsWith('.glb') ? urlKey : '');
     const preferredObjUrl = objKey || (preferredGlbUrl ? deriveObjUrlFromGlbUrl(preferredGlbUrl) : urlKey);
     const isGlb = Boolean(preferredGlbUrl);
-    const glbBustedUrl = preferredGlbUrl
-      ? `${preferredGlbUrl.split('#')[0]}${preferredGlbUrl.includes('?') ? '&' : '?'}_cb=${
-          typeof glbCacheToken === 'number' || typeof glbCacheToken === 'string' ? String(glbCacheToken) : Date.now()
-        }`
-      : '';
-    const objFallbackUrl = preferredObjUrl;
+    const pierceToken =
+      typeof glbCacheToken === 'number' || typeof glbCacheToken === 'string' ? String(glbCacheToken) : String(Date.now());
+    const glbFetchUrl = preferredGlbUrl ? withCachePierce(preferredGlbUrl, pierceToken) : '';
+    const objFetchUrl = preferredObjUrl ? withCachePierce(preferredObjUrl, pierceToken) : '';
+    const urlFetchUrl = urlKey ? withCachePierce(urlKey, pierceToken) : '';
 
     void (async () => {
       try {
@@ -502,14 +512,14 @@ export default function ThreeDViewer({
           // 1) 优先 GLB（快）。若 GLB 404 / 加载失败，则自动降级 OBJ
           let headGlb: Awaited<ReturnType<typeof headValidateAssetUrl>> = { ok: false, status: 0, contentType: '', isHtml: false };
           try {
-            headGlb = await withTimeout(headValidateAssetUrl(glbBustedUrl), GLB_PREVIEW_TIMEOUT_MS, 'GLB HEAD');
+            headGlb = await withTimeout(headValidateAssetUrl(glbFetchUrl), GLB_PREVIEW_TIMEOUT_MS, 'GLB HEAD');
             headGlbStatusForMessage = headGlb.status;
           } catch (e) {
             headGlbStatusForMessage = 0;
             // eslint-disable-next-line no-console
             console.warn('[ThreeDViewer] GLB HEAD 超时/失败，立即降级 OBJ:', e);
           }
-          if (!headGlb.ok && assetStatus === 'ready' && objFallbackUrl) {
+          if (!headGlb.ok && assetStatus === 'ready' && objFetchUrl) {
             // eslint-disable-next-line no-console
             console.warn(`[ThreeDViewer] 后端状态 ready 但 GLB 不可访问(HTTP ${headGlb.status})，立即加载源文件降级。`);
           }
@@ -517,7 +527,7 @@ export default function ThreeDViewer({
             try {
               const ab = await withTimeout(
                 loadArrayBufferWithXhr(
-                  glbBustedUrl,
+                  glbFetchUrl,
                   (p) => {
                     if (!signal.aborted) setProgress(p);
                   },
@@ -557,7 +567,7 @@ export default function ThreeDViewer({
           }
 
           // 2) OBJ 降级
-          const obj = await loadObjOrStlSource(objFallbackUrl, true);
+          const obj = await loadObjOrStlSource(objFetchUrl, true);
           if (!obj || signal.aborted) return;
           const ok = processLoadedObject(obj, {
             ...procBase,
@@ -572,7 +582,7 @@ export default function ThreeDViewer({
           }
         } else {
           // OBJ/STL 主路径
-          const sourceUrl = objFallbackUrl || urlKey;
+          const sourceUrl = objFetchUrl || urlFetchUrl;
           const obj = await loadObjOrStlSource(sourceUrl, false);
           if (!obj || signal.aborted) return;
           const ok = processLoadedObject(obj, {

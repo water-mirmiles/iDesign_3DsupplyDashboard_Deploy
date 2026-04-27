@@ -63,10 +63,14 @@ function resolveStorageRootFromRuntimeCwd() {
 }
 
 const STORAGE_ROOT = resolveStorageRootFromRuntimeCwd();
+/** 与磁盘对齐的绝对路径，避免相对路径与进程 cwd 漂移导致 /storage 404 */
+const ABS_STORAGE_ROOT = path.resolve(STORAGE_ROOT);
 
 app.use(cors());
 // eslint-disable-next-line no-console
 console.log('[CORS] app.use(cors()) 已启用，允许来自 http://localhost:3000 的开发请求。');
+// eslint-disable-next-line no-console
+console.log('📂 [Static-Check] 静态资源挂载根目录:', ABS_STORAGE_ROOT);
 
 // --- Production static hosting (Vite dist/) ---
 // 托管前端构建出的 dist 文件夹（与仓库根 `dist/` 对齐）
@@ -74,10 +78,11 @@ const DIST_DIR = path.join(__dirname, '..', 'dist');
 
 app.use(
   '/storage',
-  express.static(STORAGE_ROOT, {
+  express.static(ABS_STORAGE_ROOT, {
     etag: true,
     maxAge: '1h',
     setHeaders(res) {
+      res.setHeader('Access-Control-Allow-Origin', '*');
       res.setHeader('Accept-Ranges', 'bytes');
       res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
     },
@@ -4080,7 +4085,7 @@ app.post('/api/upload', upload.array('files', 200), async (req, res) => {
     const absolutePath = path.resolve(f.path);
     uploadTrace(`文件已保存至: ${absolutePath}`);
     try {
-      fs.chmodSync(absolutePath, 0o666);
+      fs.chmodSync(absolutePath, 0o644);
     } catch (e) {
       uploadTrace('文件权限修正失败:', e instanceof Error ? e.message : String(e));
     }
