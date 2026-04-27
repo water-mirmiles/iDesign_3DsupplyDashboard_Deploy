@@ -25,6 +25,7 @@ type AssetDetailsResponse = {
   file: {
     exists: boolean;
     fileName: string | null;
+    physicalPath?: string;
     url?: string;
     previewUrl?: string;
     fallbackUrl?: string;

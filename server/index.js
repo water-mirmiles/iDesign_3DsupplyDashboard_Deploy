@@ -324,7 +324,26 @@ function stripExtAssetName(name) {
 }
 
 function normalizeAssetCodeKey(codeOrFileName) {
-  return stripExtAssetName(String(codeOrFileName ?? '').trim()).toLowerCase();
+  return stripExtAssetName(String(codeOrFileName ?? ''))
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[\u2010\u2011\u2012\u2013\u2014\u2015\u2212－﹣]/g, '-')
+    .replace(/[\s\u00A0\u1680\u180E\u2000-\u200D\u2028\u2029\u202F\u205F\u2060\u3000\uFEFF]+/g, '')
+    .trim();
+}
+
+function scoreClosestAssetName(want, candidate) {
+  if (!want || !candidate) return 0;
+  if (want === candidate) return Number.MAX_SAFE_INTEGER;
+  let samePrefix = 0;
+  const n = Math.min(want.length, candidate.length);
+  while (samePrefix < n && want[samePrefix] === candidate[samePrefix]) samePrefix += 1;
+  const wantSet = new Set(want);
+  let overlap = 0;
+  for (const ch of new Set(candidate)) {
+    if (wantSet.has(ch)) overlap += 1;
+  }
+  return samePrefix * 10 + overlap - Math.abs(want.length - candidate.length);
 }
 
 function uploadTrace(message, detail = '') {
@@ -361,19 +380,21 @@ function findPhysicalAssetFileAbs(dirAbs, codeRaw) {
 }
 
 /**
- * 目录全扫描：只要「文件名(不含后缀)」与 code 相等(忽略大小写) 即命中。
- * @returns {{ glb: string|null, obj: string|null, any: string|null, hits: string[] }}
+ * 目录全扫描：文件名与 code 统一做横杠/空白/不可见字符归一化后相等即命中。
+ * @returns {{ glb: string|null, obj: string|null, any: string|null, hits: string[], closestFileName: string|null, success: boolean }}
  */
 function scanDirForAssetByCode(dirAbs, codeRaw) {
   const want = normalizeAssetCodeKey(codeRaw);
-  if (!want) return { glb: null, obj: null, any: null, hits: [] };
+  if (!want) return { glb: null, obj: null, any: null, hits: [], closestFileName: null, success: false };
   let entries = [];
   try {
     entries = fs.readdirSync(dirAbs, { withFileTypes: true });
   } catch {
-    return { glb: null, obj: null, any: null, hits: [] };
+    return { glb: null, obj: null, any: null, hits: [], closestFileName: null, success: false };
   }
   const hits = [];
+  let closestFileName = null;
+  let closestScore = -Infinity;
   let glb = null;
   let obj = null;
   let any = null;
@@ -381,7 +402,12 @@ function scanDirForAssetByCode(dirAbs, codeRaw) {
     if (!e.isFile()) continue;
     const ext = path.extname(e.name).toLowerCase();
     if (!ASSET_3D_EXTS.includes(ext)) continue;
-    const base = stripExtAssetName(e.name).trim().toLowerCase();
+    const base = normalizeAssetCodeKey(e.name);
+    const score = scoreClosestAssetName(want, base);
+    if (score > closestScore) {
+      closestScore = score;
+      closestFileName = e.name;
+    }
     if (base !== want) continue;
     const abs = path.join(dirAbs, e.name);
     hits.push(e.name);
@@ -389,7 +415,7 @@ function scanDirForAssetByCode(dirAbs, codeRaw) {
     if (ext === '.glb') glb = abs;
     if (ext === '.obj') obj = abs;
   }
-  return { glb, obj, any, hits };
+  return { glb, obj, any, hits, closestFileName, success: hits.length > 0 };
 }
 
 function scanAllAssetDirsByCode(codeRaw) {
@@ -4456,6 +4482,12 @@ app.get('/api/asset-details', async (req, res) => {
     const scan = scanDirForAssetByCode(dir, code);
     const abs = scan.glb || scan.obj || scan.any;
     // eslint-disable-next-line no-console
+    console.log(`[Discovery] 正在搜寻编号: ${code}`);
+    // eslint-disable-next-line no-console
+    console.log(`[Discovery] 磁盘上最接近的文件是: ${scan.closestFileName || '(none)'}`);
+    // eslint-disable-next-line no-console
+    console.log(`[Discovery] 最终匹配结果: ${scan.success ? '✅' : '❌'}`);
+    // eslint-disable-next-line no-console
     console.log('[Server] 正在搜索资产:', abs || `(not found) dir=${dir} code=${JSON.stringify(code)}`, 'hits=', scan.hits);
     let file = {
       exists: false,
@@ -4473,6 +4505,7 @@ app.get('/api/asset-details', async (req, res) => {
       file = {
         exists: true,
         fileName: path.basename(abs),
+        physicalPath: abs,
         url: relUrl,
         previewUrl: glbUrl || objUrl || relUrl,
         fallbackUrl: objUrl || relUrl,
@@ -4680,11 +4713,21 @@ app.use((err, _req, res, _next) => {
 
 async function start() {
   await ensureStorageDirs();
+  try {
+    if (fs.existsSync(FINAL_RESULTS_PATH)) {
+      fs.unlinkSync(FINAL_RESULTS_PATH);
+      // eslint-disable-next-line no-console
+      console.log('[Startup] removed stale final_results.json to force Linux disk rescan');
+    }
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.warn('[Startup] remove final_results.json failed:', e instanceof Error ? e.message : String(e));
+  }
   await purgeStorageJsonExceptDataAndAssets();
   await ensureSeedAdmin();
   // 自动化环境清理：启动时强制确保 sandbox 目录存在
   try {
-    fse.ensureDirSync(path.join(__dirname, 'storage', 'sandbox'));
+    fse.ensureDirSync(DIRS.sandbox);
   } catch {
     // ignore
   }
