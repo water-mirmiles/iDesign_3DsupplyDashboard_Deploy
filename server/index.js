@@ -428,6 +428,7 @@ function scanDirForAssetByCode(dirAbs, codeRaw) {
   let any = null;
   for (const e of entries) {
     if (!e.isFile()) continue;
+    if (e.name.startsWith('._')) continue;
     const ext = path.extname(e.name).toLowerCase();
     if (!is3DAssetExt(ext)) continue;
     const base = normalizeAssetCodeKey(e.name);
@@ -4521,6 +4522,7 @@ app.get('/api/asset-details', async (req, res) => {
 
     const scan = scanDirForAssetByCode(dir, code);
     const abs = scan.glb || scan.obj || scan.any;
+    const physicalAssetPresent = Boolean(abs && fs.existsSync(abs));
     // eslint-disable-next-line no-console
     console.log(`[Discovery] 正在搜寻编号: ${code}`);
     // eslint-disable-next-line no-console
@@ -4570,17 +4572,27 @@ app.get('/api/asset-details', async (req, res) => {
     const hasGlb = Boolean(scan.glb && fs.existsSync(scan.glb));
     const hasAnySource = Boolean(scan.any && fs.existsSync(scan.any));
 
-    if (scan.success && linkedStyles.length === 0) {
-      // 缓存中的 inventory 可能落后于当前 Excel 主表；弹窗关联款号必须以实时聚合结果兜底。
+    if (physicalAssetPresent && linkedStyles.length === 0) {
+      // eslint-disable-next-line no-console
+      console.log(
+        `[Logic-Audit] 资产 ${code} 存在，但关联款号为 0。归一化 key: ${normalizeAssetCodeKey(code)}`
+      );
+      // 物理文件已在盘上，但快照 inventory 未反查到款号：现场全量重算后再返回，避免列表与弹窗条数分裂。
       try {
         // eslint-disable-next-line no-console
-        console.log(`[Realtime-Link] 缓存关联为 0，现场重算主表并反查: type=${type} code=${code}`);
+        console.log(`[Realtime-Link] 物理资产已存在但关联为 0，现场全量重算并反查: type=${type} code=${code}`);
         const payload = await processAllData({ storageRoot: STORAGE_ROOT });
         await persistFinalDashboardData(STORAGE_ROOT, payload);
         inventory = Array.isArray(payload?.inventory) ? payload.inventory : [];
         ({ linkedStyles, linkedSoleCodes } = collectLinkedAssetRows(inventory, { isSole, code }));
         // eslint-disable-next-line no-console
         console.log(`[Realtime-Link] 现场反查完成: ${code} => ${linkedStyles.length} rows`);
+        if (linkedStyles.length === 0) {
+          // eslint-disable-next-line no-console
+          console.log(
+            `[Logic-Audit] 资产 ${code} 存在，但关联款号为 0。归一化 key: ${normalizeAssetCodeKey(code)}`
+          );
+        }
       } catch (recalcError) {
         // eslint-disable-next-line no-console
         console.warn('[Realtime-Link] 现场反查失败，保留缓存结果:', recalcError instanceof Error ? recalcError.message : recalcError);

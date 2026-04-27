@@ -6,6 +6,9 @@ import ThreeDViewer from '@/components/ThreeDViewer';
 import { getStorageBaseUrl } from '@/lib/storageBaseUrl';
 import { formatMetricsForUi, type Last3DMetrics } from '@/lib/last3dMetrics';
 
+/** 生产环境走同源相对路径，避免弹窗请求打到用户本机 localhost */
+const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:3001';
+
 type InventoryRealResponse = {
   ok: boolean;
   items: InventoryItem[];
@@ -200,8 +203,6 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType, targetAudience }:
 
   const apiType = assetType === 'last' ? 'lasts' : 'soles';
 
-  const API_BASE = 'http://localhost:3001';
-
   async function safeFetchJson<T>(url: string): Promise<{ response: Response; json: T | null }> {
     const response = await fetch(url);
     if (!response.ok) {
@@ -244,7 +245,7 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType, targetAudience }:
     } finally {
       setLoading(false);
     }
-  }, [apiType, assetCode]);
+  }, [API_BASE, apiType, assetCode]);
 
   const handleReprocessAsset = useCallback(async () => {
     if (!assetCode.trim() || reprocessing) return;
