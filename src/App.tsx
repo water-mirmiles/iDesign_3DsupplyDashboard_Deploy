@@ -11,13 +11,16 @@ import SchemaMapping from '@/views/SchemaMapping';
 import InventoryList from '@/views/InventoryList';
 import LastSoleRelationView from '@/views/LastSoleRelation';
 import Login from '@/views/Login';
+import Settings from '@/views/Settings';
 
-type CurrentUser = { username: string };
+type CurrentUser = { username: string; role?: string };
 
 function readCurrentUser(): CurrentUser | null {
   try {
     const parsed = JSON.parse(localStorage.getItem('currentUser') || 'null');
-    if (parsed && typeof parsed.username === 'string' && parsed.username.trim()) return { username: parsed.username.trim() };
+    if (parsed && typeof parsed.username === 'string' && parsed.username.trim()) {
+      return { username: parsed.username.trim(), role: typeof parsed.role === 'string' ? parsed.role : undefined };
+    }
   } catch {
     // ignore
   }
@@ -31,8 +34,8 @@ export default function App() {
   const [currentView, setCurrentView] = useState(() => localStorage.getItem('currentView') || 'dashboard');
 
   if (!isAuthenticated) {
-    return <Login onLogin={({ username, rememberMe }) => {
-      const user = { username };
+    return <Login onLogin={({ username, role, rememberMe }) => {
+      const user = { username, role };
       setCurrentUser(user);
       setIsAuthenticated(true);
       localStorage.setItem('currentUser', JSON.stringify(user));
@@ -60,6 +63,8 @@ export default function App() {
             }}
           />
         );
+      case 'settings':
+        return <Settings currentUser={currentUser} />;
       default:
         return <Dashboard />;
     }
@@ -73,11 +78,13 @@ export default function App() {
         localStorage.setItem('currentView', view);
       }}
       onLogout={() => {
+        setCurrentView('dashboard');
         setIsAuthenticated(false);
         setCurrentUser(null);
         localStorage.removeItem('isLoggedIn');
         localStorage.removeItem('currentUser');
         localStorage.removeItem('username');
+        localStorage.removeItem('currentView');
       }}
       currentUser={currentUser}
     >

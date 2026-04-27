@@ -58,15 +58,21 @@ export function Sidebar({ currentView, onNavigate, onLogout, currentUser }: Side
 
       {/* Bottom Actions */}
       <div className="p-4 border-t border-slate-800 space-y-1">
-        <div className="rounded-lg border border-slate-800 bg-slate-950/40 px-3 py-2.5">
+        <button
+          onClick={() => onNavigate('settings')}
+          className={cn(
+            'w-full rounded-lg border border-slate-800 px-3 py-2.5 text-left transition-colors',
+            currentView === 'settings' ? 'bg-blue-600 text-white shadow-md shadow-blue-900/20' : 'bg-slate-950/40 hover:bg-slate-800'
+          )}
+        >
           <div className="flex items-center gap-3 text-sm font-medium text-slate-300">
-            <Settings className="w-5 h-5 text-slate-400" />
+            <Settings className={cn('w-5 h-5', currentView === 'settings' ? 'text-white' : 'text-slate-400')} />
             系统设置
           </div>
-          <div className="mt-2 truncate pl-8 text-xs text-slate-500" title={currentUser?.username || '未登录'}>
-            当前登录：<span className="font-medium text-slate-300">{currentUser?.username || '未登录'}</span>
+          <div className={cn('mt-2 truncate pl-8 text-xs', currentView === 'settings' ? 'text-blue-100' : 'text-slate-500')} title={currentUser?.username || '未登录'}>
+            当前登录：<span className={cn('font-medium', currentView === 'settings' ? 'text-white' : 'text-slate-300')}>{currentUser?.username || '未登录'}</span>
           </div>
-        </div>
+        </button>
         <button 
           onClick={onLogout}
           className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium text-red-400 hover:bg-slate-800 hover:text-red-300 transition-colors"

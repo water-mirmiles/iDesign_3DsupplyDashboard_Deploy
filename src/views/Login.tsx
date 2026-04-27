@@ -2,10 +2,10 @@ import React, { useState } from 'react';
 import { Box, Lock, User, ArrowRight } from 'lucide-react';
 
 interface LoginProps {
-  onLogin: (info: { username: string; rememberMe: boolean }) => void;
+  onLogin: (info: { username: string; role?: string; rememberMe: boolean }) => void;
 }
 
-type AuthResponse = { ok?: boolean; user?: { username: string }; error?: string };
+type AuthResponse = { ok?: boolean; user?: { username: string; role?: string }; error?: string };
 
 export default function Login({ onLogin }: LoginProps) {
   const [isLogin, setIsLogin] = useState(true);
@@ -23,7 +23,7 @@ export default function Login({ onLogin }: LoginProps) {
     if (!u || !p) return;
 
     try {
-      const resp = await fetch(isLogin ? '/api/auth/login' : '/api/auth/register', {
+      const resp = await fetch(isLogin ? '/api/login' : '/api/register', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username: u, password: p }),
@@ -33,7 +33,7 @@ export default function Login({ onLogin }: LoginProps) {
         setError(json.error || (isLogin ? '用户名或密码错误，或该账号尚未注册。' : '注册失败。'));
         return;
       }
-      onLogin({ username: json.user.username, rememberMe });
+      onLogin({ username: json.user.username, role: json.user.role, rememberMe });
     } catch (err) {
       setError(err instanceof Error ? err.message : '认证服务暂不可用。');
     }
@@ -108,7 +108,7 @@ export default function Login({ onLogin }: LoginProps) {
               记住我
             </label>
             <div className="text-xs text-slate-500">
-              {isLogin ? '登录校验后端用户库' : '注册将写入后端 users.json'}
+              {isLogin ? '登录校验后端用户库' : '请输入管理员为您预设的用户名以设置新密码'}
             </div>
           </div>
 
@@ -116,7 +116,7 @@ export default function Login({ onLogin }: LoginProps) {
             type="submit"
             className="w-full flex items-center justify-center gap-2 py-2.5 px-4 border border-transparent rounded-lg shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 focus:ring-offset-slate-900 transition-all mt-6"
           >
-            {isLogin ? '登录系统' : '注册账号'}
+            {isLogin ? '登录系统' : '设置密码并激活'}
             <ArrowRight className="w-4 h-4" />
           </button>
         </form>
@@ -127,6 +127,17 @@ export default function Login({ onLogin }: LoginProps) {
             className="text-sm text-slate-400 hover:text-white transition-colors"
           >
             {isLogin ? '没有账号？点击注册' : '已有账号？点击登录'}
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              localStorage.clear();
+              sessionStorage.clear();
+              window.location.reload();
+            }}
+            className="mt-4 block w-full text-xs text-amber-300 hover:text-amber-200 transition-colors"
+          >
+            彻底清理浏览器缓存
           </button>
         </div>
       </div>
