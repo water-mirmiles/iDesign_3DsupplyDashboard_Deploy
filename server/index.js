@@ -56,7 +56,13 @@ const dotenvResult = dotenv.config({ path: ENV_PATH, debug: true });
 
 const app = express();
 /** 必须在其它路由与 body parser 之前：供 /storage 直出与 Three.js Range 拉取 */
-const STORAGE_ROOT = path.resolve(__dirname, 'storage');
+function resolveStorageRootFromRuntimeCwd() {
+  const cwd = process.cwd();
+  if (path.basename(cwd) === 'server') return path.resolve(cwd, 'storage');
+  return path.resolve(cwd, 'server', 'storage');
+}
+
+const STORAGE_ROOT = resolveStorageRootFromRuntimeCwd();
 
 app.use(cors());
 // eslint-disable-next-line no-console
@@ -430,6 +436,45 @@ function isPathInsideAssetDir(fileAbs, dirAbs) {
   return f === root || f.startsWith(prefix);
 }
 
+function containsMachineAbsolutePath(value) {
+  try {
+    return /(?:\/Users\/|\/root\/|[A-Za-z]:\\Users\\)/.test(JSON.stringify(value));
+  } catch {
+    return false;
+  }
+}
+
+function isSnapshotEnvironmentMismatch(snapshot) {
+  const legacyRoot = snapshot?.cache?.storageRoot || snapshot?.meta?.storageRoot || snapshot?.STORAGE_ROOT;
+  if (legacyRoot && path.resolve(String(legacyRoot)) !== STORAGE_ROOT) return true;
+  return containsMachineAbsolutePath(snapshot);
+}
+
+function portableCacheValue(value) {
+  const root = STORAGE_ROOT.split(path.sep).join('/');
+  const toPortableString = (input) => {
+    const s = String(input);
+    const normalized = s.split(path.sep).join('/');
+    if (normalized.startsWith(root)) {
+      const rel = normalized.slice(root.length).replace(/^\/+/, '');
+      return rel ? `storage/${rel}` : 'storage';
+    }
+    if (/(?:\/Users\/|\/root\/|[A-Za-z]:\\Users\\)/.test(s)) return path.basename(s);
+    return input;
+  };
+  const visit = (node) => {
+    if (typeof node === 'string') return toPortableString(node);
+    if (Array.isArray(node)) return node.map(visit);
+    if (node && typeof node === 'object') {
+      const out = {};
+      for (const [key, child] of Object.entries(node)) out[key] = visit(child);
+      return out;
+    }
+    return node;
+  };
+  return visit(value);
+}
+
 async function readFinalDashboardSnapshot() {
   const candidates = [FULL_INVENTORY_CACHE_PATH, FINAL_DASHBOARD_PATH];
   for (const p of candidates) {
@@ -437,6 +482,12 @@ async function readFinalDashboardSnapshot() {
       if (!(await fse.pathExists(p))) continue;
       const data = await fse.readJson(p);
       if (!data || typeof data !== 'object' || !data.kpis) continue;
+      if (isSnapshotEnvironmentMismatch(data)) {
+        // eslint-disable-next-line no-console
+        console.warn('[Cache] detected machine-specific snapshot path; purging stale cache:', path.basename(p));
+        await purgeOldSnapshots();
+        return null;
+      }
       return data;
     } catch {
       // try next snapshot source
@@ -447,10 +498,16 @@ async function readFinalDashboardSnapshot() {
 
 async function writeDashboardSnapshots(payload) {
   await fse.ensureDir(STORAGE_ROOT);
+  const portablePayload = portableCacheValue(payload);
+  portablePayload.cache = {
+    ...(portablePayload.cache || {}),
+    storageRootMode: 'runtime-cwd/server/storage',
+    savedAt: new Date().toISOString(),
+  };
   await Promise.all([
-    fse.writeJson(FULL_INVENTORY_CACHE_PATH, payload, { spaces: 2 }),
-    fse.writeJson(FINAL_DASHBOARD_PATH, payload, { spaces: 2 }),
-    fse.writeJson(FINAL_RESULTS_PATH, payload, { spaces: 2 }),
+    fse.writeJson(FULL_INVENTORY_CACHE_PATH, portablePayload, { spaces: 2 }),
+    fse.writeJson(FINAL_DASHBOARD_PATH, portablePayload, { spaces: 2 }),
+    fse.writeJson(FINAL_RESULTS_PATH, portablePayload, { spaces: 2 }),
   ]);
 }
 
@@ -4411,12 +4468,16 @@ app.get('/api/asset-details', async (req, res) => {
     if (abs && fs.existsSync(abs)) {
       const st = fs.statSync(abs);
       const relUrl = `/storage/assets/${type}/${encodeURIComponent(path.basename(abs))}`;
+      const glbUrl = scan.glb ? `/storage/assets/${type}/${encodeURIComponent(path.basename(scan.glb))}` : null;
+      const objUrl = scan.obj ? `/storage/assets/${type}/${encodeURIComponent(path.basename(scan.obj))}` : null;
       file = {
         exists: true,
         fileName: path.basename(abs),
         url: relUrl,
-        previewUrl: relUrl,
-        fallbackUrl: scan.obj ? `/storage/assets/${type}/${encodeURIComponent(path.basename(scan.obj))}` : relUrl,
+        previewUrl: glbUrl || objUrl || relUrl,
+        fallbackUrl: objUrl || relUrl,
+        glbUrl,
+        objUrl,
         sizeBytes: st.size,
         sizeLabel: formatBytesHuman(st.size),
         modifiedAt: st.mtime.toISOString(),
@@ -4468,6 +4529,8 @@ app.get('/api/asset-details', async (req, res) => {
         error: 'File not found',
         type,
         code,
+        glbUrl: null,
+        objUrl: null,
         file,
         uploadedBy,
         linkedStyles,
@@ -4484,6 +4547,8 @@ app.get('/api/asset-details', async (req, res) => {
         message: 'GLB 不可用，已回退原始源文件预览',
         type,
         code,
+        glbUrl: null,
+        objUrl: scan.obj ? `/storage/assets/${type}/${encodeURIComponent(path.basename(scan.obj))}` : null,
         file,
         uploadedBy,
         linkedStyles,
@@ -4499,6 +4564,8 @@ app.get('/api/asset-details', async (req, res) => {
       status: 'ready',
       type,
       code,
+      glbUrl: scan.glb ? `/storage/assets/${type}/${encodeURIComponent(path.basename(scan.glb))}` : null,
+      objUrl: scan.obj ? `/storage/assets/${type}/${encodeURIComponent(path.basename(scan.obj))}` : null,
       file,
       uploadedBy,
       linkedStyles,

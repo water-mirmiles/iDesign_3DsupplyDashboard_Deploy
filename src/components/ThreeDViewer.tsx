@@ -10,6 +10,8 @@ import { audienceLabelZh, getTargetLengthMm, parseAudience, type ShoeAudience } 
 
 type Props = {
   fileUrl: string;
+  glbUrl?: string | null;
+  objUrl?: string | null;
   /** 与清单行 `target_audience` 对齐；未传时按 MEN(275mm) 处理。仅对 legacy OBJ 路径生效。 */
   targetAudience?: string;
   /**
@@ -25,6 +27,8 @@ type Props = {
   onError?: (err: Error) => void;
   onMetrics?: (m: Last3DMetrics) => void;
 };
+
+const GLB_PREVIEW_TIMEOUT_MS = 2000;
 
 function resolveAssetUrl(fileUrl: string) {
   const u = String(fileUrl || '').trim();
@@ -276,6 +280,22 @@ async function headValidateAssetUrl(resolvedUrl: string) {
   return { ok: resp.ok, status: resp.status, contentType: ct, isHtml };
 }
 
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(new Error(`${label} timeout after ${ms}ms`)), ms);
+    promise.then(
+      (value) => {
+        window.clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        window.clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
+}
+
 function deriveObjUrlFromGlbUrl(glbResolvedUrl: string) {
   try {
     const u = new URL(glbResolvedUrl, window.location.origin);
@@ -299,6 +319,8 @@ function resourcePathForUrl(resolved: string) {
 
 export default function ThreeDViewer({
   fileUrl,
+  glbUrl,
+  objUrl,
   targetAudience,
   precomputedMetrics,
   precomputedKey,
@@ -321,6 +343,8 @@ export default function ThreeDViewer({
   const [progress, setProgress] = useState<number | null>(null);
 
   const urlKey = useMemo(() => resolveAssetUrl(String(fileUrl || '').trim()), [fileUrl]);
+  const glbKey = useMemo(() => resolveAssetUrl(String(glbUrl || '').trim()), [glbUrl]);
+  const objKey = useMemo(() => resolveAssetUrl(String(objUrl || '').trim()), [objUrl]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -409,14 +433,16 @@ export default function ThreeDViewer({
       });
     };
 
-    const isGlb = urlKey.toLowerCase().endsWith('.glb');
-    const isStl = urlKey.toLowerCase().endsWith('.stl');
-    const glbBustedUrl = isGlb
-      ? `${urlKey.split('#')[0]}${urlKey.includes('?') ? '&' : '?'}_cb=${
+    const preferredGlbUrl = glbKey || (urlKey.toLowerCase().endsWith('.glb') ? urlKey : '');
+    const preferredObjUrl = objKey || (preferredGlbUrl ? deriveObjUrlFromGlbUrl(preferredGlbUrl) : urlKey);
+    const isGlb = Boolean(preferredGlbUrl);
+    const isStl = !preferredGlbUrl && preferredObjUrl.toLowerCase().endsWith('.stl');
+    const glbBustedUrl = preferredGlbUrl
+      ? `${preferredGlbUrl.split('#')[0]}${preferredGlbUrl.includes('?') ? '&' : '?'}_cb=${
           typeof glbCacheToken === 'number' || typeof glbCacheToken === 'string' ? String(glbCacheToken) : Date.now()
         }`
-      : urlKey;
-    const objFallbackUrl = isGlb ? deriveObjUrlFromGlbUrl(urlKey) : urlKey;
+      : '';
+    const objFallbackUrl = preferredObjUrl;
 
     void (async () => {
       try {
@@ -437,18 +463,28 @@ export default function ThreeDViewer({
 
         if (isGlb) {
           // 1) 优先 GLB（快）。若 GLB 404 / 加载失败，则自动降级 OBJ
-          const headGlb = await headValidateAssetUrl(glbBustedUrl);
+          let headGlb: Awaited<ReturnType<typeof headValidateAssetUrl>> = { ok: false, status: 0, contentType: '', isHtml: false };
+          try {
+            headGlb = await withTimeout(headValidateAssetUrl(glbBustedUrl), GLB_PREVIEW_TIMEOUT_MS, 'GLB HEAD');
+          } catch (e) {
+            // eslint-disable-next-line no-console
+            console.warn('[ThreeDViewer] GLB HEAD 超时/失败，立即降级 OBJ:', e);
+          }
           if (headGlb.ok && !headGlb.isHtml) {
             try {
-              const ab = await loadArrayBufferWithXhr(
-                glbBustedUrl,
-                (p) => {
-                  if (!signal.aborted) setProgress(p);
-                },
-                signal
+              const ab = await withTimeout(
+                loadArrayBufferWithXhr(
+                  glbBustedUrl,
+                  (p) => {
+                    if (!signal.aborted) setProgress(p);
+                  },
+                  signal
+                ),
+                GLB_PREVIEW_TIMEOUT_MS,
+                'GLB load'
               );
               if (signal.aborted) return;
-              const basePath = resourcePathForUrl(urlKey);
+              const basePath = resourcePathForUrl(preferredGlbUrl);
               const gltf = await new Promise<{ scene: THREE.Object3D }>((resolve, reject) => {
                 loaderGltf.parse(
                   ab,
@@ -508,7 +544,8 @@ export default function ThreeDViewer({
           }
         } else {
           // OBJ/STL 主路径
-          const headSource = await headValidateAssetUrl(urlKey);
+          const sourceUrl = objFallbackUrl || urlKey;
+          const headSource = await headValidateAssetUrl(sourceUrl);
           if (!headSource.ok || headSource.isHtml) {
             const msg = `文件路径错误 (HTTP ${headSource.status})`;
             setError(msg);
@@ -519,7 +556,7 @@ export default function ThreeDViewer({
           let obj: THREE.Object3D;
           if (isStl) {
             const ab = await loadArrayBufferWithXhr(
-              urlKey,
+              sourceUrl,
               (p) => {
                 if (!signal.aborted) setProgress(p);
               },
@@ -530,7 +567,7 @@ export default function ThreeDViewer({
             obj = new THREE.Mesh(geometry, phongMat.clone());
           } else {
             const text = await loadTextWithXhr(
-              urlKey,
+              sourceUrl,
               (p) => {
                 if (!signal.aborted) setProgress(p);
               },
@@ -602,7 +639,7 @@ export default function ThreeDViewer({
       }
       renderer.dispose();
     };
-  }, [urlKey, targetAudience, precomputedMetrics, precomputedKey, glbCacheToken]);
+  }, [urlKey, glbKey, objKey, targetAudience, precomputedMetrics, precomputedKey, glbCacheToken]);
 
   return (
     <div className={className} ref={containerRef} style={{ position: 'relative', minHeight: 120, width: '100%', height: '100%' }}>

@@ -13,9 +13,9 @@ function normalize(s) {
 }
 
 function resolveServerStorageRoot() {
-  const fromCwd = path.resolve(process.cwd(), 'server', 'storage');
-  if (fse.existsSync(fromCwd)) return fromCwd;
-  return fromCwd;
+  const cwd = process.cwd();
+  if (path.basename(cwd) === 'server') return path.resolve(cwd, 'storage');
+  return path.resolve(cwd, 'server', 'storage');
 }
 
 function normalizeLower(s) {
@@ -569,10 +569,41 @@ function appendAiTraceLogSync(line) {
   try {
     const p = aiTraceLogPath();
     fse.ensureDirSync(path.dirname(p));
+    if (fse.existsSync(p)) {
+      const st = fse.statSync(p);
+      if (st.size > 10 * 1024 * 1024) fse.writeFileSync(p, '', { encoding: 'utf8' });
+    }
     fse.appendFileSync(p, `${String(line ?? '')}\n`, { encoding: 'utf8' });
   } catch {
     // ignore
   }
+}
+
+function portableCacheValue(value, storageRoot) {
+  const root = path.resolve(storageRoot || resolveServerStorageRoot()).split(path.sep).join('/');
+  const toPortableString = (input) => {
+    const s = String(input);
+    const normalized = s.split(path.sep).join('/');
+    if (normalized.startsWith(root)) {
+      const rel = normalized.slice(root.length).replace(/^\/+/, '');
+      return rel ? `storage/${rel}` : 'storage';
+    }
+    if (/(?:\/Users\/|\/root\/|[A-Za-z]:\\Users\\)/.test(s)) return path.basename(s);
+    return input;
+  };
+  const visit = (node) => {
+    if (typeof node === 'string') return toPortableString(node);
+    if (Array.isArray(node)) return node.map(visit);
+    if (node && typeof node === 'object') {
+      const out = {};
+      for (const [key, child] of Object.entries(node)) {
+        out[key] = visit(child);
+      }
+      return out;
+    }
+    return node;
+  };
+  return visit(value);
 }
 
 export function clearEngineLogSync() {
@@ -2555,6 +2586,7 @@ async function aggregateForDateRoot({ storageRoot, dateDirName, standardMap, for
  * 全量聚合：读取 mapping_config、最新快照目录下全部 XLSX（多表 Join / CONCAT）、对齐 3D 资产文件名。
  */
 export async function processAllData({ storageRoot, operator = 'System', operationTime = new Date() }) {
+  clearAiTraceLogSync();
   // eslint-disable-next-line no-console
   console.log('[Engine] 正在合成款号数据...');
   const t0 = Date.now();
@@ -2723,9 +2755,15 @@ export async function persistFinalDashboardData(storageRoot, payload) {
   const outPath = path.join(storageRoot, 'final_dashboard_data.json');
   const finalResultsPath = path.join(storageRoot, 'final_results.json');
   const fullInventoryCachePath = path.join(storageRoot, 'full_inventory_cache.json');
-  await fse.writeJson(outPath, payload, { spaces: 2 });
-  await fse.writeJson(finalResultsPath, payload, { spaces: 2 });
-  await fse.writeJson(fullInventoryCachePath, payload, { spaces: 2 });
+  const portablePayload = portableCacheValue(payload, storageRoot);
+  portablePayload.cache = {
+    ...(portablePayload.cache || {}),
+    storageRootMode: 'runtime-cwd/server/storage',
+    savedAt: new Date().toISOString(),
+  };
+  await fse.writeJson(outPath, portablePayload, { spaces: 2 });
+  await fse.writeJson(finalResultsPath, portablePayload, { spaces: 2 });
+  await fse.writeJson(fullInventoryCachePath, portablePayload, { spaces: 2 });
   return outPath;
 }
 

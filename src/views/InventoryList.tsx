@@ -20,12 +20,16 @@ type AssetDetailsResponse = {
   message?: string;
   type: 'lasts' | 'soles';
   code: string;
+  glbUrl?: string | null;
+  objUrl?: string | null;
   file: {
     exists: boolean;
     fileName: string | null;
     url?: string;
     previewUrl?: string;
     fallbackUrl?: string;
+    glbUrl?: string | null;
+    objUrl?: string | null;
     sizeBytes: number | null;
     sizeLabel: string | null;
     modifiedAt: string | null;
@@ -281,6 +285,8 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType, targetAudience }:
     if (file.previewUrl) return file.previewUrl.startsWith('http') ? file.previewUrl : `${getStorageBaseUrl()}${file.previewUrl}`;
     return `${getStorageBaseUrl()}/storage/assets/${apiType}/${encodeURIComponent(String(file.fileName))}`;
   }, [isOpen, file?.exists, file?.fileName, file?.previewUrl, apiType]);
+  const viewerGlbUrl = details?.glbUrl || file?.glbUrl || null;
+  const viewerObjUrl = details?.objUrl || file?.objUrl || file?.fallbackUrl || null;
 
   useEffect(() => {
     if (!isOpen || !fileUrl) return;
@@ -329,10 +335,12 @@ const PreviewModal = ({ isOpen, onClose, assetCode, assetType, targetAudience }:
           {fileUrl ? (
             <div
               className="absolute inset-0"
-              key={`${fileUrl}__${String(targetAudience ?? '')}__${precomputedKey || '0'}`}
+              key={`${fileUrl}__${viewerGlbUrl || ''}__${viewerObjUrl || ''}__${String(targetAudience ?? '')}__${precomputedKey || '0'}`}
             >
               <ThreeDViewer
                 fileUrl={fileUrl}
+                glbUrl={viewerGlbUrl}
+                objUrl={viewerObjUrl}
                 targetAudience={targetAudience}
                 precomputedMetrics={fileUrl && fileUrl.toLowerCase().endsWith('.glb') ? precomputedFromApi : null}
                 precomputedKey={precomputedKey}
