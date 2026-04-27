@@ -135,6 +135,7 @@ function publicUser(user) {
 
 async function readUsersFile() {
   try {
+    await migrateLegacyUsersFile();
     if (!(await fse.pathExists(USERS_PATH))) return { version: 1, users: [] };
     const data = await fse.readJson(USERS_PATH);
     return {
@@ -147,8 +148,48 @@ async function readUsersFile() {
 }
 
 async function writeUsersFile(payload) {
-  await fse.ensureDir(STORAGE_ROOT);
+  await fse.ensureDir(AUTH_DIR);
   await fse.writeJson(USERS_PATH, payload, { spaces: 2 });
+}
+
+async function migrateLegacyUsersFile() {
+  try {
+    await fse.ensureDir(AUTH_DIR);
+    const hasNew = await fse.pathExists(USERS_PATH);
+    const hasLegacy = await fse.pathExists(LEGACY_USERS_PATH);
+    if (!hasLegacy) return false;
+    if (!hasNew) {
+      await fse.move(LEGACY_USERS_PATH, USERS_PATH, { overwrite: false });
+      // eslint-disable-next-line no-console
+      console.log(`[Auth] migrated legacy users.json to protected path: ${USERS_PATH}`);
+      return true;
+    }
+    const legacy = await fse.readJson(LEGACY_USERS_PATH).catch(() => null);
+    const current = await fse.readJson(USERS_PATH).catch(() => null);
+    const byName = new Map();
+    for (const u of Array.isArray(current?.users) ? current.users : []) {
+      const key = normalizeUsername(u?.username).toLowerCase();
+      if (key) byName.set(key, u);
+    }
+    let merged = false;
+    for (const u of Array.isArray(legacy?.users) ? legacy.users : []) {
+      const key = normalizeUsername(u?.username).toLowerCase();
+      if (!key || byName.has(key)) continue;
+      byName.set(key, u);
+      merged = true;
+    }
+    if (merged) {
+      await fse.writeJson(USERS_PATH, { version: 1, users: Array.from(byName.values()) }, { spaces: 2 });
+    }
+    await fse.remove(LEGACY_USERS_PATH);
+    // eslint-disable-next-line no-console
+    console.log('[Auth] removed legacy storage/users.json after protected-path migration');
+    return true;
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.warn('[Auth] migrate legacy users.json failed:', e instanceof Error ? e.message : String(e));
+    return false;
+  }
 }
 
 async function ensureSeedAdmin() {
@@ -229,57 +270,30 @@ const FINAL_DASHBOARD_PATH = path.join(STORAGE_ROOT, 'final_dashboard_data.json'
 const FINAL_RESULTS_PATH = path.join(STORAGE_ROOT, 'final_results.json');
 const FULL_INVENTORY_CACHE_PATH = path.join(STORAGE_ROOT, 'full_inventory_cache.json');
 const ASSETS_META_PATH = path.join(STORAGE_ROOT, 'assets_meta.json');
-const USERS_PATH = path.join(STORAGE_ROOT, 'users.json');
+const AUTH_DIR = path.join(STORAGE_ROOT, 'auth');
+const LEGACY_USERS_PATH = path.join(STORAGE_ROOT, 'users.json');
+const USERS_PATH = path.join(AUTH_DIR, 'users.json');
 const UPLOAD_AUDIT_PATH = path.join(STORAGE_ROOT, 'upload_audit.json');
 
 /**
- * 暴力清除本地 JSON 快照缓存：
- * 删除 server/storage 下除 data_tables 与 assets 目录之外的所有 .json 文件。
- * （临时排障：避免 final_results.json / final_dashboard_data.json 等残留导致“数字死锁”）
+ * 清除本地快照缓存：只允许删除显式列出的缓存文件，严禁递归/通配符清理。
+ * 认证数据库位于 storage/auth/users.json，不允许被任何缓存清理流程触碰。
  */
 async function purgeStorageJsonExceptDataAndAssets() {
-  const keepSub = new Set([path.resolve(DIRS.dataTables), path.resolve(path.join(STORAGE_ROOT, 'assets'))]);
-  const keepFiles = new Set([
-    path.resolve(USERS_PATH),
-    path.resolve(UPLOAD_AUDIT_PATH),
-    path.resolve(ASSETS_META_PATH),
-    path.resolve(FULL_INVENTORY_CACHE_PATH),
-    path.resolve(FINAL_DASHBOARD_PATH),
-    path.resolve(FINAL_RESULTS_PATH),
-  ]);
-  const shouldSkipDir = (absDir) => {
-    const d = path.resolve(absDir);
-    for (const k of keepSub) {
-      const prefix = k.endsWith(path.sep) ? k : k + path.sep;
-      if (d === k || d.startsWith(prefix)) return true;
-    }
-    return false;
-  };
   const removed = [];
-  const walk = async (dirAbs) => {
-    if (shouldSkipDir(dirAbs)) return;
-    let entries = [];
+  const deleteCacheFile = async (p) => {
     try {
-      entries = await fse.readdir(dirAbs, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const e of entries) {
-      const full = path.join(dirAbs, e.name);
-      if (e.isDirectory()) {
-        await walk(full);
-      } else if (e.isFile() && e.name.toLowerCase().endsWith('.json')) {
-        if (keepFiles.has(path.resolve(full))) continue;
-        try {
-          await fse.remove(full);
-          removed.push(path.relative(STORAGE_ROOT, full).split(path.sep).join('/'));
-        } catch {
-          // ignore
-        }
+      if (await fse.pathExists(p)) {
+        await fse.remove(p);
+        removed.push(path.relative(STORAGE_ROOT, p).split(path.sep).join('/'));
       }
+    } catch {
+      // ignore
     }
   };
-  await walk(STORAGE_ROOT);
+  await deleteCacheFile(FINAL_RESULTS_PATH);
+  await deleteCacheFile(FINAL_DASHBOARD_PATH);
+  await deleteCacheFile(FULL_INVENTORY_CACHE_PATH);
   // eslint-disable-next-line no-console
   console.log('[Startup] purge storage json removed:', removed.length ? removed.join(', ') : '(none)');
   return removed;
@@ -730,23 +744,6 @@ async function purgeOldSnapshots() {
   await tryRemove(FINAL_RESULTS_PATH);
   await tryRemove(FINAL_DASHBOARD_PATH);
   await tryRemove(FULL_INVENTORY_CACHE_PATH);
-
-  // 删除任何包含 snapshot 关键字的缓存文件（仅 storage 根下递归）
-  const walk = async (dir) => {
-    const entries = await fse.readdir(dir, { withFileTypes: true });
-    for (const e of entries) {
-      const full = path.join(dir, e.name);
-      if (e.isDirectory()) {
-        await walk(full);
-      } else if (e.isFile()) {
-        const nameLower = e.name.toLowerCase();
-        if (nameLower.includes('snapshot')) {
-          await tryRemove(full);
-        }
-      }
-    }
-  };
-  await walk(STORAGE_ROOT);
   return removed;
 }
 
@@ -1251,6 +1248,7 @@ async function ensureStorageDirs() {
   await fse.ensureDir(DIRS.lasts);
   await fse.ensureDir(DIRS.soles);
   await fse.ensureDir(DIRS.sandbox);
+  await fse.ensureDir(AUTH_DIR);
 }
 
 function extractJsonArray(text) {
@@ -4713,6 +4711,7 @@ app.use((err, _req, res, _next) => {
 
 async function start() {
   await ensureStorageDirs();
+  await migrateLegacyUsersFile();
   try {
     if (fs.existsSync(FINAL_RESULTS_PATH)) {
       fs.unlinkSync(FINAL_RESULTS_PATH);
